@@ -11,18 +11,23 @@
 
 # ── Self-check: detect accidental HTML download (wrong GitHub URL) ─────────────
 # Correct:  https://raw.githubusercontent.com/...
-# Wrong:    https://github.com/.../blob/main/...  ← downloads HTML page
-if grep -q "<!DOCTYPE\|<html" "$0" 2>/dev/null; then
-    echo ""
-    echo "ERROR: Downloaded HTML page instead of shell script."
-    echo "Use the raw URL:"
-    echo ""
-    echo "  wget -O /tmp/install_podkop_bot.sh \\"
-    echo "    https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh"
-    echo "  ash /tmp/install_podkop_bot.sh"
-    echo ""
-    exit 1
-fi
+# Wrong:    https://github.com/.../blob/main/...  -- downloads HTML page
+# Check only the first line: HTML starts with <!DOCTYPE or <html, shell starts with #!
+_first_line=$(head -1 "$0" 2>/dev/null)
+case "$_first_line" in
+    '<!DOCTYPE'*|'<html'*)
+        echo ""
+        echo "ERROR: Downloaded HTML page instead of shell script."
+        echo "Use the raw URL:"
+        echo ""
+        echo "  wget -O /tmp/install_podkop_bot.sh \\"
+        echo "    https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh"
+        echo "  ash /tmp/install_podkop_bot.sh"
+        echo ""
+        exit 1
+        ;;
+esac
+unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
