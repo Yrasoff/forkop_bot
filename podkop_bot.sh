@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.65
+# Podkop Telegram Bot v0.13.66
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,20 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.66:
+# - FIXED: "Proxy switched" alert showed "From: main-urltest-out" (URLTest
+#          group tag) instead of the actual leaf proxy. Root cause: at watchdog
+#          startup URLTest .now is empty, so _resolve_leaf returned the group
+#          itself as last_leaf baseline. Fix: after _resolve_leaf, check the
+#          resolved node's type — if it's still a group (Selector/URLTest/
+#          Fallback/LoadBalance), discard it and keep last_leaf unchanged.
+#          Only fully-resolved leaf proxies are stored as last_leaf.
+# - FIXED: "Bot route: Initializing..." in Proxy switched alert. Watchdog
+#          runs as a subshell and cannot see LAST_ROUTE_NAME from the parent
+#          process. Fix: _write_socks_state() now writes route_name= to
+#          SOCKS_STATE_FILE. Check D reads it via grep before sending the alert.
+#
+
 # CHANGELOG v0.13.65:
 # - NEW:   Bot Control Plane card now shows "Active Route" — the tier
 #          currently used by the bot to reach Telegram. Placed between
@@ -568,7 +582,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.65"
+BOT_VERSION="0.13.66"
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -2092,8 +2106,8 @@ check_health() {
 }
 
 _write_socks_state() {
-    printf 'tg=%s\nsocks=%s\nroute=%s\nlast_ok=%s\n' \
-        "$1" "$2" "$LAST_ROUTE" "$3" > "$SOCKS_STATE_FILE"
+    printf 'tg=%s\nsocks=%s\nroute=%s\nlast_ok=%s\nroute_name=%s\n' \
+        "$1" "$2" "$LAST_ROUTE" "$3" "$LAST_ROUTE_NAME" > "$SOCKS_STATE_FILE"
 }
 
 # send_health_alert: health daemon uses this instead of bare api_request_fast.
@@ -2327,15 +2341,23 @@ start_health_daemon() {
             # Only runs when sing-box is running and Clash API is available.
             # ------------------------------------------------------------------
             if [ "$curr_sb_state" = "running" ]; then
-                local _wd_proxies _wd_sel _wd_leaf_raw
+                local _wd_proxies _wd_sel _wd_leaf_raw _wd_leaf_type
                 _wd_proxies=$(clash_request "/proxies" 2>/dev/null)
                 if [ -n "$_wd_proxies" ] && [ "$_wd_proxies" != "null" ]; then
                     _wd_sel=$(get_selector_tag "$_wd_proxies")
                     _wd_leaf_raw=$(echo "$_wd_proxies" | jq -r --arg s "$_wd_sel" \
                         '.proxies[$s].now // empty' 2>/dev/null)
-                    [ -n "$_wd_leaf_raw" ] && \
-                        curr_leaf=$(_resolve_leaf "$_wd_leaf_raw" "$_wd_proxies") || \
+                    if [ -n "$_wd_leaf_raw" ]; then
+                        curr_leaf=$(_resolve_leaf "$_wd_leaf_raw" "$_wd_proxies")
+                        # Only accept fully-resolved leaf (not a group/URLTest node)
+                        _wd_leaf_type=$(echo "$_wd_proxies" | jq -r \
+                            --arg n "$curr_leaf" '.proxies[$n].type // empty' 2>/dev/null)
+                        case "$_wd_leaf_type" in
+                            Selector|URLTest|Fallback|LoadBalance) curr_leaf="" ;;
+                        esac
+                    else
                         curr_leaf=""
+                    fi
                     if [ -n "$curr_leaf" ] && [ -n "$last_leaf" ] && \
                        [ "$curr_leaf" != "$last_leaf" ]; then
                         local old_disp new_disp
@@ -2343,15 +2365,19 @@ start_health_daemon() {
                         new_disp=$(display_proxy_name "$curr_leaf")
                         logger -t podkop-bot "[Watchdog] Leaf changed: ${last_leaf} -> ${curr_leaf}"
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
-                            local leaf_txt _mode
+                            local leaf_txt _mode _bot_route
                             _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "unknown")
+                            # Read current bot route from state file (subshell can't see parent vars)
+                            _bot_route=$(grep '^route_name=' "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2-)
+                            [ -z "$_bot_route" ] && _bot_route="${LAST_ROUTE_NAME:-unknown}"
                             leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy switched</b>\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n<b>Section:</b> <code>%s</code> | <b>Mode:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
-                                "$_hn" "$E_TGT" "$old_disp" "$new_disp" "$sec" "$_mode" "${LAST_ROUTE_NAME:-unknown}")
+                                "$_hn" "$E_TGT" "$old_disp" "$new_disp" "$sec" "$_mode" "$_bot_route")
                             admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
                                 '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                             send_health_alert "$admin_payload"
                         fi
                     fi
+                    # Only store fully-resolved leaf to avoid group tags as baseline
                     [ -n "$curr_leaf" ] && last_leaf="$curr_leaf"
                 fi
             fi
