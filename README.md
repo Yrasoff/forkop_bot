@@ -1,6 +1,6 @@
 # 🤖 podkop_bot
 
-Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrtна базе sing-box.
+Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
 Позволяет управлять роутером прямо из Telegram — без доступа к LuCI и SSH.
 
@@ -17,10 +17,11 @@ ash /tmp/install_podkop_bot.sh
 
 ## 📋 Требования
 
-- OpenWrt 23.x / 24.x или ImmortalWrt
+- OpenWrt 23.x / 24.x / 25.x или ImmortalWrt
 - Установленный и настроенный [podkop](https://github.com/itdoginfo/podkop)
 - Пакеты: `curl`, `jq` (устанавливаются автоматически)
 - Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
+- TG User ID админа(-ов)
 
 ---
 
