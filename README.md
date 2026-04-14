@@ -21,7 +21,7 @@ ash /tmp/install_podkop_bot.sh
 - Установленный и настроенный [podkop](https://github.com/itdoginfo/podkop) 0.7.X с включенным Mixed Proxy Port (2080)
 - Пакеты: `curl`, `jq` (устанавливаются автоматически)
 - Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
-- TG User ID админа(-ов)
+- TG User ID админа(-ов) - @Getmyid_Work_Bot
 
 ---
 
