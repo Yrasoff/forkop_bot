@@ -112,8 +112,8 @@ Sticky-роутинг, Recovery Mode, IPC между watchdog и main loop.
 
 ```sh
 # Скачать скрипт
-wget -O /usr/bin/podkop_bot.sh https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh
-chmod +x /usr/bin/podkop_bot.sh
+wget -O /usr/bin/podkop_bot https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh
+chmod +x /usr/bin/podkop_bot
 
 # Настроить UCI
 uci set podkop_bot.settings=settings
@@ -122,7 +122,7 @@ uci set podkop_bot.settings.chat_id="ВАШ_CHAT_ID"
 uci commit podkop_bot
 
 # Запустить
-/usr/bin/podkop_bot.sh &
+/usr/bin/podkop_bot &
 ```
 
 ---
