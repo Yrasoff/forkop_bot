@@ -140,8 +140,10 @@ EXISTING_TOKEN=$(uci_get bot_token)
 EXISTING_CHAT=$(uci_get chat_id)
 
 if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; then
+    # Truncate token for display — ${var:0:N} is bash-only, use printf/cut for ash
+    TOKEN_SHORT=$(printf '%s' "$EXISTING_TOKEN" | cut -c1-${TOKEN_DISPLAY_LENGTH})
     echo "Existing installation detected:"
-    echo "  Token  : ${EXISTING_TOKEN:0:$TOKEN_DISPLAY_LENGTH}..."
+    echo "  Token  : ${TOKEN_SHORT}..."
     echo "  Chat ID: $EXISTING_CHAT"
     echo ""
     echo "Choose an option:"
