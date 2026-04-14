@@ -1,6 +1,6 @@
 # 🤖 podkop_bot
 
-Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом обхода блокировок на базе sing-box для OpenWrt.
+Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrtна базе sing-box.
 
 Позволяет управлять роутером прямо из Telegram — без доступа к LuCI и SSH.
 
