@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.68
+# Podkop Telegram Bot v0.13.69
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,15 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.69:
+# - FIXED: ZeroTier interfaces (zt<hex>, e.g. zt3jnfoa3b) were not shown
+#          in Status — pattern matched "zero" but ZeroTier uses "zt" prefix.
+#          Added "zt" to the interface filter regex.
+# - UX:    Extra VPN interfaces now show human-readable labels:
+#          Tailscale, ZeroTier, AmneziaWG, WireGuard, VPN (tun*)
+#          Format: "🌐 Tailscale (tailscale0): 100.x.x.x"
+#
+
 # CHANGELOG v0.13.68:
 # - FIXED: Alert flood — root cause was two bot instances running simultaneously.
 #          procd sends SIGTERM then SIGKILL, but watchdog subshell can survive.
@@ -611,7 +620,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.68"
+BOT_VERSION="0.13.69"
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -4465,9 +4474,15 @@ EOF
 
             extra_ifs=$(ip -4 addr show 2>/dev/null | awk -v icon="${E_NET}" '/inet / {
                 iface=$NF; sub(/@.*/, "", iface);
-                if(iface ~ /^(tun|tail|awg|wg|zero)/) {
+                if(iface ~ /^(tun|tail|awg|wg|zt|zero)/) {
                     ip=$2; sub(/\/.*/, "", ip);
-                    printf "%s %s: <code>%s</code>\n", icon, iface, ip;
+                    if      (iface ~ /^tail/)  label="Tailscale"
+                    else if (iface ~ /^zt/)    label="ZeroTier"
+                    else if (iface ~ /^awg/)   label="AmneziaWG"
+                    else if (iface ~ /^wg/)    label="WireGuard"
+                    else if (iface ~ /^tun/)   label="VPN"
+                    else                       label=iface
+                    printf "%s %s (<code>%s</code>): <code>%s</code>\n", icon, label, iface, ip;
                 }
             }')
 
