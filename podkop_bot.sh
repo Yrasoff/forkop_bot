@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.60
+# Podkop Telegram Bot v0.13.61
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,22 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.61:
+# - FIXED: /start and text commands after clearing chat history returned no
+#          response. send_or_edit with user's message_id tried to edit user
+#          message (impossible) → silent fail. Plain text now passes empty mid
+#          so send_or_edit always sends a new bot message.
+#          Also fixes second admin /start in a fresh private chat.
+# - FIXED: Bot could stay on tier5 (Emergency IP) indefinitely even after
+#          fallback_socks recovered. tier5 sticky never probed SOCKS tiers
+#          while tier5 itself worked. Now: every 30s, tier5 sticky path
+#          tries _try_socks_tiers first. On success: switches back immediately.
+#          Timestamp tracked in SOCKS_REPROBE_TS_FILE (atomic, no watchdog dep).
+# - FIXED: Watchdog now sends IPC "up" every PROBE_EVERY cycles (default 5min)
+#          when LAST_ROUTE is tier4/tier5. Forces route reset so next request
+#          runs full discovery. Complements tier5 reprobe for tier4 case.
+#
+
 # CHANGELOG v0.13.60:
 # - FIXED: api_request_fast (button presses, sendMessage, editMessage) did not
 #          respect RECOVERY_MODE. After podkop stop, FAST route stuck on tier5
@@ -500,7 +516,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.60"
+BOT_VERSION="0.13.61"
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -563,6 +579,8 @@ HEALTH_STATE_FILE="/tmp/podkop_bot_health_state"
 SOCKS_STATE_FILE="/tmp/podkop_bot_socks_state"
 # Periodic SOCKS latency probe results: key=value per endpoint, written by watchdog
 SOCKS_PROBE_FILE="/tmp/podkop_bot_socks_probe"
+# Timestamp of last SOCKS re-probe from degraded tier4/tier5 sticky path
+SOCKS_REPROBE_TS_FILE="/tmp/podkop_bot_socks_reprobe_ts"
 ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
 LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
 UNAUTH_FILE="/tmp/podkop_bot_unauth"
@@ -888,7 +906,22 @@ _route_request() {
                 }
                 ;;
             tier5)
-                # Emergency IP sticky: skip straight to direct+emergency, no SOCKS probing
+                # On degraded path (tier5): periodically try SOCKS tiers before using emergency IP.
+                # Without this, bот stays on tier5 forever even after fallback_socks recovers.
+                local _now _last_reprobe
+                _now=$(date +%s)
+                _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
+                if [ $((_now - _last_reprobe)) -ge 30 ]; then
+                    echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
+                    local ROUTE_KEY ROUTE_NAME
+                    if _try_socks_tiers "$_args" "$_max" "2"; then
+                        LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
+                        eval "$_rvar=$ROUTE_KEY"
+                        logger -t podkop-bot "[Transport] tier5 reprobe: recovered via ${ROUTE_KEY} / ${ROUTE_NAME}"
+                        return 0
+                    fi
+                fi
+                # Reprobe failed or not yet due — use emergency path
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "3" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Direct"
@@ -2008,6 +2041,15 @@ start_health_daemon() {
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
                 logger -t podkop-bot "[Watchdog] status: socks=${last_socks_state:-unknown} sb=${last_sb_state:-unknown} route=${LAST_ROUTE_NAME}"
                 probe_all_socks_write &
+                # If bot is stuck on degraded path (tier4/tier5), signal recovery attempt.
+                # This resets LAST_ROUTE_FAST/POLL so next request runs full discovery
+                # and can return to SOCKS tiers if they recovered.
+                case "$LAST_ROUTE" in
+                    tier4|tier5)
+                        logger -t podkop-bot "[Watchdog] Degraded route ($LAST_ROUTE) detected — sending IPC up to force rediscovery"
+                        printf 'up' > "$ROUTE_CMD_FILE"
+                        ;;
+                esac
             fi
 
             sec=$(get_active_section)
@@ -5016,7 +5058,7 @@ EOF
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
@@ -5141,7 +5183,9 @@ EOF
                 handle_command "$text" "$CALLBACK_MSG_ID" "$callback_id"
                 answer_callback "$callback_id" ""
             else
-                handle_command "$text" "$CALLBACK_MSG_ID" ""
+                # Plain text: pass empty mid so send_or_edit always sends new message
+                # (cannot editMessageText on user's own message, only on bot messages)
+                handle_command "$text" "" ""
             fi
 
             reset_chat_context
