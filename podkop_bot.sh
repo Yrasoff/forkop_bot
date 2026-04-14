@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.63
+# Podkop Telegram Bot v0.13.65
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,28 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.65:
+# - NEW:   Bot Control Plane card now shows "Active Route" — the tier
+#          currently used by the bot to reach Telegram. Placed between
+#          Transport Policy and Fallback Route list so the operator
+#          immediately sees whether the bot is on tier1 (Podkop SOCKS5),
+#          tier2_N (Fallback SOCKS), tier4 (Direct), tier5 (Emergency IP)
+#          or still Initializing. No extra API calls needed — reads
+#          LAST_ROUTE_NAME which is always current.
+#
+
+# CHANGELOG v0.13.64:
+# - FIXED: Podkop version showed "Unknown" on OpenWrt 25.x (apk). All 5
+#          version detection sites now try opkg first, fall back to apk.
+#          apk package name format: "podkop-0.7.x" -> strips "podkop-" prefix.
+# - FIXED: Main menu button showed "URL Test" in urltest mode instead of
+#          "Outbounds". Now consistent: selector/urltest both show "Outbounds".
+# - FIXED: Alert "Tunnel upstream DOWN/RECOVERED" was misleading — implied
+#          the VPN tunnel for router traffic was affected. Renamed to
+#          "Bot SOCKS upstream DOWN/RECOVERED" to clarify this is the bot's
+#          own transport path to Telegram, not the podkop/sing-box tunnel.
+#
+
 # CHANGELOG v0.13.63:
 # - NEW:   URLTest mode: Auto (best ping) button in Outbound Selector.
 #          Selector .now pointing at URLTest group = auto mode (sing-box picks
@@ -231,7 +253,7 @@
 # - NEW:   Hostname prefix in all watchdog alerts for multi-router supergroup.
 #          All 4 alert types now start with [hostname]:
 #          [Router] sing-box STOPPED/RECOVERED
-#          [Router] ALERT: Tunnel upstream DOWN/RECOVERED
+#          [Router] ALERT: Bot SOCKS upstream DOWN/RECOVERED
 #          [Router] TG Connectivity: ...
 #          Hostname read once at watchdog startup from /proc/sys/kernel/hostname.
 #          Set per-router via: uci set system.@system[0].hostname=MyRouter
@@ -546,7 +568,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.63"
+BOT_VERSION="0.13.65"
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -2268,7 +2290,7 @@ start_health_daemon() {
                         fi
                         [ -z "$_fb_avail" ] && _fb_avail="  (none configured)\n"
                         socks_alert_txt=$(printf \
-                            '<b>[%s]</b> <b>%s Tunnel upstream DOWN</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<b>Fallback:</b>\n<code>%b</code>' \
+                            '<b>[%s]</b> <b>%s Bot SOCKS upstream DOWN</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<b>Fallback:</b>\n<code>%b</code>' \
                             "$_hn" "$E_ERR" "$m_ip" "$m_port" \
                             "$active_px_display" \
                             "${LAST_ROUTE_NAME:-unknown}" \
@@ -2280,7 +2302,7 @@ start_health_daemon() {
                         last_ok_route="tier1"
                         logger -t podkop-bot "[Watchdog] SOCKS recovered - wrote route_cmd=up (DNS warmup done)"
                         socks_alert_txt=$(printf \
-                            '<b>[%s]</b> <b>%s Tunnel upstream RECOVERED</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
+                            '<b>[%s]</b> <b>%s Bot SOCKS upstream RECOVERED</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
                             "$_hn" "$E_OK" "$m_ip" "$m_port" \
                             "$active_px_display" \
                             "${LAST_ROUTE_NAME:-unknown}")
@@ -4298,6 +4320,7 @@ _handle_bot() {
 
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
             # Pass cached proxies to avoid extra clash_request
             local proxies; proxies=$(clash_request "/proxies")
             active_proxy=$(get_active_proxy_name "$proxies")
@@ -4325,7 +4348,7 @@ EOF
             local cur_pct; cur_pct=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
             local proxy_btn_lbl proxy_btn_cb
             case "$cur_pct" in
-                urltest)  proxy_btn_lbl="${E_GLOB} URL Test";       proxy_btn_cb="proxy_menu" ;;
+                urltest)  proxy_btn_lbl="${E_GLOB} Outbounds";      proxy_btn_cb="proxy_menu" ;;
                 url)      proxy_btn_lbl="${E_GLOB} URL Links";      proxy_btn_cb="url_links_menu" ;;
                 outbound) proxy_btn_lbl="${E_GLOB} Outbound";       proxy_btn_cb="outbound_info" ;;
                 *)        proxy_btn_lbl="${E_GLOB} Outbounds"; proxy_btn_cb="proxy_menu" ;;
@@ -4744,6 +4767,7 @@ ${E_BOT} <b>Bot Control Plane</b>
 
 ${E_SHLD} <b>Transport Policy:</b> <code>${tr}</code>
 ${tr_hint}
+<b>Active Route:</b> <code>${LAST_ROUTE_NAME:-Initializing...}</code>
 <b>Fallback Route:</b>
 <code>${tr_chain}</code>
 <b>TG Latency:</b> ${E_TIME} ${tg_lat}
@@ -4878,6 +4902,7 @@ EOF
             local sec; sec=$(get_active_section)
             local hostname; hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             local p_ver; p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
             local sb_ver; sb_ver=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
             {
                 echo "=== Podkop Support Bundle ==="
@@ -4945,6 +4970,7 @@ EOF
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             lan_ip=$(uci -q get network.lan.ipaddr || echo "Unknown")
             p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
             sb_ver=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
             y_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
             text=$(cat <<EOF
@@ -4966,6 +4992,7 @@ EOF
             local p_ver latest text kb
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
             p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2 | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | cut -d'-' -f1)
             latest=$(curl -s --connect-timeout 5 --max-time 10 \
                 "https://api.github.com/repos/itdoginfo/podkop/releases/latest" \
                 | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
@@ -5165,6 +5192,7 @@ send_startup_notification_async() {
                 logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
                 p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
                 active_proxy=$(display_proxy_name_with_tag "$(get_active_proxy_name "")")
                 tg_lat=$(get_tg_latency)
                 sec=$(get_active_section)
