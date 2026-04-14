@@ -1,9 +1,28 @@
 #!/bin/ash
 
-# Installer script for podkop_bot
-# Downloads, configures, and sets up podkop_bot on OpenWrt
-# Supports: OpenWrt 23.x / 24.x (opkg) and OpenWrt 25.x+ (apk)
+# Installer for podkop_bot — Telegram remote management bot for podkop/sing-box on OpenWrt
+# Supports: OpenWrt 23.05 / 24.10 (opkg) and OpenWrt 25.x+ (apk)
 # Based on installer pattern from https://github.com/VizzleTF/podkop_autoupdater
+#
+# CORRECT install command:
+#   wget -O /tmp/install_podkop_bot.sh \
+#     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
+#   ash /tmp/install_podkop_bot.sh
+
+# ── Self-check: detect accidental HTML download (wrong GitHub URL) ─────────────
+# Correct:  https://raw.githubusercontent.com/...
+# Wrong:    https://github.com/.../blob/main/...  ← downloads HTML page
+if grep -q "<!DOCTYPE\|<html" "$0" 2>/dev/null; then
+    echo ""
+    echo "ERROR: Downloaded HTML page instead of shell script."
+    echo "Use the raw URL:"
+    echo ""
+    echo "  wget -O /tmp/install_podkop_bot.sh \\"
+    echo "    https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh"
+    echo "  ash /tmp/install_podkop_bot.sh"
+    echo ""
+    exit 1
+fi
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
@@ -16,53 +35,47 @@ OS_RELEASE_FILE="/etc/os-release"
 TOKEN_DISPLAY_LENGTH=10
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-exit_with_error() {
-    echo ""
-    echo "Ошибка: $1"
-    exit 1
-}
-
+die()  { echo ""; echo "ERROR: $1"; exit 1; }
 info() { echo "  $1"; }
-ok()   { echo "OK $1"; }
-warn() { echo "!! $1"; }
+ok()   { echo "[OK] $1"; }
+warn() { echo "[!!] $1"; }
 
 download_file() {
     local url="$1" dest="$2"
     wget -q -O "$dest" "$url" 2>/dev/null \
         || curl -s -o "$dest" "$url" 2>/dev/null \
-        || exit_with_error "Не удалось скачать $url. Проверьте интернет."
+        || die "Failed to download $url — check internet connection."
 }
 
-uci_set() { uci set    "${UCI_PKG}.${UCI_SEC}.${1}=${2}" 2>/dev/null; }
 uci_get() { uci -q get "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
 
 # ── Check OS ───────────────────────────────────────────────────────────────────
 if ! grep -qE "OpenWrt|immortalwrt|ImmortalWrt" "$OS_RELEASE_FILE" 2>/dev/null; then
-    exit_with_error "Скрипт предназначен для OpenWrt / ImmortalWrt."
+    die "This script is designed for OpenWrt / ImmortalWrt only."
 fi
 
 echo ""
-echo "podkop_bot -- установщик"
-echo "========================"
+echo "==========================================="
+echo "  podkop_bot installer"
+echo "==========================================="
 echo ""
 
 # ── Detect package manager (opkg vs apk) ──────────────────────────────────────
-# OpenWrt 23.x / 24.x uses opkg.
-# OpenWrt 25.x+ migrated to apk (Alpine Package Keeper).
-# Detection priority:
-#   1. Binary presence (most reliable — works even if PATH is non-standard)
-#   2. VERSION_ID from /etc/os-release (fallback)
+# OpenWrt 23.05 / 24.10  → opkg
+# OpenWrt 25.x+          → apk (Alpine Package Keeper)
+#
+# Detection order:
+#   1. Binary in PATH  — most reliable
+#   2. VERSION_ID in /etc/os-release — fallback when binary not yet in PATH
 PKG_MANAGER=""
 if command -v apk >/dev/null 2>&1; then
     PKG_MANAGER="apk"
 elif command -v opkg >/dev/null 2>&1; then
     PKG_MANAGER="opkg"
 else
-    # Neither binary in PATH — parse VERSION_ID
-    # VERSION_ID format: "24.10.1" or "25.xx.x" or "SNAPSHOT"
     _ver=$(grep "^VERSION_ID=" "$OS_RELEASE_FILE" 2>/dev/null | cut -d'"' -f2)
     _major=$(echo "$_ver" | cut -d'.' -f1)
-    if echo "$_major" | grep -qE '^[0-9]+$' && [ "$_major" -ge 25 ]; then
+    if echo "$_major" | grep -qE '^[0-9]+$' && [ "$_major" -ge 25 ] 2>/dev/null; then
         PKG_MANAGER="apk"
     else
         PKG_MANAGER="opkg"
@@ -70,13 +83,13 @@ else
     unset _ver _major
 fi
 
-info "Версия OpenWrt: $(grep '^VERSION_ID=' "$OS_RELEASE_FILE" 2>/dev/null | cut -d'"' -f2 || echo 'unknown')"
-info "Пакетный менеджер: ${PKG_MANAGER}"
+OWRT_VERSION=$(grep '^VERSION_ID=' "$OS_RELEASE_FILE" 2>/dev/null | cut -d'"' -f2)
+info "OpenWrt version : ${OWRT_VERSION:-unknown}"
+info "Package manager : ${PKG_MANAGER}"
 echo ""
 
 # ── Package manager wrappers ───────────────────────────────────────────────────
-# All package operations go through these wrappers so the rest of the script
-# is identical regardless of opkg vs apk.
+# All install operations use these wrappers — rest of the script is PM-agnostic.
 
 pkg_update() {
     case "$PKG_MANAGER" in
@@ -86,16 +99,10 @@ pkg_update() {
 }
 
 pkg_is_installed() {
-    # Returns 0 if package is installed, 1 otherwise
     local pkg="$1"
     case "$PKG_MANAGER" in
-        apk)
-            # apk info exits 0 if package is installed
-            apk info "$pkg" >/dev/null 2>&1
-            ;;
-        opkg)
-            opkg list-installed 2>/dev/null | grep -q "^${pkg} "
-            ;;
+        apk)  apk info "$pkg" >/dev/null 2>&1 ;;
+        opkg) opkg list-installed 2>/dev/null | grep -q "^${pkg} " ;;
     esac
 }
 
@@ -108,17 +115,17 @@ pkg_install() {
 }
 
 # ── Install dependencies ───────────────────────────────────────────────────────
-info "Обновление индекса пакетов..."
+info "Updating package index..."
 pkg_update
 
-info "Установка зависимостей (curl, jq)..."
+info "Installing dependencies: curl, jq"
 for pkg in curl jq; do
     if pkg_is_installed "$pkg"; then
-        info "  $pkg — уже установлен"
+        info "  $pkg — already installed"
     else
-        info "  Установка $pkg..."
-        pkg_install "$pkg" || exit_with_error "Не удалось установить $pkg."
-        ok "$pkg установлен."
+        info "  Installing $pkg..."
+        pkg_install "$pkg" || die "Failed to install $pkg."
+        ok "$pkg installed."
     fi
 done
 echo ""
@@ -128,117 +135,129 @@ EXISTING_TOKEN=$(uci_get bot_token)
 EXISTING_CHAT=$(uci_get chat_id)
 
 if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; then
-    echo "Обнаружена существующая установка:"
-    echo "  Токен:   ${EXISTING_TOKEN:0:$TOKEN_DISPLAY_LENGTH}..."
+    echo "Existing installation detected:"
+    echo "  Token  : ${EXISTING_TOKEN:0:$TOKEN_DISPLAY_LENGTH}..."
     echo "  Chat ID: $EXISTING_CHAT"
     echo ""
-    echo "Выберите действие:"
-    echo "  1) Обновить скрипт, сохранить конфиг  (по умолчанию)"
-    echo "  2) Переустановить с новыми настройками"
-    echo "  3) Выйти без изменений"
-    printf "Введите 1, 2 или 3: "
+    echo "Choose an option:"
+    echo "  1) Update script, keep config  [default]"
+    echo "  2) Reinstall with new settings"
+    echo "  3) Exit without changes"
+    printf "Enter 1, 2 or 3: "
     read -r CHOICE
     echo ""
     case "$CHOICE" in
         2)
-            info "Переустановка с новыми настройками..."
+            info "Reinstalling with new settings..."
             ;;
         3)
-            ok "Установка пропущена. Текущий конфиг сохранён."
+            ok "Skipped. Existing config preserved."
             exit 0
             ;;
         1|*)
-            info "Обновление скрипта без изменения конфига..."
+            info "Updating script, preserving config..."
             download_file "$BOT_URL" "$BOT_PATH"
             chmod +x "$BOT_PATH"
-            ok "Скрипт обновлён: $BOT_PATH"
+            ok "Script updated: $BOT_PATH"
             echo ""
             if [ -f "$INIT_PATH" ] && "$INIT_PATH" status >/dev/null 2>&1; then
-                "$INIT_PATH" restart >/dev/null 2>&1 && ok "Сервис перезапущен."
+                "$INIT_PATH" restart >/dev/null 2>&1 && ok "Service restarted."
             fi
-            echo "Установка завершена!"
+            echo "Done."
             exit 0
             ;;
     esac
 fi
 
 # ── Download bot script ────────────────────────────────────────────────────────
-info "Скачивание podkop_bot..."
+info "Downloading podkop_bot..."
 download_file "$BOT_URL" "$BOT_PATH"
 chmod +x "$BOT_PATH"
-ok "Скачан: $BOT_PATH"
+ok "Downloaded: $BOT_PATH"
 echo ""
 
-# ── Configure bot token ────────────────────────────────────────────────────────
-echo "-- Настройка бота --"
+# ── Bot token ─────────────────────────────────────────────────────────────────
+echo "-------------------------------------------"
+echo "  Bot configuration"
+echo "-------------------------------------------"
 echo ""
-printf "Введите токен Telegram-бота (от @BotFather):\n> "
+printf "Telegram bot token (from @BotFather):\n> "
 read -r BOT_TOKEN
-[ -z "$BOT_TOKEN" ] && exit_with_error "Токен не может быть пустым."
+[ -z "$BOT_TOKEN" ] && die "Bot token cannot be empty."
 
-info "Проверка токена через Telegram API..."
+info "Verifying token with Telegram API..."
 TG_CHECK=$(curl -s --connect-timeout 8 \
     "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null)
 if ! echo "$TG_CHECK" | grep -q '"ok":true'; then
-    warn "Не удалось подтвердить токен. Убедитесь что токен верный и есть интернет."
-    printf "Продолжить установку с этим токеном? (y/N): "
+    warn "Could not verify token. Check the token and internet connection."
+    printf "Continue with this token anyway? (y/N): "
     read -r CONT
-    [ "$CONT" != "y" ] && [ "$CONT" != "Y" ] && exit_with_error "Установка прервана."
+    [ "$CONT" != "y" ] && [ "$CONT" != "Y" ] && die "Installation aborted."
 else
     BOT_NAME=$(echo "$TG_CHECK" | jq -r '.result.username // "unknown"' 2>/dev/null)
-    ok "Токен валиден. Бот: @${BOT_NAME}"
+    ok "Token valid. Bot: @${BOT_NAME}"
 fi
 echo ""
 
-# ── Configure chat_id ──────────────────────────────────────────────────────────
-printf "Введите Chat ID или User ID для алертов\n(личный чат, группа или supergroup):\n> "
+# ── Chat ID ───────────────────────────────────────────────────────────────────
+printf "Chat ID or User ID for alerts\n(private chat, group, or supergroup):\n> "
 read -r CHAT_ID
-[ -z "$CHAT_ID" ] && exit_with_error "Chat ID не может быть пустым."
+[ -z "$CHAT_ID" ] && die "Chat ID cannot be empty."
 
-# ── Optional: additional admin IDs ────────────────────────────────────────────
+# ── Additional admin IDs (optional) ───────────────────────────────────────────
 echo ""
-printf "Дополнительные admin User ID (через пробел, Enter чтобы пропустить):\n> "
+printf "Additional admin User IDs, space-separated (Enter to skip):\n> "
 read -r ADMIN_IDS
 
-# ── Optional: allow anonymous group admins ─────────────────────────────────────
+# ── Anonymous group admins (optional) ─────────────────────────────────────────
 echo ""
-printf "Разрешить anonymous admins в группах? (Y/n): "
+printf "Allow anonymous group admins? (Y/n): "
 read -r ANON_ADMINS
 ANON_ADMINS_VAL=1
 [ "$ANON_ADMINS" = "n" ] || [ "$ANON_ADMINS" = "N" ] && ANON_ADMINS_VAL=0
 
 # ── Write UCI config ───────────────────────────────────────────────────────────
-info "Запись конфига в UCI..."
+info "Writing UCI config..."
+
+# Ensure config file exists before uci operations (fresh system)
+[ -f "/etc/config/${UCI_PKG}" ] || touch "/etc/config/${UCI_PKG}" \
+    || die "Cannot create /etc/config/${UCI_PKG} — check filesystem."
+
 uci -q delete "${UCI_PKG}.${UCI_SEC}" 2>/dev/null
-uci set "${UCI_PKG}.${UCI_SEC}=settings"
-uci_set "bot_token"              "$BOT_TOKEN"
-uci_set "chat_id"                "$CHAT_ID"
-uci_set "allow_anonymous_admins" "$ANON_ADMINS_VAL"
-[ -n "$ADMIN_IDS" ] && uci_set "admin_ids" "$ADMIN_IDS"
-uci_set "transport"              "auto"
-uci_set "health_interval"        "60"
-uci_set "alert_notify"           "1"
-uci_set "startup_notify"         "1"
-uci commit "$UCI_PKG" || exit_with_error "uci commit failed."
-ok "UCI конфиг записан (/etc/config/${UCI_PKG})."
+uci set "${UCI_PKG}.${UCI_SEC}=settings" \
+    || die "uci set failed — check /etc/config/ permissions."
+
+uci set "${UCI_PKG}.${UCI_SEC}.bot_token=${BOT_TOKEN}"
+uci set "${UCI_PKG}.${UCI_SEC}.chat_id=${CHAT_ID}"
+uci set "${UCI_PKG}.${UCI_SEC}.allow_anonymous_admins=${ANON_ADMINS_VAL}"
+[ -n "$ADMIN_IDS" ] && uci set "${UCI_PKG}.${UCI_SEC}.admin_ids=${ADMIN_IDS}"
+uci set "${UCI_PKG}.${UCI_SEC}.transport=auto"
+uci set "${UCI_PKG}.${UCI_SEC}.health_interval=60"
+uci set "${UCI_PKG}.${UCI_SEC}.alert_notify=1"
+uci set "${UCI_PKG}.${UCI_SEC}.startup_notify=1"
+
+uci commit "$UCI_PKG" || die "uci commit failed."
+ok "Config written to /etc/config/${UCI_PKG}"
 echo ""
 
-# ── Init script ────────────────────────────────────────────────────────────────
-echo "-- Автозапуск --"
+# ── Init script / autostart ────────────────────────────────────────────────────
+echo "-------------------------------------------"
+echo "  Autostart"
+echo "-------------------------------------------"
 echo ""
-printf "Установить автозапуск через init.d? (Y/n): "
+printf "Set up autostart via init.d? (Y/n): "
 read -r SETUP_INIT
 
 if [ "$SETUP_INIT" != "n" ] && [ "$SETUP_INIT" != "N" ]; then
-    # Try repo init script first; generate locally if not available
+    # Try to download init script from repo; generate locally as fallback
     INIT_OK=0
-    if wget -q --spider "$INIT_URL" >/dev/null 2>&1 || \
-       curl -sf --head "$INIT_URL" >/dev/null 2>&1; then
+    if wget -q --spider "$INIT_URL" >/dev/null 2>&1 \
+    || curl -sf --head "$INIT_URL" >/dev/null 2>&1; then
         download_file "$INIT_URL" "$INIT_PATH"
         INIT_OK=1
     fi
     if [ "$INIT_OK" = "0" ]; then
-        # procd-based init script — works on OpenWrt 23.x/24.x/25.x+
+        # Generate procd init script — compatible with OpenWrt 23.05 / 24.10 / 25.x+
         cat > "$INIT_PATH" << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=99
@@ -258,14 +277,14 @@ INITEOF
     fi
     chmod +x "$INIT_PATH"
     "$INIT_PATH" enable >/dev/null 2>&1
-    ok "Автозапуск включён (/etc/init.d/podkop_bot)."
+    ok "Autostart enabled: /etc/init.d/podkop_bot"
 else
-    info "Автозапуск пропущен. Запустить вручную: $BOT_PATH &"
+    info "Autostart skipped. Run manually: $BOT_PATH &"
 fi
 echo ""
 
-# ── Start bot ──────────────────────────────────────────────────────────────────
-printf "Запустить бота сейчас? (Y/n): "
+# ── Start now ─────────────────────────────────────────────────────────────────
+printf "Start the bot now? (Y/n): "
 read -r START_NOW
 echo ""
 
@@ -274,36 +293,36 @@ if [ "$START_NOW" != "n" ] && [ "$START_NOW" != "N" ]; then
         "$INIT_PATH" start >/dev/null 2>&1
         sleep 2
         if "$INIT_PATH" status >/dev/null 2>&1; then
-            ok "Бот запущен через init.d."
+            ok "Bot started via init.d."
         else
-            warn "init.d статус неизвестен. Проверьте: logread | grep podkop-bot"
+            warn "init.d status unknown — starting directly..."
             "$BOT_PATH" &
-            ok "Бот запущен напрямую (PID: $!)."
+            ok "Bot started (PID: $!)."
         fi
     else
         "$BOT_PATH" &
-        ok "Бот запущен (PID: $!)."
+        ok "Bot started (PID: $!)."
     fi
 else
-    info "Бот не запущен. Запустить: $BOT_PATH &"
+    info "Bot not started. Run: $BOT_PATH &"
 fi
 
-# ── Summary ────────────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
-echo "=========================="
-echo "   Установка завершена!"
-echo "=========================="
+echo "==========================================="
+echo "  Installation complete!"
+echo "==========================================="
 echo ""
-echo "  Скрипт:    $BOT_PATH"
-echo "  Конфиг:    /etc/config/${UCI_PKG}"
-echo "  Логи:      logread | grep podkop-bot"
-echo "  Пакеты:    ${PKG_MANAGER}"
+echo "  Script  : $BOT_PATH"
+echo "  Config  : /etc/config/${UCI_PKG}"
+echo "  Logs    : logread | grep podkop-bot"
+echo "  Pkg mgr : ${PKG_MANAGER}"
 echo ""
-echo "Полезные команды:"
+echo "Service commands:"
 echo "  /etc/init.d/podkop_bot start|stop|restart|status"
 echo "  logread -f | grep podkop-bot"
 echo ""
-echo "Управление UCI:"
+echo "UCI config:"
 echo "  uci show ${UCI_PKG}"
 echo "  uci set ${UCI_PKG}.${UCI_SEC}.health_interval=60"
 echo "  uci set ${UCI_PKG}.${UCI_SEC}.alert_notify=0"
