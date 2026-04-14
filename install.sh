@@ -31,6 +31,7 @@ unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
+VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INIT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot_init"
@@ -140,14 +141,18 @@ EXISTING_TOKEN=$(uci_get bot_token)
 EXISTING_CHAT=$(uci_get chat_id)
 
 if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; then
-    # Truncate token for display — ${var:0:N} is bash-only, use printf/cut for ash
     TOKEN_SHORT=$(printf '%s' "$EXISTING_TOKEN" | cut -c1-${TOKEN_DISPLAY_LENGTH})
+    # Read installed version from BOT_VERSION= line in the script
+    INSTALLED_VER=$(grep '^BOT_VERSION=' "$BOT_PATH" 2>/dev/null | cut -d'"' -f2)
+    [ -z "$INSTALLED_VER" ] && INSTALLED_VER="unknown"
+
     echo "Existing installation detected:"
-    echo "  Token  : ${TOKEN_SHORT}..."
-    echo "  Chat ID: $EXISTING_CHAT"
+    echo "  Token    : ${TOKEN_SHORT}..."
+    echo "  Chat ID  : $EXISTING_CHAT"
+    echo "  Version  : ${INSTALLED_VER}"
     echo ""
     echo "Choose an option:"
-    echo "  1) Update script, keep config  [default]"
+    echo "  1) Update script from GitHub, keep config  [default]"
     echo "  2) Reinstall with new settings"
     echo "  3) Exit without changes"
     printf "Enter 1, 2 or 3: "
@@ -162,13 +167,59 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
             exit 0
             ;;
         1|*)
-            info "Updating script, preserving config..."
+            # Fetch remote version from version.txt — lightweight (~10 bytes vs ~200KB)
+            info "Fetching latest version info from GitHub..."
+            REMOTE_VER=$(wget -q -O - "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+            [ -z "$REMOTE_VER" ] && \
+                REMOTE_VER=$(curl -s "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+            [ -z "$REMOTE_VER" ] && REMOTE_VER="unknown"
+
+            echo ""
+            echo "  Installed : v${INSTALLED_VER}"
+            echo "  Available : v${REMOTE_VER}"
+            echo ""
+
+            if [ "$INSTALLED_VER" = "$REMOTE_VER" ] && [ "$REMOTE_VER" != "unknown" ]; then
+                echo "Already up to date."
+                printf "Update anyway? (y/N): "
+                read -r FORCE_UPDATE
+                [ "$FORCE_UPDATE" != "y" ] && [ "$FORCE_UPDATE" != "Y" ] && {
+                    ok "No changes made."
+                    exit 0
+                }
+            else
+                printf "Update v${INSTALLED_VER} -> v${REMOTE_VER}? (Y/n): "
+                read -r CONFIRM_UPDATE
+                [ "$CONFIRM_UPDATE" = "n" ] || [ "$CONFIRM_UPDATE" = "N" ] && {
+                    ok "Update cancelled. No changes made."
+                    exit 0
+                }
+            fi
+
+            # Stop service before replacing binary
+            if [ -f "$INIT_PATH" ] && "$INIT_PATH" status >/dev/null 2>&1; then
+                info "Stopping service..."
+                "$INIT_PATH" stop >/dev/null 2>&1
+                sleep 1
+            fi
+
+            info "Downloading v${REMOTE_VER}..."
             download_file "$BOT_URL" "$BOT_PATH"
             chmod +x "$BOT_PATH"
-            ok "Script updated: $BOT_PATH"
+            ok "Updated to v${REMOTE_VER}: $BOT_PATH"
             echo ""
-            if [ -f "$INIT_PATH" ] && "$INIT_PATH" status >/dev/null 2>&1; then
-                "$INIT_PATH" restart >/dev/null 2>&1 && ok "Service restarted."
+
+            # Restart service if init.d script exists
+            if [ -f "$INIT_PATH" ]; then
+                "$INIT_PATH" start >/dev/null 2>&1
+                sleep 2
+                if "$INIT_PATH" status >/dev/null 2>&1; then
+                    ok "Service restarted."
+                else
+                    warn "Service did not start — check: logread | grep podkop-bot"
+                fi
+            else
+                info "No init.d script found. Start manually: $BOT_PATH &"
             fi
             echo "Done."
             exit 0
