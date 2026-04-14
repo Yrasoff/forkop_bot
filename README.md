@@ -17,8 +17,8 @@ ash /tmp/install_podkop_bot.sh
 
 ## 📋 Требования
 
-- OpenWrt 23.x / 24.x / 25.x или ImmortalWrt
-- Установленный и настроенный [podkop](https://github.com/itdoginfo/podkop)
+- OpenWrt 24.x / 25.x или ImmortalWrt
+- Установленный и настроенный [podkop](https://github.com/itdoginfo/podkop) 0.7.X+
 - Пакеты: `curl`, `jq` (устанавливаются автоматически)
 - Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
 - TG User ID админа(-ов)
