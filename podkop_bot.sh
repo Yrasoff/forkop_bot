@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.66
+# Podkop Telegram Bot v0.13.68
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,35 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.68:
+# - FIXED: Alert flood — root cause was two bot instances running simultaneously.
+#          procd sends SIGTERM then SIGKILL, but watchdog subshell can survive.
+#          New singleton guard at startup: reads BOT_PID_FILE, kills stale
+#          instance + its subshells, writes own PID. Prevents duplicate
+#          watchdog processes each sending independent leaf-change alerts.
+# - FIXED: "Bot route: Initializing..." persisted because MAIN_ROUTE_FILE
+#          was only written on tier resolution, but watchdog starts in parallel
+#          and fires Check D before main loop resolves first route.
+#          Fix: write MAIN_ROUTE_FILE immediately after first successful
+#          api_request_fast at startup, before watchdog is forked.
+#
+
+# CHANGELOG v0.13.67:
+# - FIXED: Proxy names with flag emojis showed as raw xNN bytes. BusyBox
+#          printf does not support xNN escapes in %b. url_decode() rewritten
+#          to use awk (hex->octal conversion) + printf octal escapes, which
+#          works correctly on all OpenWrt variants for multi-byte UTF-8.
+# - FIXED: "Bot route: Initializing..." in Proxy switched alerts. Watchdog
+#          is a subshell and cannot see parent LAST_ROUTE_NAME updates.
+#          New MAIN_ROUTE_FILE (/tmp/podkop_bot_main_route): main process
+#          writes current route name there on every successful tier resolution
+#          (all sticky + full discovery paths). Check D reads from this file.
+# - FIXED: Proxy switched alert spam during URLTest failover (every few secs).
+#          Added 60s debounce: leaf-change alert fires at most once per minute.
+#          Rapid consecutive switches (e.g. URLTest probing dead servers) are
+#          logged but only the first triggers an alert per 60s window.
+#
+
 # CHANGELOG v0.13.66:
 # - FIXED: "Proxy switched" alert showed "From: main-urltest-out" (URLTest
 #          group tag) instead of the actual leaf proxy. Root cause: at watchdog
@@ -582,7 +611,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.66"
+BOT_VERSION="0.13.68"
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -649,6 +678,8 @@ SOCKS_STATE_FILE="/tmp/podkop_bot_socks_state"
 SOCKS_PROBE_FILE="/tmp/podkop_bot_socks_probe"
 # Timestamp of last SOCKS re-probe from degraded tier4/tier5 sticky path
 SOCKS_REPROBE_TS_FILE="/tmp/podkop_bot_socks_reprobe_ts"
+# Main process writes current route name here so watchdog subshell can read it
+MAIN_ROUTE_FILE="/tmp/podkop_bot_main_route"
 ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
 LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
 UNAUTH_FILE="/tmp/podkop_bot_unauth"
@@ -757,8 +788,25 @@ json_escape() {
 url_decode() {
     local data="$1"
     [ -z "$data" ] && { echo ""; return 0; }
+    # Replace + with space first
     data=$(printf '%s' "$data" | sed 's/+/ /g')
-    printf '%b' "$(printf '%s' "$data" | sed 's/%/\\x/g')"
+    # Convert %XX to octal \NNN via awk, then interpret with printf.
+    # BusyBox printf does not support \xNN escapes but does support \NNN (octal).
+    # This correctly handles multi-byte UTF-8 sequences (emoji flags etc).
+    local escaped
+    escaped=$(printf '%s' "$data" | \
+        awk 'BEGIN{for(i=0;i<256;i++) oct[sprintf("%02X",i)]=sprintf("\\%03o",i)}
+        {
+            s=$0; r=""
+            while(match(s,/%[0-9A-Fa-f][0-9A-Fa-f]/)){
+                r=r substr(s,1,RSTART-1)
+                h=toupper(substr(s,RSTART+1,2))
+                r=r oct[h]
+                s=substr(s,RSTART+3)
+            }
+            printf "%s", r s
+        }')
+    printf "$escaped"
 }
 
 # ==============================================================================
@@ -956,6 +1004,7 @@ _route_request() {
                 [ -n "$_fb" ] && \
                 _try_curl "-x $_fb" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="$_last"; LAST_ROUTE_NAME="Fallback SOCKS${_n} (${_fb})"
+                    printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
                     eval "$_rvar=$_last"; return 0
                 }
                 ;;
@@ -984,6 +1033,7 @@ _route_request() {
                     local ROUTE_KEY ROUTE_NAME
                     if _try_socks_tiers "$_args" "$_max" "2"; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
+                        printf '%s' "$ROUTE_NAME" > "$MAIN_ROUTE_FILE"
                         eval "$_rvar=$ROUTE_KEY"
                         logger -t podkop-bot "[Transport] tier5 reprobe: recovered via ${ROUTE_KEY} / ${ROUTE_NAME}"
                         return 0
@@ -993,11 +1043,13 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "3" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Direct"
+                    printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
                     eval "$_rvar=tier4"; return 0
                 }
                 for _eip in $TG_EMERGENCY_IPS; do
                     _try_curl "$_t_ifflag --resolve api.telegram.org:443:${_eip}" "$_max" "$_args" "3" && {
                         LAST_ROUTE="tier5"; LAST_ROUTE_NAME="Emergency IP (${_eip})"
+                        printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
                         eval "$_rvar=tier5"; return 0
                     }
                 done
@@ -1012,6 +1064,7 @@ _route_request() {
         local _prev_name="$LAST_ROUTE_NAME"
         LAST_ROUTE="$ROUTE_KEY"
         LAST_ROUTE_NAME="$ROUTE_NAME"
+        printf '%s' "$ROUTE_NAME" > "$MAIN_ROUTE_FILE"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
             logger -t podkop-bot "[Transport] recover old=fail new=${ROUTE_KEY} route=${ROUTE_NAME}"
@@ -2139,6 +2192,8 @@ start_health_daemon() {
         local _hn; _hn=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         # Leaf proxy tracking — alert when active proxy changes
         local last_leaf="" curr_leaf=""
+        # Debounce: don't send leaf-change alerts more often than once per 60s
+        local last_leaf_alert_ts=0
 
         while true; do
             interval=$(uci -q get podkop_bot.settings.health_interval || echo "60")
@@ -2360,16 +2415,19 @@ start_health_daemon() {
                     fi
                     if [ -n "$curr_leaf" ] && [ -n "$last_leaf" ] && \
                        [ "$curr_leaf" != "$last_leaf" ]; then
-                        local old_disp new_disp
+                        local old_disp new_disp _now_ts
                         old_disp=$(display_proxy_name "$last_leaf")
                         new_disp=$(display_proxy_name "$curr_leaf")
                         logger -t podkop-bot "[Watchdog] Leaf changed: ${last_leaf} -> ${curr_leaf}"
-                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                        _now_ts=$(date +%s)
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ] && \
+                           [ $((_now_ts - last_leaf_alert_ts)) -ge 60 ]; then
+                            last_leaf_alert_ts=$_now_ts
                             local leaf_txt _mode _bot_route
                             _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "unknown")
-                            # Read current bot route from state file (subshell can't see parent vars)
-                            _bot_route=$(grep '^route_name=' "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2-)
-                            [ -z "$_bot_route" ] && _bot_route="${LAST_ROUTE_NAME:-unknown}"
+                            # Read current bot route from MAIN_ROUTE_FILE (written by main process)
+                            _bot_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null)
+                            [ -z "$_bot_route" ] && _bot_route="unknown"
                             leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy switched</b>\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n<b>Section:</b> <code>%s</code> | <b>Mode:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
                                 "$_hn" "$E_TGT" "$old_disp" "$new_disp" "$sec" "$_mode" "$_bot_route")
                             admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
@@ -5202,6 +5260,24 @@ handle_command() {
 # SECTION 11: Startup & Main Event Loop
 # ==============================================================================
 
+# ── Singleton guard ────────────────────────────────────────────────────────────
+# Kill any orphaned watchdog processes from a previous instance that survived
+# SIGKILL (procd can leave subshells running). The watchdog itself does not
+# hold the lock so it won't be blocked — only the main loop holds it.
+BOT_LOCK_FILE="/tmp/podkop_bot.lock"
+BOT_PID_FILE="/tmp/podkop_bot.pid"
+if [ -f "$BOT_PID_FILE" ]; then
+    _old_pid=$(cat "$BOT_PID_FILE" 2>/dev/null)
+    if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
+        logger -t podkop-bot "[Startup] Killing stale instance PID=${_old_pid}"
+        kill "$_old_pid" 2>/dev/null; sleep 1
+        kill -9 "$_old_pid" 2>/dev/null
+    fi
+fi
+printf '%s' "$$" > "$BOT_PID_FILE"
+# Also kill any leftover watchdog subshells by scriptname
+kill $(pgrep -f "podkop_bot" 2>/dev/null | grep -v "^$$\$" | grep -v "^$(cat $BOT_PID_FILE)\$") 2>/dev/null || true
+
 logger -t podkop-bot "=== Podkop Bot v${BOT_VERSION} Starting ==="
 
 # Startup notification runs in background subprocess to not block the main loop
@@ -5214,6 +5290,8 @@ send_startup_notification_async() {
     while [ "$i" -le 12 ]; do
         if api_request_fast "getMe" "{}" "5" >/dev/null; then
             load_bot_identity >/dev/null 2>&1
+            # Write initial route so watchdog subshell can read it immediately
+            printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
                 logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
@@ -5245,7 +5323,7 @@ EOF
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$BOT_PID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
