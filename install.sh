@@ -1,207 +1,242 @@
 #!/bin/ash
 
-# Installer script for podkop_updater.sh
-# Downloads, configures, and optionally schedules podkop_updater.sh on OpenWrt
+# Installer script for podkop_bot
+# Downloads, configures, and sets up podkop_bot on OpenWrt
+# Based on installer pattern from https://github.com/VizzleTF/podkop_autoupdater
 
-# Constants
-UPDATER_URL="https://raw.githubusercontent.com/VizzleTF/podkop_autoupdater/refs/heads/main/podkop_updater.sh"  # URL to download the updater script
-UPDATER_PATH="/usr/bin/podkop_updater.sh"  # Installation path for the updater script
-LOG_FILE="/tmp/podkop_update.log"  # Log file for update operations
-DEFAULT_BOT_TOKEN="your_bot_token"  # Default placeholder for Telegram bot token
-DEFAULT_CHAT_ID="your_chat_id"  # Default placeholder for Telegram chat ID
-DEFAULT_CRON_HOURS=1  # Default cron interval in hours. Must be bigger than POLL_TIMEOUT to avoid overlapping runs
-TOKEN_DISPLAY_LENGTH=10  # Number of characters to show when displaying bot token
-TEMP_UPDATER_PATH="/tmp/podkop_updater_new.sh"  # Temporary path for downloaded updater script
-CRON_FILE="/etc/crontabs/root"  # Path to root crontab file
-OS_RELEASE_FILE="/etc/os-release"  # System OS release information file
-GITHUB_API_URL="https://api.github.com/repos/itdoginfo/podkop/releases/latest"  # GitHub API URL for latest podkop release
-TELEGRAM_API_BASE="https://api.telegram.org/bot"  # Base URL for Telegram Bot API
-CRON_SERVICE="/etc/init.d/cron"  # Cron service control script
+# ── Constants ──────────────────────────────────────────────────────────────────
+BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
+BOT_PATH="/usr/bin/podkop_bot"
+INIT_PATH="/etc/init.d/podkop_bot"
+INIT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot_init"
+UCI_PKG="podkop_bot"
+UCI_SEC="settings"
+OS_RELEASE_FILE="/etc/os-release"
+TOKEN_DISPLAY_LENGTH=10
 
-# Functions
+# ── Helpers ────────────────────────────────────────────────────────────────────
 exit_with_error() {
-  local message="$1"
-  echo "Error: $message"
-  exit 1
+    echo ""
+    echo "❌ Ошибка: $1"
+    exit 1
 }
+
+info() { echo "ℹ  $1"; }
+ok()   { echo "✅ $1"; }
+warn() { echo "⚠️  $1"; }
 
 download_file() {
-  local url="$1"
-  local output_path="$2"
-  wget -O "$output_path" "$url" > /dev/null 2>&1
-  if [ $? -ne 0 ]; then
-    exit_with_error "Failed to download from $url. Please check your internet connection."
-  fi
+    local url="$1" dest="$2"
+    wget -q -O "$dest" "$url" 2>/dev/null \
+        || curl -s -o "$dest" "$url" 2>/dev/null \
+        || exit_with_error "Не удалось скачать $url. Проверьте интернет."
 }
 
-setup_cron_job() {
-  local cron_hours="$1"
-  local updater_command="$2"
-  echo "Setting up cron job to run every $cron_hours hour(s)..."
-  if [ ! -f "$CRON_FILE" ]; then
-    touch "$CRON_FILE"
-  fi
-  sed -i "/podkop_updater.sh/d" "$CRON_FILE"
-  echo "0 */$cron_hours * * * $updater_command" >> "$CRON_FILE"
-  $CRON_SERVICE restart > /dev/null 2>&1
-}
+uci_set()    { uci set    "${UCI_PKG}.${UCI_SEC}.${1}=${2}" 2>/dev/null; }
+uci_get()    { uci -q get "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
+uci_del()    { uci delete "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
 
-validate_cron_hours() {
-  local hours="$1"
-  if ! echo "$hours" | grep -q '^[0-9]\+$' || [ "$hours" -lt 1 ]; then
-    echo "Error: Invalid input. Using default of $DEFAULT_CRON_HOURS hour."
-    echo $DEFAULT_CRON_HOURS
-  else
-    echo "$hours"
-  fi
-}
-
-# Step 1: Check if running on OpenWrt
-if ! grep -q -e "OpenWrt" -e "immortalwrt" $OS_RELEASE_FILE; then
-  exit_with_error "This script is designed for OpenWrt or ImmortalWrt. Exiting."
+# ── Check OS ───────────────────────────────────────────────────────────────────
+if ! grep -qE "OpenWrt|immortalwrt|ImmortalWrt" "$OS_RELEASE_FILE" 2>/dev/null; then
+    exit_with_error "Скрипт предназначен для OpenWrt / ImmortalWrt."
 fi
 
-# Step 2: Install dependencies
-echo "Installing required packages (curl, jq, wget)..."
-opkg update > /dev/null 2>&1
-for pkg in curl jq wget; do
-  if ! opkg list-installed | grep -q "^$pkg "; then
-    opkg install $pkg > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-      exit_with_error "Failed to install $pkg. Please check your internet connection and opkg repositories."
-    fi
-  fi
-done
-echo "Dependencies installed."
-
-# Step 3: Check if podkop_updater.sh already exists and is configured
-if [ -f "$UPDATER_PATH" ]; then
-  echo "Found existing podkop_updater.sh at $UPDATER_PATH"
-
-  # Check if it's already configured (not default values)
-  EXISTING_BOT_TOKEN=$(grep '^BOT_TOKEN=' $UPDATER_PATH | cut -d'"' -f2)
-  EXISTING_CHAT_ID=$(grep '^CHAT_ID=' $UPDATER_PATH | cut -d'"' -f2)
-
-  if [ "$EXISTING_BOT_TOKEN" != "$DEFAULT_BOT_TOKEN" ] && [ "$EXISTING_CHAT_ID" != "$DEFAULT_CHAT_ID" ]; then
-    echo "Script is already configured with:"
-    echo "  Bot Token: ${EXISTING_BOT_TOKEN:0:$TOKEN_DISPLAY_LENGTH}..."
-    echo "  Chat ID: $EXISTING_CHAT_ID"
-    echo ""
-    echo "Choose an option:"
-    echo "1) Keep existing configuration and exit"
-    echo "2) Reconfigure with new settings"
-    echo "3) Update script but keep existing configuration"
-    echo "Enter 1, 2, or 3 (default: 1):"
-    read -r EXISTING_CONFIG_CHOICE
-
-    case "$EXISTING_CONFIG_CHOICE" in
-      2)
-        echo "Reconfiguring with new settings..."
-        ;;
-      3)
-        echo "Updating script while preserving configuration..."
-        # Download new version but preserve config
-        download_file $UPDATER_URL $TEMP_UPDATER_PATH
-        # Replace config in new version with existing values
-        sed -i "s|BOT_TOKEN=\"$DEFAULT_BOT_TOKEN\"|BOT_TOKEN=\"$EXISTING_BOT_TOKEN\"|" $TEMP_UPDATER_PATH
-        sed -i "s|CHAT_ID=\"$DEFAULT_CHAT_ID\"|CHAT_ID=\"$EXISTING_CHAT_ID\"|" $TEMP_UPDATER_PATH
-        mv $TEMP_UPDATER_PATH $UPDATER_PATH
-        chmod +x $UPDATER_PATH
-        echo "Script updated with preserved configuration."
-        echo "Installation complete! The script is ready to use."
-        exit 0
-        ;;
-      1|*)
-        echo "Keeping existing configuration. Installation complete!"
-        exit 0
-        ;;
-    esac
-  fi
-fi
-
-# Download podkop_updater.sh
-echo "Downloading podkop_updater.sh from $UPDATER_URL..."
-download_file $UPDATER_URL $UPDATER_PATH
-chmod +x $UPDATER_PATH
-echo "Downloaded and set executable: $UPDATER_PATH"
-
-# Step 4: Prompt for update mode
-echo "Choose update mode:"
-echo "1) Manual (run via console, no cron)"
-echo "2) Automatic (run via cron, no Telegram confirmation)"
-echo "3) Automatic with Telegram bot confirmation (default, run via cron)"
-echo "Enter 1, 2, or 3 (default: 3):"
-read -r UPDATE_MODE
-case "$UPDATE_MODE" in
-  1)
-    echo "Manual mode selected. Script installed without cron or Telegram configuration."
-    ;;
-  2)
-    echo "Automatic mode selected."
-    # Prompt for cron frequency
-    echo "How often should the script run (in hours, e.g., 1 for hourly, 6 for every 6 hours)?"
-    read -r CRON_HOURS
-    CRON_HOURS=$(validate_cron_hours "$CRON_HOURS")
-    # Configure cron job
-    setup_cron_job "$CRON_HOURS" "$UPDATER_PATH --force"
-    echo "Cron job configured for automatic updates."
-    ;;
-  3|*)
-    echo "Automatic with Telegram bot confirmation selected."
-    # Prompt for Telegram bot token
-    echo "Please enter your Telegram bot token (obtained from @BotFather):"
-    read -r BOT_TOKEN
-    if [ -z "$BOT_TOKEN" ]; then
-      exit_with_error "Bot token cannot be empty. Exiting."
-    fi
-    # Prompt for Telegram chat ID
-    echo "Please enter your Telegram chat ID (obtained from @get_id_bot or similar):"
-    read -r CHAT_ID
-    if [ -z "$CHAT_ID" ]; then
-      exit_with_error "Chat ID cannot be empty. Exiting."
-    fi
-    # Configure podkop_updater.sh
-    echo "Configuring podkop_updater.sh with bot token and chat ID..."
-    sed -i "s|BOT_TOKEN=\"$DEFAULT_BOT_TOKEN\"|BOT_TOKEN=\"$BOT_TOKEN\"|" $UPDATER_PATH
-    sed -i "s|CHAT_ID=\"$DEFAULT_CHAT_ID\"|CHAT_ID=\"$CHAT_ID\"|" $UPDATER_PATH
-    if ! grep -q "BOT_TOKEN=\"$BOT_TOKEN\"" $UPDATER_PATH || ! grep -q "CHAT_ID=\"$CHAT_ID\"" $UPDATER_PATH; then
-      exit_with_error "Failed to configure podkop_updater.sh. Please check the script file."
-    fi
-    # Prompt for cron frequency
-    echo "How often should the script run (in hours, e.g., 1 for hourly, 6 for every 6 hours)?"
-    read -r CRON_HOURS
-    CRON_HOURS=$(validate_cron_hours "$CRON_HOURS")
-    # Configure cron job
-    setup_cron_job "$CRON_HOURS" "$UPDATER_PATH"
-    echo "Cron job configured for Telegram-confirmed updates."
-    ;;
-esac
-
-# Step 5: Verify network access
-echo "Verifying network access to GitHub and Telegram APIs..."
-if ! curl -s $GITHUB_API_URL > /dev/null; then
-  echo "Warning: Cannot reach GitHub API. The script may fail to check for updates."
-fi
-if [ "$UPDATE_MODE" = "3" ] || [ -z "$UPDATE_MODE" ]; then
-  if ! curl -s "${TELEGRAM_API_BASE}$BOT_TOKEN/getMe" | grep -q '"ok":true'; then
-    echo "Warning: Cannot reach Telegram API or invalid bot token. The script may fail to send notifications."
-  fi
-fi
-
-# Step 6: Final instructions
-echo "Installation complete!"
-echo "The script is installed at $UPDATER_PATH."
-if [ "$UPDATE_MODE" = "1" ]; then
-  echo "Run manually with: $UPDATER_PATH"
-elif [ "$UPDATE_MODE" = "2" ]; then
-  echo "Automatic updates are scheduled every $CRON_HOURS hour(s)."
-else
-  echo "Telegram-confirmed updates are scheduled every $CRON_HOURS hour(s)."
-  echo "Reply 'yes' to Telegram messages to update or 'no' to cancel."
-fi
-echo "Logs will be written to $LOG_FILE."
 echo ""
-echo "Available commands:"
-echo "  $UPDATER_PATH              - Run update check"
-echo "  $UPDATER_PATH --dry-run    - Test full flow without making changes"
-echo "  $UPDATER_PATH --force      - Force update without Telegram confirmation"
+echo "╔══════════════════════════════════════╗"
+echo "║       podkop_bot  —  установщик      ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+
+# ── Install dependencies ───────────────────────────────────────────────────────
+info "Обновление opkg и установка зависимостей (curl, jq)..."
+opkg update >/dev/null 2>&1
+for pkg in curl jq; do
+    if ! opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+        opkg install "$pkg" >/dev/null 2>&1 \
+            || exit_with_error "Не удалось установить $pkg."
+    fi
+done
+ok "Зависимости установлены."
+echo ""
+
+# ── Check existing installation ────────────────────────────────────────────────
+EXISTING_TOKEN=$(uci_get bot_token)
+EXISTING_CHAT=$(uci_get chat_id)
+
+if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; then
+    echo "Обнаружена существующая установка:"
+    echo "  Токен:   ${EXISTING_TOKEN:0:$TOKEN_DISPLAY_LENGTH}..."
+    echo "  Chat ID: $EXISTING_CHAT"
+    echo ""
+    echo "Выберите действие:"
+    echo "  1) Обновить скрипт, сохранить конфиг  (по умолчанию)"
+    echo "  2) Переустановить с новыми настройками"
+    echo "  3) Выйти без изменений"
+    printf "Введите 1, 2 или 3: "
+    read -r CHOICE
+    echo ""
+    case "$CHOICE" in
+        2) info "Переустановка с новыми настройками..." ;;
+        3) ok "Установка пропущена. Текущий конфиг сохранён."; exit 0 ;;
+        1|*)
+            info "Обновление скрипта без изменения конфига..."
+            download_file "$BOT_URL" "$BOT_PATH"
+            chmod +x "$BOT_PATH"
+            ok "Скрипт обновлён: $BOT_PATH"
+            echo ""
+            # Перезапускаем сервис если он запущен
+            if [ -f "$INIT_PATH" ] && "$INIT_PATH" status >/dev/null 2>&1; then
+                "$INIT_PATH" restart >/dev/null 2>&1 && ok "Сервис перезапущен."
+            fi
+            echo ""
+            echo "Установка завершена!"
+            exit 0
+            ;;
+    esac
+fi
+
+# ── Download bot script ────────────────────────────────────────────────────────
+info "Скачивание podkop_bot.sh..."
+download_file "$BOT_URL" "$BOT_PATH"
+chmod +x "$BOT_PATH"
+ok "Скачан: $BOT_PATH"
+echo ""
+
+# ── Configure bot token ────────────────────────────────────────────────────────
+echo "── Настройка бота ────────────────────────────────"
+echo ""
+printf "Введите токен Telegram-бота (от @BotFather):\n> "
+read -r BOT_TOKEN
+[ -z "$BOT_TOKEN" ] && exit_with_error "Токен не может быть пустым."
+
+# Verify token
+info "Проверка токена через Telegram API..."
+TG_CHECK=$(curl -s --connect-timeout 8 \
+    "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null)
+if ! echo "$TG_CHECK" | grep -q '"ok":true'; then
+    warn "Не удалось подтвердить токен. Убедитесь что токен верный и есть интернет."
+    printf "Продолжить установку с этим токеном? (y/N): "
+    read -r CONT
+    [ "$CONT" != "y" ] && [ "$CONT" != "Y" ] && exit_with_error "Установка прервана."
+else
+    BOT_NAME=$(echo "$TG_CHECK" | jq -r '.result.username // "unknown"' 2>/dev/null)
+    ok "Токен валиден. Бот: @${BOT_NAME}"
+fi
+echo ""
+
+# ── Configure chat_id ──────────────────────────────────────────────────────────
+printf "Введите Chat ID или User ID для алертов\n(личный чат, группа или supergroup):\n> "
+read -r CHAT_ID
+[ -z "$CHAT_ID" ] && exit_with_error "Chat ID не может быть пустым."
+
+# ── Optional: additional admin IDs ────────────────────────────────────────────
+echo ""
+printf "Дополнительные admin User ID (через пробел, Enter чтобы пропустить):\n> "
+read -r ADMIN_IDS
+
+# ── Optional: allow anonymous group admins ─────────────────────────────────────
+echo ""
+printf "Разрешить anonymous admins в группах? (Y/n): "
+read -r ANON_ADMINS
+ANON_ADMINS_VAL=1
+[ "$ANON_ADMINS" = "n" ] || [ "$ANON_ADMINS" = "N" ] && ANON_ADMINS_VAL=0
+
+# ── Write UCI config ───────────────────────────────────────────────────────────
+info "Запись конфига в UCI..."
+uci -q delete "${UCI_PKG}.${UCI_SEC}" 2>/dev/null
+uci set "${UCI_PKG}.${UCI_SEC}=settings"
+uci_set "bot_token"   "$BOT_TOKEN"
+uci_set "chat_id"     "$CHAT_ID"
+uci_set "allow_anonymous_admins" "$ANON_ADMINS_VAL"
+[ -n "$ADMIN_IDS" ] && uci_set "admin_ids" "$ADMIN_IDS"
+uci_set "transport"      "auto"
+uci_set "health_interval" "60"
+uci_set "alert_notify"   "1"
+uci_set "startup_notify" "1"
+uci commit "$UCI_PKG" || exit_with_error "uci commit failed."
+ok "UCI конфиг записан (/etc/config/${UCI_PKG})."
+echo ""
+
+# ── Init script ────────────────────────────────────────────────────────────────
+echo "── Автозапуск ────────────────────────────────────"
+echo ""
+printf "Установить автозапуск через init.d? (Y/n): "
+read -r SETUP_INIT
+
+if [ "$SETUP_INIT" != "n" ] && [ "$SETUP_INIT" != "N" ]; then
+    # Create minimal init.d script if no upstream init provided
+    if ! wget -q --spider "$INIT_URL" 2>/dev/null && \
+       ! curl -s --head "$INIT_URL" 2>/dev/null | grep -q "200"; then
+        # Generate init.d script locally
+        cat > "$INIT_PATH" << 'INITEOF'
+#!/bin/sh /etc/rc.common
+START=99
+STOP=10
+USE_PROCD=1
+PROG=/usr/bin/podkop_bot
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "$PROG"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}
+INITEOF
+    else
+        download_file "$INIT_URL" "$INIT_PATH"
+    fi
+    chmod +x "$INIT_PATH"
+    "$INIT_PATH" enable >/dev/null 2>&1
+    ok "Автозапуск включён (/etc/init.d/podkop_bot)."
+else
+    info "Автозапуск пропущен. Запустить вручную: $BOT_PATH"
+fi
+echo ""
+
+# ── Start bot ──────────────────────────────────────────────────────────────────
+printf "Запустить бота сейчас? (Y/n): "
+read -r START_NOW
+echo ""
+
+if [ "$START_NOW" != "n" ] && [ "$START_NOW" != "N" ]; then
+    if [ -f "$INIT_PATH" ]; then
+        "$INIT_PATH" start >/dev/null 2>&1
+        sleep 2
+        if "$INIT_PATH" status >/dev/null 2>&1; then
+            ok "Бот запущен через init.d."
+        else
+            warn "init.d не смог запустить бот. Запускаем напрямую..."
+            "$BOT_PATH" &
+            ok "Бот запущен (PID: $!)."
+        fi
+    else
+        "$BOT_PATH" &
+        ok "Бот запущен (PID: $!)."
+    fi
+else
+    info "Бот не запущен. Запустить: $BOT_PATH &"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────────────────
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║          Установка завершена!         ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+echo "  Скрипт:   $BOT_PATH"
+echo "  Конфиг:   /etc/config/${UCI_PKG}"
+echo "  Логи:     logread | grep podkop-bot"
+echo ""
+echo "Полезные команды:"
+echo "  /etc/init.d/podkop_bot start|stop|restart|status"
+echo "  logread -f | grep podkop-bot"
+echo ""
+echo "Управление через UCI:"
+echo "  uci show ${UCI_PKG}         — просмотр конфига"
+echo "  uci set ${UCI_PKG}.${UCI_SEC}.health_interval=60"
+echo "  uci set ${UCI_PKG}.${UCI_SEC}.alert_notify=0   — выключить алерты"
+echo "  uci commit ${UCI_PKG}"
+echo ""
+echo "GitHub: https://github.com/Medvedolog/podkop_bot"
