@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.61
+# Podkop Telegram Bot v0.13.63
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,36 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.63:
+# - NEW:   URLTest mode: Auto (best ping) button in Outbound Selector.
+#          Selector .now pointing at URLTest group = auto mode (sing-box picks
+#          fastest). Selector .now pointing at a leaf proxy = manual/fixed.
+#          Card header shows "| Auto: best ping" or "| Manual: fixed" hint.
+#          Auto button: grayed with checkmark when already auto, active button
+#          when manual is fixed — one tap returns to URLTest auto selection.
+#          Handler do_px_auto_urltest: PUT /proxies/selector with URLTest group
+#          name, detected via .proxies[*].type == "URLTest".
+# - FIXED: display_proxy_name now checks TAG_NAME_CACHE (built from all UCI
+#          link lists including urltest_proxy_links) before server:port fallback.
+#          URLTest outbound names now show #fragment human names (DE Senko -11d)
+#          instead of raw sing-box tags (main-4-out).
+#
+
+# CHANGELOG v0.13.62:
+# - FIXED: URLTest outbound names showed raw sing-box tags (main-4-out,
+#          main-urltest-out) instead of human names from #fragment in URI.
+#          Root cause: TAG_URI_CACHE (from sing-box config.json) has no
+#          #fragment; UCI_LINKS_CACHE only included selector_proxy_links.
+#          Fix: new TAG_NAME_CACHE (/tmp/podkop_tag_name_cache.txt) built
+#          from ALL UCI link lists (selector + urltest + url). Matches
+#          tag by server:port from TAG_URI_CACHE, stores tag=Human Name.
+#          display_proxy_name() now checks TAG_NAME_CACHE as step 2,
+#          before falling back to [type] server:port or raw tag.
+# - FIXED: build_all_caches() now includes build_tag_name_cache().
+#          Section switch, link add/delete all trigger full cache rebuild.
+#          Lazy-init in get_selector_link_by_index unchanged (UCI only).
+#
+
 # CHANGELOG v0.13.61:
 # - FIXED: /start and text commands after clearing chat history returned no
 #          response. send_or_edit with user's message_id tried to edit user
@@ -516,7 +546,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.61"
+BOT_VERSION="0.13.63"
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -544,6 +574,8 @@ TARGET_REPLY_THREAD_ID=""
 
 TAG_URI_CACHE="/tmp/podkop_tag_uri_cache.txt"
 UCI_LINKS_CACHE="/tmp/podkop_uci_links_cache.txt"
+# tag → human name extracted from #fragment in UCI links (selector + urltest)
+TAG_NAME_CACHE="/tmp/podkop_tag_name_cache.txt"
 ACTIVE_SECTION_FILE="/tmp/podkop_bot_active_section"
 RELOAD_TS_FILE="/tmp/podkop_bot_last_reload_ts"
 
@@ -1617,11 +1649,44 @@ build_uci_links_cache() {
     logger -t podkop-bot "[Cache] uci_links rebuilt for '${sec}' ($(wc -l < "$UCI_LINKS_CACHE" 2>/dev/null || echo 0) entries)"
 }
 
-# Rebuild both caches. Community lists cache is intentionally NOT cleared here
+# Build tag->human_name cache from #fragment in ALL UCI proxy link lists.
+# Covers selector_proxy_links, urltest_proxy_links, url_proxy_links.
+# Format: tag=Human Name
+# This is the only way to get display names for URLTest group members since
+# sing-box config.json does not store the #fragment comment.
+build_tag_name_cache() {
+    local tmp sec raw_list link frag tag
+    sec=$(get_active_section)
+    tmp=$(mktemp /tmp/podkop_tag_name.XXXXXX)
+    for uci_key in selector_proxy_links urltest_proxy_links url_proxy_links; do
+        raw_list=$(uci -q show podkop.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
+        [ -z "$raw_list" ] && continue
+        eval "set -- $raw_list"
+        for link in "$@"; do
+            # Extract #fragment
+            case "$link" in *#?*) frag="${link##*#}" ;; *) continue ;; esac
+            frag=$(url_decode "$frag")
+            [ -z "$frag" ] && continue
+            # Derive tag from sing-box config matching this link's server:port
+            # Use TAG_URI_CACHE: find tag whose reconstructed URI matches link server:port
+            local srv_port; srv_port=$(extract_server_port_from_uri "${link%%#*}")
+            [ -z "$srv_port" ] || [ "$srv_port" = "N/A" ] && continue
+            # Match by server:port suffix in TAG_URI_CACHE
+            tag=$(grep "@${srv_port}$\|:${srv_port}$" "$TAG_URI_CACHE" 2>/dev/null \
+                | head -1 | cut -d= -f1)
+            [ -n "$tag" ] && printf '%s=%s\n' "$tag" "$frag" >> "$tmp"
+        done
+    done
+    mv "$tmp" "$TAG_NAME_CACHE"
+    logger -t podkop-bot "[Cache] tag_names rebuilt for '${sec}' ($(wc -l < "$TAG_NAME_CACHE" 2>/dev/null || echo 0) entries)"
+}
+
+# Rebuild all caches. Community lists cache intentionally NOT cleared here
 # to protect against GitHub rate limits (60 req/hr).
 build_all_caches() {
     build_tag_uri_cache
     build_uci_links_cache
+    build_tag_name_cache
 }
 
 # Returns url_proxy_links for $1 (section) as newline-separated list.
@@ -1749,14 +1814,22 @@ get_proxy_human_name_by_tag() {
 display_proxy_name() {
     local tag="$1" human cached_uri srv_port type_str
     [ -z "$tag" ] && { echo "Unknown"; return 0; }
+    # 1. Try human name from selector_proxy_links index (fast, works for selector mode)
     human=$(get_proxy_human_name_by_tag "$tag")
     [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
+    # 2. Try tag_name_cache (covers urltest_proxy_links, url_proxy_links, all modes)
+    if [ -f "$TAG_NAME_CACHE" ]; then
+        human=$(grep "^${tag}=" "$TAG_NAME_CACHE" | cut -d= -f2-)
+        [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
+    fi
+    # 3. Fallback: reconstruct [type] server:port from TAG_URI_CACHE
     cached_uri=$(get_uri_by_tag "$tag")
     if [ -n "$cached_uri" ] && [ "$cached_uri" != "N/A" ]; then
         srv_port=$(extract_server_port_from_uri "$cached_uri")
         type_str=$(printf '%s' "$cached_uri" | cut -d: -f1)
         [ -n "$srv_port" ] && [ "$srv_port" != "N/A" ] && { printf '[%s] %s\n' "$type_str" "$srv_port"; return 0; }
     fi
+    # 4. Last resort: return raw tag
     printf '%s\n' "$tag"
 }
 
@@ -2310,7 +2383,7 @@ EOF
         "set_sec_"*)
             local new_sec="${cmd#set_sec_}"
             echo "$new_sec" > "$ACTIVE_SECTION_FILE"
-            build_uci_links_cache
+            build_all_caches
             _handle_sections "sections_menu" "$mid"
             ;;
     esac
@@ -2343,7 +2416,7 @@ _handle_proxy() {
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
             else
                 uci add_list podkop.${sec}.selector_proxy_links="$safe_link"
-                uci_commit_safe podkop; build_uci_links_cache
+                uci_commit_safe podkop; build_all_caches
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
                 _handle_proxy "proxy_menu" "" "" ""
@@ -2374,6 +2447,41 @@ _handle_proxy() {
             selector=$(get_selector_tag "$proxies")
             current_proxy=$(get_active_proxy_name "$proxies")
             current_proxy_display=$(html_escape "$(display_proxy_name_with_tag "$current_proxy")")
+
+            # Detect URLTest mode and whether auto or manual is active
+            local proxy_mode_cur urltest_group urltest_now is_auto_mode auto_hint
+            proxy_mode_cur=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            auto_hint=""
+            if [ "$proxy_mode_cur" = "urltest" ]; then
+                # The URLTest group is a member of the selector — find it
+                urltest_group=$(echo "$proxies" | jq -r \
+                    --arg sel "$selector" \
+                    '.proxies[$sel].all[]? | select(. as $n | $ENV.proxies | (. // "") | if . != "" then true else false end) | empty' \
+                    2>/dev/null || echo "")
+                # Simpler: find the URLTest-type member of selector's all list
+                urltest_group=$(echo "$proxies" | jq -r \
+                    --arg sel "$selector" \
+                    '[.proxies[$sel].all[]? | select(.? as $n | (.proxies[$n].type? // "") == "URLTest")] | .[0] // empty' \
+                    2>/dev/null || echo "")
+                # Even simpler direct approach
+                urltest_group=$(echo "$proxies" | jq -r \
+                    '.proxies | to_entries[] | select(.value.type == "URLTest") | .key' \
+                    2>/dev/null | head -1)
+                urltest_now=$(echo "$proxies" | jq -r \
+                    --arg g "$urltest_group" '.proxies[$g].now // empty' 2>/dev/null)
+                # Active selector .now points to the urltest group itself = Auto mode
+                local selector_now
+                selector_now=$(echo "$proxies" | jq -r \
+                    --arg sel "$selector" '.proxies[$sel].now // empty' 2>/dev/null)
+                if [ "$selector_now" = "$urltest_group" ] || [ -z "$urltest_group" ]; then
+                    is_auto_mode="1"
+                    auto_hint=" | <i>Auto: best ping</i>"
+                else
+                    is_auto_mode="0"
+                    auto_hint=" | <i>Manual: fixed</i>"
+                fi
+            fi
+
             total=$(echo "$proxies" | jq -r --arg sel "$selector" \
                 '.proxies[$sel].all | length // 0' 2>/dev/null)
 
@@ -2460,10 +2568,19 @@ EOF
                 nav_row="[{\"text\":\"${E_BACK} Prev\",\"callback_data\":\"${prev_cb}\"},{\"text\":\"${E_FILE} $((page+1))/${total_pages}\",\"callback_data\":\"proxy_menu_p_${page}\"},{\"text\":\"Next >\",\"callback_data\":\"${next_cb}\"}],"
             fi
 
-            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}${nav_row}"
+            # URLTest mode: prepend Auto (best ping) button on its own row
+            if [ "$proxy_mode_cur" = "urltest" ] && [ -n "$urltest_group" ]; then
+                if [ "${is_auto_mode:-0}" = "1" ]; then
+                    kb="${kb}[{\"text\":\"${E_SCAN} Auto: best ping  ✓\",\"callback_data\":\"proxy_menu\"}],"
+                else
+                    kb="${kb}[{\"text\":\"${E_SCAN} Auto: best ping\",\"callback_data\":\"do_px_auto_urltest\"}],"
+                fi
+            fi
+            kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
             text=$(cat <<EOF
 ${E_GLOB} <b>Outbound Selector</b> [<code>${sec}</code>]
-<b>Active:</b> <code>${current_proxy_display}</code>
+<b>Active:</b> <code>${current_proxy_display}</code>${auto_hint}
 
 ${list_text}
 
@@ -2580,6 +2697,22 @@ EOF
             _handle_proxy "px_view_${p_idx}" "$mid" "" ""
             ;;
 
+        "do_px_auto_urltest")
+            # Switch selector to point at the URLTest group — restores auto best-ping mode
+            local proxies selector urltest_grp payload
+            proxies=$(clash_request "/proxies")
+            selector=$(get_selector_tag "$proxies")
+            urltest_grp=$(echo "$proxies" | jq -r \
+                '.proxies | to_entries[] | select(.value.type == "URLTest") | .key' \
+                2>/dev/null | head -1)
+            if [ -n "$urltest_grp" ]; then
+                payload=$(jq -n -c --arg name "$urltest_grp" '{name:$name}')
+                clash_request "/proxies/${selector}" "PUT" "$payload" >/dev/null
+                logger -t podkop-bot "Audit: ${audit_str} -> auto urltest via ${urltest_grp}"
+            fi
+            _handle_proxy "proxy_menu" "$mid" "" ""
+            ;;
+
         "do_px_"*)
             local p_idx="${cmd#do_px_}" ret_page=0 proxies selector proxy_name payload
             ret_page=$(( ${cmd#do_px_} / per_page ))
@@ -2624,7 +2757,7 @@ EOF
             fi
             [ -n "$p_idx" ] && ret_page=$(( p_idx / per_page ))
             uci del_list podkop.${sec}.selector_proxy_links="$raw_link"
-            uci_commit_safe podkop; build_uci_links_cache
+            uci_commit_safe podkop; build_all_caches
             send_or_edit "$mid" "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
             safe_reload_podkop "force"; sleep 1
             _handle_proxy "proxy_menu_p_${ret_page}" "$mid" "" ""
@@ -5058,7 +5191,7 @@ EOF
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
