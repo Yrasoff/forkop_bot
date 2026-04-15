@@ -180,7 +180,7 @@ else
     PODKOP_VER=""
     case "$PKG_MANAGER" in
         apk)  PODKOP_VER=$(apk info podkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) ;;
-        opkg) PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}') ;;
+        opkg) PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}' | sed 's/^v//') ;;
     esac
     ok "podkop found${PODKOP_VER:+ (v${PODKOP_VER})}."
 fi
@@ -332,7 +332,20 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
             fi
 
             echo ""
-            echo "Done. Logs: logread -f | grep podkop-bot"
+            echo "==========================================="
+            echo "  Update complete!"
+            echo "==========================================="
+            echo ""
+            echo "  Bot script : $BOT_PATH"
+            echo "  Version    : v${REMOTE_VER}"
+            echo "  Config     : /etc/config/${UCI_PKG}"
+            echo ""
+            echo "Useful commands:"
+            echo "  logread -f | grep podkop-bot          — live logs"
+            echo "  /etc/init.d/podkop_bot restart        — restart bot"
+            echo "  /etc/init.d/podkop_bot status         — check status"
+            echo ""
+            echo "GitHub: https://github.com/Medvedolog/podkop_bot"
             exit 0
             ;;
     esac
