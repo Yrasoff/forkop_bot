@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.77
+# Podkop Telegram Bot v0.13.80
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,50 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.80:
+# - FIXED: Watchdog summary log showed "route=Initializing..." permanently because
+#          LAST_ROUTE_NAME is a fork-time copy of the parent variable (always stays
+#          "Initializing..." in the watchdog subshell). Now reads from MAIN_ROUTE_FILE
+#          which is written by the main process on every successful tier resolution.
+# - COSMETIC: Removed duplicate singleton guard comment ("by scriptname" line
+#             left over from v0.13.78 rename, sat above the correct "by BOT_PATH
+#             pattern" comment). No behavior change.
+#
+
+# CHANGELOG v0.13.79:
+# - UX:    Bot Settings card redesigned into 4 visual blocks with separators:
+#          [1] Transport Policy + Active Route + TG Latency
+#          [2] Fallback Chain (active tier bold ◀ active)
+#          [3] Overrides: Custom Proxy + cp_hint + Bind Interface
+#          [4] Uptime + Started / Last Command / Unauthorized Attempts
+#          Keyboard restructured into 3 semantic rows:
+#          Row 1: Transport | Health Interval
+#          Row 2: Fallback SOCKS
+#          Row 3: Custom Proxy | Bind Iface
+#          Row 4: Startup Notify | Alert Notify
+#          Row 5: Menu
+#          st/al icons pre-computed into variables (no inline $() in kb string).
+# - UX:    cmd_files (Configs & Logs) now has Menu button alongside Back.
+# - FIX:   Singleton guard comment updated: "by scriptname" → "by BOT_PATH pattern".
+#
+
+# CHANGELOG v0.13.78:
+# - FIXED: Broken reply_markup JSON in Diagnostics (cmd_diagnostics, ask_upstream_health,
+#          ask_run_podkop_tests, ask_run_internal_diag, ask_support_bundle) and
+#          Bot self-update (cmd_check_update_bot, ask_update_bot_*, do_update_bot_*
+#          error branches). Unescaped {"inline_keyboard":...} as literal shell arg
+#          caused Telegram to reject all requests silently (no keyboard rendered).
+#          Fixed by using kb="{\"inline_keyboard\":...}" variable pattern throughout.
+# - FIXED: Self-update wget without timeout replaced with curl --connect-timeout 5
+#          --max-time 8/15. wget -qO- on OpenWrt hangs indefinitely without -T flag.
+# - FIXED: Singleton guard: pgrep -f "podkop_bot" → pgrep -f "$BOT_PATH" to avoid
+#          matching unrelated processes. Less greedy, more precise.
+# - UX:    Menu button added to all Diagnostics screens (hub + 4 ask_* confirms)
+#          and Bot self-update screens (check, ask, error branches).
+# - UX:    cp_hint spacing: explicit newline between cp_hint and Bind Interface line
+#          prevents visual merge when hint is non-empty.
+#
+
 # CHANGELOG v0.13.77:
 # - FIXED: Source of truth for route key in watchdog — architectural cleanup.
 #   Root cause: MAIN_ROUTE_FILE holds human-readable names ("Podkop (SOCKS5:...)"),
@@ -767,7 +811,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.77"
+BOT_VERSION="0.13.80"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -2439,7 +2483,8 @@ start_health_daemon() {
             if [ "$probe_cycle" -ge "$PROBE_EVERY" ]; then
                 probe_cycle=0
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
-                logger -t podkop-bot "[Watchdog] status: socks=${last_socks_state:-unknown} sb=${last_sb_state:-unknown} route=${LAST_ROUTE_NAME}"
+                _wd_log_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
+                logger -t podkop-bot "[Watchdog] status: socks=${last_socks_state:-unknown} sb=${last_sb_state:-unknown} route=${_wd_log_route}"
                 probe_all_socks_write &
             fi
 
@@ -5133,51 +5178,52 @@ $(_fmt_tier "tier5" "Emergency IPs")"
             fi
 
             kb="{\"inline_keyboard\":["
-            kb="${kb}[{\"text\":\"Transport: ${tr_disp}\",\"callback_data\":\"ask_set_tr_menu\"}],"
-            kb="${kb}[{\"text\":\"Health Interval: ${hi}s\",\"callback_data\":\"set_bot_hi_${next_hi}\"}],"
-            kb="${kb}[{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"}],"
-            if [ "$cp" = "Not set" ]; then
-                kb="${kb}[{\"text\":\"${E_ADD} Set Custom Proxy\",\"callback_data\":\"cmd_custom_proxy\"}],"
-            else
-                kb="${kb}[{\"text\":\"${E_DEL} Clear Custom Proxy\",\"callback_data\":\"cmd_clear_custom_proxy\"}],"
-            fi
-            if [ "$bi" = "Not set" ]; then
-                kb="${kb}[{\"text\":\"${E_ADD} Bind Interface\",\"callback_data\":\"cmd_bind_iface\"}],"
-            else
-                kb="${kb}[{\"text\":\"${E_DEL} Unbind Interface\",\"callback_data\":\"cmd_clear_bind_iface\"}],"
-            fi
-            kb="${kb}[{\"text\":\"$([ "$st" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") Startup Notify\",\"callback_data\":\"toggle_bot_st\"},{\"text\":\"$([ "$al" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") Alert Notify\",\"callback_data\":\"toggle_bot_al\"}],"
-            kb="${kb}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
-
+            # Hints
             local tr_hint cp_hint=""
-            # Hint: if custom_proxy is socks5://, suggest moving to fallback_socks
             if echo "$cp" | grep -q '^socks5://'; then
-                cp_hint="${E_IDEA} <i>Tip: <code>${cp}</code> is a SOCKS proxy — consider moving it to Fallback SOCKS (tier2) for better failover ordering. Use the button below.</i>"
+                cp_hint="${E_IDEA} <i>Tip: <code>${cp}</code> is a SOCKS proxy — consider moving it to Fallback SOCKS (tier2) for better failover ordering.</i>"
             fi
             case "$tr" in
-                auto)   tr_hint="${E_IDEA} <i>Auto: Podkop SOCKS5 -> Fallback SOCKS (tier2_N) -> Custom proxy -> Direct -> Emergency IPs.</i>" ;;
-                socks)  tr_hint="${E_IDEA} <i>Socks5 only: Podkop SOCKS5 + Fallback SOCKS tiers. Bot goes offline if all SOCKS fail.</i>" ;;
-                direct) tr_hint="${E_IDEA} <i>Direct: skip all SOCKS tiers. Use when tunnel is intentionally off.</i>" ;;
+                auto)   tr_hint="${E_IDEA} <i>Auto: Podkop SOCKS5 → Fallback SOCKS → Custom → Direct → Emergency IPs.</i>" ;;
+                socks)  tr_hint="${E_IDEA} <i>Socks5 only: SOCKS tiers only. Bot goes offline if all SOCKS fail.</i>" ;;
+                direct) tr_hint="${E_IDEA} <i>Direct: skip all SOCKS. Use when tunnel is intentionally off.</i>" ;;
                 *)      tr_hint="" ;;
             esac
 
+            # Keyboard: 3 semantic groups
+            local cp_btn bi_btn st_icon al_icon
+            [ "$cp" = "Not set" ]                 && cp_btn="{\"text\":\"${E_ADD} Custom Proxy\",\"callback_data\":\"cmd_custom_proxy\"}"                 || cp_btn="{\"text\":\"${E_DEL} Clear Custom Proxy\",\"callback_data\":\"cmd_clear_custom_proxy\"}"
+            [ "$bi" = "Not set" ]                 && bi_btn="{\"text\":\"${E_ADD} Bind Iface\",\"callback_data\":\"cmd_bind_iface\"}"                 || bi_btn="{\"text\":\"${E_DEL} Unbind Iface\",\"callback_data\":\"cmd_clear_bind_iface\"}"
+            [ "$st" = "1" ] && st_icon="$E_ON" || st_icon="$E_OFF"
+            [ "$al" = "1" ] && al_icon="$E_ON" || al_icon="$E_OFF"
+
+            kb="{\"inline_keyboard\":[
+                [{\"text\":\"Transport: ${tr_disp}\",\"callback_data\":\"ask_set_tr_menu\"},{\"text\":\"Health: ${hi}s\",\"callback_data\":\"set_bot_hi_${next_hi}\"}],
+                [{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"}],
+                [${cp_btn},${bi_btn}],
+                [{\"text\":\"${st_icon} Startup Notify\",\"callback_data\":\"toggle_bot_st\"},{\"text\":\"${al_icon} Alert Notify\",\"callback_data\":\"toggle_bot_al\"}],
+                [{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+            ]}"
+
             text=$(cat <<EOF
 ${E_BOT} <b>Bot Control Plane</b>
-
+<code>────────────────────</code>
 ${E_SHLD} <b>Transport Policy:</b> <code>${tr}</code>
 ${tr_hint}
-<b>Active Route:</b> <code>${LAST_ROUTE_NAME:-Initializing...}</code>
-<b>Fallback Route:</b>
+${E_SHLD} <b>Active Route:</b> <code>${LAST_ROUTE_NAME:-Initializing...}</code>
+${E_TIME} <b>TG Latency:</b> ${tg_lat}
+<code>────────────────────</code>
+<b>Fallback Chain:</b>
 ${tr_chain}
-<b>TG Latency:</b> ${E_TIME} ${tg_lat}
-
+<code>────────────────────</code>
+<b>Overrides:</b>
 <b>Custom Proxy:</b> <code>${cp}</code>
 ${cp_hint}
 <b>Bind Interface:</b> <code>${bi}</code>
-
+<code>────────────────────</code>
 <b>Bot Uptime:</b> ${uptime_sys}
 <b>Started:</b> ${BOT_START_STR}
-
+<code>────────────────────</code>
 <b>Last Command:</b>
 ${last_cmd_str}
 
@@ -5256,53 +5302,43 @@ EOF
             ;;
 
         "cmd_diagnostics")
-            # Diagnostics hub: heavy tests with confirm flow.
-            # Separated from Runtime Info to avoid mixing "view" and "run" actions.
-            send_or_edit "$mid"                 "$(printf '%s <b>Diagnostics</b>
-
-All actions below run active tests.
-On slow routers they may take 10–30 seconds.' "$E_TEST")"                 "{"inline_keyboard":[
-                    [{"text":"${E_SCAN} Upstream Health","callback_data":"ask_upstream_health"}],
-                    [{"text":"${E_GLOB} Global Check","callback_data":"ask_run_podkop_tests"},{"text":"${E_CPU} Internal Diag","callback_data":"ask_run_internal_diag"}],
-                    [{"text":"${E_LOG} Support Bundle","callback_data":"ask_support_bundle"}],
-                    [{"text":"${E_BACK} Back","callback_data":"cmd_runtime"}]
-                ]}"
+            local text kb
+            text=$(printf '%s <b>Diagnostics</b>\n\nAll actions below run active tests.\nOn slow routers they may take 10\xe2\x80\x9330 seconds.' "$E_TEST")
+            kb="{\"inline_keyboard\":[
+                [{\"text\":\"${E_SCAN} Upstream Health\",\"callback_data\":\"ask_upstream_health\"}],
+                [{\"text\":\"${E_GLOB} Global Check\",\"callback_data\":\"ask_run_podkop_tests\"},{\"text\":\"${E_CPU} Internal Diag\",\"callback_data\":\"ask_run_internal_diag\"}],
+                [{\"text\":\"${E_LOG} Support Bundle\",\"callback_data\":\"ask_support_bundle\"}],
+                [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+            ]}"
+            send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_upstream_health")
-            send_or_edit "$mid"                 "$(printf '%s <b>Upstream Health</b>
-
-Tests all outbound proxies via Clash API.
-Sends results as a text file.
-
-<i>May take 10–30 sec on slow routers.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Run","callback_data":"cmd_upstream_health"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            local text kb
+            text=$(printf '%s <b>Upstream Health</b>\n\nTests all outbound proxies via Clash API.\nSends results as a text file.\n\n<i>May take 10\xe2\x80\x9330 sec on slow routers.</i>' "$E_WARN")
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_upstream_health\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_run_podkop_tests")
-            send_or_edit "$mid"                 "$(printf '%s <b>Global Check</b>
-
-Runs <code>podkop global_check</code> — tests DNS, routing, connectivity.
-Sends results as a text file.
-
-<i>May take 10–30 sec.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Run","callback_data":"cmd_run_podkop_tests"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            local text kb
+            text=$(printf '%s <b>Global Check</b>\n\nRuns <code>podkop global_check</code> \xe2\x80\x94 tests DNS, routing, connectivity.\nSends results as a text file.\n\n<i>May take 10\xe2\x80\x9330 sec.</i>' "$E_WARN")
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_run_podkop_tests\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_run_internal_diag")
-            send_or_edit "$mid"                 "$(printf '%s <b>Internal Diagnostics</b>
-
-Gathers UCI config, routes, nft rules, syslog, bot state.
-Sends results as a text file.
-
-<i>~5 sec, light CPU load.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Run","callback_data":"cmd_run_internal_diag"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            local text kb
+            text=$(printf '%s <b>Internal Diagnostics</b>\n\nGathers UCI config, routes, nft rules, syslog, bot state.\nSends results as a text file.\n\n<i>~5 sec, light CPU load.</i>' "$E_WARN")
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_run_internal_diag\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_support_bundle")
-            send_or_edit "$mid"                 "$(printf '%s <b>Support Bundle</b>
-
-Collects everything: versions, UCI config (token redacted), routes, nft, interfaces, bot transport state, last 80 syslog lines.
-Sends as a single text file.
-
-<i>~5 sec. Share with maintainer when reporting bugs.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Collect & Send","callback_data":"cmd_support_bundle"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            local text kb
+            text=$(printf '%s <b>Support Bundle</b>\n\nCollects everything: versions, UCI config (token redacted), routes, nft, interfaces, bot transport state, last 80 syslog lines.\nSends as a single text file.\n\n<i>~5 sec. Share with maintainer when reporting bugs.</i>' "$E_WARN")
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Collect & Send\",\"callback_data\":\"cmd_support_bundle\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "cmd_upstream_health")
@@ -5334,7 +5370,7 @@ Sends as a single text file.
                 "{\"inline_keyboard\":[
                     [{\"text\":\"${E_FILE} Podkop Config\",\"callback_data\":\"cmd_get_config\"},{\"text\":\"${E_FILE} Sing-box JSON\",\"callback_data\":\"cmd_get_sb_json\"}],
                     [{\"text\":\"${E_LOG} Syslog\",\"callback_data\":\"cmd_get_log\"}],
-                    [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"}]
+                    [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
                 ]}"
             ;;
         "cmd_get_config")  api_document "/etc/config/podkop"        "Podkop Config" ;;
@@ -5494,57 +5530,52 @@ EOF
         # is sent BEFORE the binary is replaced (send_or_edit → then update).
         # ------------------------------------------------------------------
         "cmd_check_update_bot")
-            local remote_ver
+            local remote_ver text kb
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
-            remote_ver=$(wget -qO -                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"                 2>/dev/null | tr -d '[:space:]')
-            [ -z "$remote_ver" ] && remote_ver=$(curl -s --connect-timeout 8 --max-time 12                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"                 2>/dev/null | tr -d '[:space:]')
+            remote_ver=$(curl -s --connect-timeout 5 --max-time 8 \
+                "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
+                2>/dev/null | tr -d '[:space:]')
             if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
-                send_or_edit "$mid"                     "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")"                     "{"inline_keyboard":[[{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                send_or_edit "$mid" "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")" "$kb"
                 return
             fi
             if [ "$remote_ver" = "$BOT_VERSION" ]; then
-                send_or_edit "$mid"                     "$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")"                     "{"inline_keyboard":[[{"text":"${E_RST} Force Update","callback_data":"ask_update_bot_${remote_ver}"},{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                send_or_edit "$mid" "$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")" "$kb"
             else
-                local upd_txt
-                upd_txt=$(printf '%s <b>Bot Update Available!</b>
-
-<b>Installed:</b> v%s
-<b>Available:</b> v%s
-
-<i>The bot will restart automatically after update.
-You will receive a startup notification when it is back online.</i>'                     "$E_NEW" "$BOT_VERSION" "$remote_ver")
-                send_or_edit "$mid" "$upd_txt"                     "{"inline_keyboard":[[{"text":"${E_OK} Update to v${remote_ver}","callback_data":"ask_update_bot_${remote_ver}"}],[{"text":"${E_BACK} Cancel","callback_data":"cmd_info"}]]}"
+                text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<i>The bot will restart automatically after update.\nYou will receive a startup notification when it is back online.</i>' \
+                    "$E_NEW" "$BOT_VERSION" "$remote_ver")
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                send_or_edit "$mid" "$text" "$kb"
             fi
             ;;
 
         "ask_update_bot_"*)
-            local target_ver="${cmd#ask_update_bot_}"
-            send_or_edit "$mid"                 "$(printf '%s <b>Update bot to v%s?</b>
-
-The bot will download the new version and restart.
-All active menus will be interrupted.
-
-Section: <code>%s</code>'                     "$E_WARN" "$target_ver" "$(get_active_section)")"                 "{"inline_keyboard":[[{"text":"${E_OK} Yes, Update & Restart","callback_data":"do_update_bot_${target_ver}"}],[{"text":"${E_BACK} Cancel","callback_data":"cmd_info"}]]}"
+            local target_ver="${cmd#ask_update_bot_}" text kb
+            text=$(printf '%s <b>Update bot to v%s?</b>\n\nThe bot will download the new version and restart.\nAll active menus will be interrupted.\n\nSection: <code>%s</code>' \
+                "$E_WARN" "$target_ver" "$(get_active_section)")
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Update & Restart\",\"callback_data\":\"do_update_bot_${target_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "do_update_bot_"*)
             local target_ver="${cmd#do_update_bot_}"
             local bot_tmp="/tmp/podkop_bot_update.$$"
             local bot_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
+            local kb_err="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
 
-            send_or_edit "$mid"                 "$(printf '%s <b>Downloading bot v%s...</b>' "$E_TIME" "$target_ver")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Downloading bot v%s...</b>' "$E_TIME" "$target_ver")" ""
 
-            # Download to temp file
-            if ! wget -qO "$bot_tmp" "$bot_url" 2>/dev/null &&                ! curl -s -o "$bot_tmp" "$bot_url" 2>/dev/null; then
+            if ! curl -s --connect-timeout 5 --max-time 15 -o "$bot_tmp" "$bot_url" 2>/dev/null; then
                 rm -f "$bot_tmp"
-                send_message "$(printf '%s Download failed. Check connectivity.' "$E_ERR")"                     "{"inline_keyboard":[[{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                send_message "$(printf '%s Download failed. Check connectivity.' "$E_ERR")" "$kb_err"
                 return
             fi
 
-            # Validate: must start with shebang and contain BOT_VERSION
-            if ! head -1 "$bot_tmp" | grep -q '^#!' ||                ! grep -q '^BOT_VERSION=' "$bot_tmp"; then
+            if ! head -1 "$bot_tmp" | grep -q '^#!' || ! grep -q '^BOT_VERSION=' "$bot_tmp"; then
                 rm -f "$bot_tmp"
-                send_message "$(printf '%s Downloaded file is invalid (not a bot script).' "$E_ERR")"                     "{"inline_keyboard":[[{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                send_message "$(printf '%s Downloaded file is invalid (not a bot script).' "$E_ERR")" "$kb_err"
                 return
             fi
 
@@ -5552,30 +5583,20 @@ Section: <code>%s</code>'                     "$E_WARN" "$target_ver" "$(get_act
             new_ver=$(grep '^BOT_VERSION=' "$bot_tmp" | cut -d'"' -f2)
             chmod +x "$bot_tmp"
 
-            # Confirm to user BEFORE restart (last message the bot sends)
-            send_message                 "$(printf '%s <b>Bot updating to v%s</b>
-Restarting now — startup notification will confirm when back online.'                     "$E_RST" "${new_ver:-$target_ver}")" ""
+            send_message \
+                "$(printf '%s <b>Bot updating to v%s</b>\nRestarting now — startup notification will confirm when back online.' \
+                    "$E_RST" "${new_ver:-$target_ver}")" ""
 
-            # Atomic replace: mv on same filesystem is instantaneous
             mv "$bot_tmp" "$BOT_PATH"
-
             logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Restarting..."
 
-            # Restart: prefer init.d (procd respawns from new binary cleanly).
-            # Kill watchdog first so it doesn't outlive the restart.
-            kill "$HEALTH_PID" 2>/dev/null
-            sleep 1
+            kill "$HEALTH_PID" 2>/dev/null; sleep 1
 
             if [ -f "/etc/init.d/podkop_bot" ]; then
                 /etc/init.d/podkop_bot restart &
             else
-                # No init.d: exec replaces the current process image with the
-                # new binary. All subshells (watchdog) are orphaned and will
-                # self-exit on next IPC check or SIGTERM from OS cleanup.
                 exec "$BOT_PATH"
             fi
-            # This point is not reached after exec; after init.d restart
-            # the current process receives SIGTERM from procd shortly.
             exit 0
             ;;
 
@@ -5742,8 +5763,8 @@ if [ -f "$BOT_PID_FILE" ]; then
     fi
 fi
 printf '%s' "$$" > "$BOT_PID_FILE"
-# Also kill any leftover watchdog subshells by scriptname
-kill $(pgrep -f "podkop_bot" 2>/dev/null | grep -v "^$$\$" | grep -v "^$(cat $BOT_PID_FILE)\$") 2>/dev/null || true
+# Also kill any leftover watchdog subshells by BOT_PATH pattern
+kill $(pgrep -f "$BOT_PATH" 2>/dev/null | grep -v "^$$\$" | grep -v "^$(cat $BOT_PID_FILE 2>/dev/null)\$") 2>/dev/null || true
 
 logger -t podkop-bot "=== Podkop Bot v${BOT_VERSION} Starting ==="
 
