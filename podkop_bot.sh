@@ -1327,8 +1327,11 @@ api_request_fast() {
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
             LAST_ROUTE_FAST="$ROUTE_KEY"
-            RECOVERY_MODE=0
-            logger -t podkop-bot "[Transport] fast recovery: new=${ROUTE_KEY} route=${ROUTE_NAME}"
+            # Decrement but do NOT zero — let api_poll_long confirm stability
+            # before fully exiting recovery mode. Zeroing here causes the next
+            # poll cycle to skip SOCKS-first and potentially land on Direct.
+            RECOVERY_MODE=$((RECOVERY_MODE > 1 ? RECOVERY_MODE - 1 : 0))
+            logger -t podkop-bot "[Transport] fast recovery: new=${ROUTE_KEY} route=${ROUTE_NAME} recovery_mode=${RECOVERY_MODE}"
             rm -f "$tmp"; echo "$API_RESPONSE"; return 0
         fi
     fi
@@ -3281,7 +3284,7 @@ EOF
                 nav_row="[{\"text\":\"< Prev\",\"callback_data\":\"${prev_cb}\"},{\"text\":\"$((page+1))/${total_pages}\",\"callback_data\":\"url_links_p_${page}\"},{\"text\":\"Next >\",\"callback_data\":\"${next_cb}\"}],"
             fi
 
-            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             text=$(cat <<EOF
 ${E_GLOB} <b>URL Links</b> [<code>${sec}</code>]
 <b>Total:</b> ${total} link(s)
@@ -3557,11 +3560,11 @@ EOF
         "do_autostart_off")
             /etc/init.d/podkop disable 2>/dev/null
             send_or_edit "$mid" "$(printf '%s Podkop autostart <b>disabled</b>.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}" ;;
         "do_autostart_on")
             /etc/init.d/podkop enable 2>/dev/null
             send_or_edit "$mid" "$(printf '%s Podkop autostart <b>enabled</b>.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}" ;;
     esac
 }
 
@@ -4576,7 +4579,7 @@ _handle_fallback_socks() {
             [ -z "$list_text" ] && list_text="<i>No fallback SOCKS configured.</i>"
             local text kb
             text=$(printf '%s <b>Fallback SOCKS</b>\n\nTried in order after Podkop SOCKS5 fails.\nFormat: <code>socks5://IP:PORT</code> or <code>socks5h://IP:PORT</code>\n\n%s' "$E_NET" "$list_text")
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_fb_socks_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"fallback_socks_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_fb_socks_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"fallback_socks_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4691,7 +4694,20 @@ _handle_bot() {
 
     if [ "$cmd" = "STATE_INPUT" ]; then
         rm -f "$STATE_FILE"
-        if [ "$state" = "wait_custom_proxy" ]; then
+        if [ "$state" = "wait_restart_router_confirm" ]; then
+            local input; input=$(printf "%s" "$text" | tr -d '\r\n\t ')
+            if [ "$input" = "YES" ]; then
+                send_message "$(printf '%s <b>Rebooting %s now...</b>\nBot will be back online in ~60 seconds.' "$E_OFF" "$(cat /proc/sys/kernel/hostname 2>/dev/null || echo Router)")" ""
+                logger -t podkop-bot "[Restart Router] Manual reboot requested via Telegram"
+                sleep 2
+                reboot
+            else
+                delete_message "$mid"
+                send_message "$(printf '%s Reboot cancelled. You typed: <code>%s</code>' "$E_BACK" "$(html_escape "$input")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+            fi
+            return
+        elif [ "$state" = "wait_custom_proxy" ]; then
             delete_message "$mid"
             local safe_link=$(printf "%s" "$text" | tr -d '\r\n\t ')
             if echo "$safe_link" | grep -qE '^(http|https|socks5|socks5h)://'; then
@@ -4836,7 +4852,15 @@ EOF
             [ "$sb_pid" != "n/a" ] && \
                 sb_ram=$(awk '/VmRSS/{print int($2/1024)}' /proc/"$sb_pid"/status 2>/dev/null || echo "0")
 
-            health_st=$(cat "$HEALTH_STATE_FILE" 2>/dev/null || echo "Unknown")
+            # Build health summary from SOCKS_STATE_FILE (two TG metrics + SOCKS)
+            local _h_tgd _h_tgt _h_socks _h_tgd_icon _h_tgt_icon _h_socks_icon
+            _h_tgd=$(grep "^tg_direct=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            _h_tgt=$(grep "^tg_transport=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            _h_socks=$(grep "^socks=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            [ "$_h_tgd" = "ok" ]   && _h_tgd_icon="$E_OK"   || _h_tgd_icon="$E_ERR"
+            [ "$_h_tgt" = "ok" ]   && _h_tgt_icon="$E_OK"   || _h_tgt_icon="$E_ERR"
+            [ "$_h_socks" = "up" ] && _h_socks_icon="$E_OK" || _h_socks_icon="$E_ERR"
+            health_st="${_h_tgd_icon} TG direct: ${_h_tgd:-?} | ${_h_tgt_icon} via SOCKS: ${_h_tgt:-?} | ${_h_socks_icon} SOCKS: ${_h_socks:-?}"
             strategy=$(uci -q get podkop.settings.dns_type || echo "udp")
             yacd_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
             tg_lat=$(get_tg_latency)
@@ -4877,7 +4901,7 @@ EOF
 )
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime\"}],
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -4935,7 +4959,7 @@ EOF
                 [{\"text\":\"${E_HEALTH} Tunnel Health\",\"callback_data\":\"cmd_tunnel_health\"}],
                 [{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"}],
                 [{\"text\":\"${E_FILE} Configs & Logs\",\"callback_data\":\"cmd_files\"}],
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_status\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_status\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5080,7 +5104,7 @@ ${E_ON} <b>Community Lists:</b>
 EOF
 )
             kb="{\"inline_keyboard\":[
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_tunnel_health\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_tunnel_health\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5454,6 +5478,49 @@ EOF
             _handle_bot "cmd_diagnostics" "" "" ""
             ;;
 
+        "ask_restart_router_1")
+            # First confirmation — button press
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Restart Router?</b>\n\nThis will reboot <b>%s</b>.\nAll connections will be interrupted for ~60 seconds.\n\n<b>Are you sure?</b>' "$E_WARN" "$(cat /proc/sys/kernel/hostname 2>/dev/null || echo Router)")" \
+                "{\"inline_keyboard\":[
+                    [{\"text\":\"${E_OK} Yes, continue\",\"callback_data\":\"ask_restart_router_2\"}],
+                    [{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]
+                ]}"
+            ;;
+
+        "ask_restart_router_2")
+            # Second confirmation — requires typing YES
+            echo "wait_restart_router_confirm" > "$STATE_FILE"
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Final confirmation required.</b>\n\nType <code>YES</code> (uppercase) to confirm router reboot.\nAny other input cancels.' "$E_WARN")" \
+                "{\"inline_keyboard\":[
+                    [{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]
+                ]}"
+            ;;
+
+        "ask_restart_bot")
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Restart Bot?</b>\n\nKills all bot processes (main loop + watchdog subshells) and restarts via init.d.\nBot will send a startup notification when back online.' "$E_WARN")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Restart\",\"callback_data\":\"do_restart_bot\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            ;;
+
+        "do_restart_bot")
+            send_message "$(printf '%s <b>Restarting bot...</b>\nStartup notification will confirm when back online.' "$E_RST")" ""
+            logger -t podkop-bot "[Restart] Manual restart requested via Telegram"
+            kill "$HEALTH_PID" 2>/dev/null
+            sleep 1
+            _bot_basename=$(basename "$BOT_PATH")
+            if [ -f "/etc/init.d/podkop_bot" ]; then
+                /etc/init.d/podkop_bot restart
+                killall -9 "$_bot_basename" 2>/dev/null || true
+            else
+                killall -9 "$_bot_basename" 2>/dev/null || true
+                sleep 1
+                exec "$BOT_PATH"
+            fi
+            exit 0
+            ;;
+
         "cmd_info")
             local hostname lan_ip p_ver y_en sb_ver text kb
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
@@ -5473,7 +5540,7 @@ ${E_INFO} <b>System Information</b>
 <b>YACD:</b> $([ "$y_en" = "1" ] && echo "${E_ON} Enabled - http://${lan_ip}:9090/ui" || echo "${E_OFF} Disabled")
 EOF
 )
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],[{\"text\":\"${E_OFF} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5679,7 +5746,7 @@ handle_command() {
                 _handle_lists "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_dns_server|wait_bootstrap_dns)
                 _handle_dns "STATE_INPUT" "$mid" "$cmd" "$state" ;;
-            wait_custom_proxy|wait_bind_iface)
+            wait_custom_proxy|wait_bind_iface|wait_restart_router_confirm)
                 _handle_bot "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_fb_socks_add)
                 _handle_fallback_socks "STATE_INPUT" "$mid" "$cmd" "$state" ;;
@@ -5739,7 +5806,9 @@ handle_command() {
         do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
-        cmd_check_update_bot|ask_update_bot_*|do_update_bot_*)
+        cmd_check_update_bot|ask_update_bot_*|do_update_bot_*|\
+        ask_restart_bot|do_restart_bot|\
+        ask_restart_router_1|ask_restart_router_2)
             _handle_bot "$cmd" "$mid" "" "" ;;
 
         ask_set_tr_menu|ask_set_tr_*|do_set_tr_*)
