@@ -1190,10 +1190,14 @@ _route_request() {
             RECOVERY_MODE=4
             logger -t podkop-bot "[Transport] IPC: watchdog=down -> FAST/POLL reset, RECOVERY_MODE=4"
         else
-            RECOVERY_MODE=0
+            # RECOVERY_MODE=2: next 2 poll cycles probe SOCKS tiers first (aggressive),
+            # preventing bot from settling on tier4/Direct when tier1 just recovered.
+            # Using 0 caused _try_all_tiers to miss tier1 on tight connect-timeout
+            # and fall through to Direct if tier1 was slow to respond post-restart.
+            RECOVERY_MODE=2
             # Clear tier5 reprobe timestamp: forces immediate SOCKS retry on tier5 path
             rm -f "$SOCKS_REPROBE_TS_FILE"
-            logger -t podkop-bot "[Transport] IPC: watchdog=up -> FAST/POLL reset, RECOVERY_MODE=0, reprobe_ts cleared"
+            logger -t podkop-bot "[Transport] IPC: watchdog=up -> FAST/POLL reset, RECOVERY_MODE=2, reprobe_ts cleared"
         fi
     fi
     # ------------------------------------------------
@@ -5590,11 +5594,23 @@ EOF
             mv "$bot_tmp" "$BOT_PATH"
             logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Restarting..."
 
-            kill "$HEALTH_PID" 2>/dev/null; sleep 1
+            # Kill watchdog by saved PID first (clean)
+            kill "$HEALTH_PID" 2>/dev/null
+            sleep 1
+            # Kill any surviving subshells (probe_all_socks_write, check_health forks)
+            _bot_basename=$(basename "$BOT_PATH")
 
             if [ -f "/etc/init.d/podkop_bot" ]; then
-                /etc/init.d/podkop_bot restart &
+                # procd path: tell procd to restart BEFORE killall.
+                # init.d restart communicates with procd via ubus synchronously —
+                # procd queues the restart independently of this process.
+                # Only after ubus call completes do we killall zombies + exit.
+                /etc/init.d/podkop_bot restart
+                killall -9 "$_bot_basename" 2>/dev/null || true
             else
+                # No init.d: kill zombies first, then exec (replaces this process)
+                killall -9 "$_bot_basename" 2>/dev/null || true
+                sleep 1
                 exec "$BOT_PATH"
             fi
             exit 0
@@ -5767,6 +5783,12 @@ printf '%s' "$$" > "$BOT_PID_FILE"
 kill $(pgrep -f "$BOT_PATH" 2>/dev/null | grep -v "^$$\$" | grep -v "^$(cat $BOT_PID_FILE 2>/dev/null)\$") 2>/dev/null || true
 
 logger -t podkop-bot "=== Podkop Bot v${BOT_VERSION} Starting ==="
+# Pre-initialize route key file so watchdog nudge logic works from first cycle.
+# Without this, MAIN_ROUTE_KEY_FILE is empty until first api_request_fast succeeds,
+# and watchdog sees "unknown" → sends nudge → IPC up resets FAST/POLL → bot does
+# full discovery but may land on tier4 (Direct) before tier1 is confirmed reachable.
+# Setting "unknown" explicitly ensures nudge fires and triggers SOCKS-first rediscovery.
+printf 'unknown' > "$MAIN_ROUTE_KEY_FILE"
 
 # Startup notification runs in background subprocess to not block the main loop
 send_startup_notification_async() {
