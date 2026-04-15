@@ -8,6 +8,38 @@
 #   wget -O /tmp/install_podkop_bot.sh \
 #     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
 #   ash /tmp/install_podkop_bot.sh
+#
+# INSTALLER_VERSION="1.5.0"
+#
+# CHANGELOG v1.5.0:
+# - NEW:  safe_stop_bot now calls cleanup_bot_runtime_files() (Step 5) which
+#         removes all /tmp/podkop_bot_* IPC/state files before deploying new binary.
+#         Prevents stale route keys, nudge timestamps, socks state from old versions
+#         polluting the new bot startup (root cause of 'tir4' mystery).
+#
+# CHANGELOG v1.4.0:
+# - FIXED: vv0.7.14-r1 → v0.7.14-r1: opkg returns version with leading 'v',
+#          installer was adding another via "v${PODKOP_VER}". Added sed strip.
+# - FIXED: Update flow now shows full summary (version, path, useful commands)
+#          instead of bare "Done." + exit 0 before summary block.
+#
+# CHANGELOG v1.3.0:
+# - NEW:  safe_stop_bot(): kill by PID file + killall -9 before binary replacement.
+#         Prevents zombie watchdog subshells surviving update.
+# - NEW:  podkop presence check with version display before install.
+# - NEW:  admin_ids configured via uci add_list (fixes space-separated breakage).
+# - NEW:  Fallback SOCKS configuration in interactive setup.
+#
+# CHANGELOG v1.2.0:
+# - NEW:  Detect accidental HTML download (wrong GitHub blob URL) and show correct
+#         raw.githubusercontent.com URL with clear error message.
+# - NEW:  apk package manager support for OpenWrt 25.x+.
+#
+# CHANGELOG v1.1.0:
+# - NEW:  Update flow: detect existing install, show token/version, offer
+#         update-keep-config / reinstall / exit options.
+# - NEW:  init.d script download and installation.
+# - NEW:  Verbose progress output throughout.
 
 # ── Self-check: detect accidental HTML download (wrong GitHub URL) ─────────────
 # Correct:  https://raw.githubusercontent.com/...
@@ -103,6 +135,43 @@ safe_stop_bot() {
 
     # Step 4: reap zombies via wait (only works for children, best-effort)
     wait 2>/dev/null || true
+
+    # Step 5: clean up all runtime/IPC files from /tmp to prevent stale state
+    # from affecting the new version (wrong route keys, stale nudge timestamps, etc.)
+    cleanup_bot_runtime_files
+}
+
+cleanup_bot_runtime_files() {
+    local _files="
+        /tmp/podkop_bot_state
+        /tmp/podkop_bot_health_state
+        /tmp/podkop_bot_socks_state
+        /tmp/podkop_bot_socks_probe
+        /tmp/podkop_bot_socks_reprobe_ts
+        /tmp/podkop_bot_route_cmd
+        /tmp/podkop_bot_last_menu_msg
+        /tmp/podkop_bot_last_alert_msg
+        /tmp/podkop_bot_username
+        /tmp/podkop_bot_id
+        /tmp/podkop_bot_tag_name_cache
+        /tmp/podkop_bot_main_route
+        /tmp/podkop_bot_main_route_key
+        /tmp/podkop_bot.pid
+        /tmp/podkop_bot_last_nudge
+        /tmp/podkop_bot_unauth
+        /tmp/podkop_bot_last_cmd
+        /tmp/podkop_bot_offset
+    "
+    local _removed=0
+    for _f in $_files; do
+        if [ -f "$_f" ]; then
+            rm -f "$_f"
+            _removed=$((_removed + 1))
+        fi
+    done
+    # Remove any leftover temp request files
+    rm -f /tmp/podkop_req.* /tmp/podkop_bot_update.* /tmp/podkop_updates.* 2>/dev/null || true
+    [ "$_removed" -gt 0 ] && info "Cleaned up ${_removed} runtime files from /tmp."
 }
 
 # Validate socks5[h]://host:port format
