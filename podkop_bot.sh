@@ -1186,7 +1186,8 @@ _try_socks_tiers() {
     local _n=0 _fb
     for _fb in $_t_fb_socks; do
         _n=$((_n + 1))
-        if _try_curl "-x $_fb" "$max_time" "$args" "$ct"; then
+        logger -t podkop-bot "[Transport] probing tier2_${_n}: ${_fb}"
+        if _try_curl "-x ${_fb}" "$max_time" "$args" "$ct"; then
             ROUTE_KEY="tier2_${_n}"
             ROUTE_NAME="Fallback SOCKS${_n} (${_fb})"
             return 0
@@ -1406,7 +1407,12 @@ api_request_fast() {
     if [ "${RECOVERY_MODE:-0}" -gt 0 ]; then
         _load_transport_ctx
         local ROUTE_KEY ROUTE_NAME
-        if _try_socks_tiers "$final_args" "$max_time" "3"; then
+        # Use reduced max_time so all SOCKS tiers fit within one fast request budget.
+        # Default max_time=8s with ct=3s means tier1 alone can consume all 8s before
+        # tier2 gets a chance. Cap at 5s per tier: tier1(3s ct)+tier2(3s ct) = ~6s total.
+        local _fast_max=5
+        logger -t podkop-bot "[Transport] fast recovery start: RECOVERY_MODE=${RECOVERY_MODE} fb_socks='${_t_fb_socks}' policy=${_t_policy}"
+        if _try_socks_tiers "$final_args" "$_fast_max" "3"; then
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
             LAST_ROUTE_FAST="$ROUTE_KEY"
@@ -1416,6 +1422,8 @@ api_request_fast() {
             RECOVERY_MODE=$((RECOVERY_MODE > 1 ? RECOVERY_MODE - 1 : 0))
             logger -t podkop-bot "[Transport] fast recovery: new=${ROUTE_KEY} route=${ROUTE_NAME} recovery_mode=${RECOVERY_MODE}"
             rm -f "$tmp"; echo "$API_RESPONSE"; return 0
+        else
+            logger -t podkop-bot "[Transport] fast recovery: _try_socks_tiers failed for all tiers"
         fi
     fi
     if _route_request "$final_args" "$max_time" "2" "3" "LAST_ROUTE_FAST"; then
