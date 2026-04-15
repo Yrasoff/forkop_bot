@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.69
+# Podkop Telegram Bot v0.13.77
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,153 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.77:
+# - FIXED: Source of truth for route key in watchdog — architectural cleanup.
+#   Root cause: MAIN_ROUTE_FILE holds human-readable names ("Podkop (SOCKS5:...)"),
+#   not tier keys. grep -oE 'tier[0-9_]+' on it always returned empty.
+#   SOCKS_STATE_FILE.route= was written by watchdog from stale subshell LAST_ROUTE.
+#   Both fallbacks in per-cycle nudge therefore read wrong/stale data.
+#
+#   Fix: new MAIN_ROUTE_KEY_FILE (/tmp/podkop_bot_main_route_key) written by
+#   main process at every successful tier resolution via _write_main_route() helper.
+#   _write_main_route(key, name) atomically updates both KEY and NAME files.
+#   All tier resolution points updated: tier1..tier5 sticky + full discovery +
+#   tier5 reprobe + api_request_fast recovery path.
+#
+#   Per-cycle nudge now reads MAIN_ROUTE_KEY_FILE directly — no grep heuristics,
+#   no stale var, no fallback chain needed.
+#
+#   _write_socks_state() drops route= and route_name= fields (were stale subshell
+#   copies). SOCKS_STATE_FILE now contains: tg, tg_direct, tg_transport, socks,
+#   last_ok only. Tunnel Health and rt_socks_state reads unaffected (use socks= key).
+#
+#   MAIN_ROUTE_KEY_FILE added to trap cleanup.
+#
+
+# CHANGELOG v0.13.76:
+# - FIXED: BOT_PATH not declared — self-update mv/exec expanded to empty string.
+#          Added: BOT_PATH=$(readlink -f "$0" || echo "/usr/bin/podkop_bot")
+#          near BOT_VERSION. readlink -f resolves symlinks at runtime, fallback
+#          matches installer default path.
+# - FIXED: Per-cycle watchdog nudge read stale LAST_ROUTE from subshell scope
+#          (fork-time copy, never updated). Now reads from MAIN_ROUTE_FILE
+#          (written by main process on every successful tier resolution) with
+#          fallback to route= key in SOCKS_STATE_FILE. Both are file-based IPC,
+#          same pattern as ROUTE_CMD_FILE already used for watchdog→main comms.
+# - FIXED: html_escape() missing double-quote escaping. URLs in remote_domain/
+#          subnet list <a href="..."> cards could contain " and break HTML parse
+#          mode → Telegram 400. Added: -e 's/"/\&quot;/g'
+# - UX:    Tunnel Health "TG via SOCKS" renamed to "TG via Podkop (tier1)"
+#          with note "(primary mixed_proxy — not full bot transport chain)".
+#          Prevents confusion: this metric only probes tier1, not tier2_N/tier3.
+#
+
+# CHANGELOG v0.13.75:
+# - FIXED: Transport tier return logic — bot now reliably comes back to tier1
+#          after podkop/sing-box recovers. Three-part fix:
+#   1. IPC "up" now also clears SOCKS_REPROBE_TS_FILE → tier5 reprobe fires
+#      immediately on next _route_request, not after 30s timer.
+#   2. Per-cycle watchdog nudge: every health cycle, if socks=up AND sing-box
+#      running AND bot route=tier4/tier5/fail, sends IPC "up" to main loop.
+#      Replaces the previous PROBE_EVERY-only nudge (was up to ~5 min lag).
+#   3. Removed duplicate IPC "up" from PROBE_EVERY block (now per-cycle).
+# - UX:    Scope line added to all 7 watchdog alert types:
+#          TG reachable/unreachable: "Scope: bot control plane"
+#          sing-box STOPPED: "Scope: data plane DOWN + bot transport resetting"
+#          sing-box RECOVERED: "Scope: data plane restored — bot returning to tier1"
+#          Bot SOCKS DOWN: "Scope: bot control plane — podkop data routing unaffected"
+#          Bot SOCKS RECOVERED: "Scope: bot control plane — returning to tier1"
+#          Proxy switched: "Scope: outbound selection only — no service interruption"
+#          Consistent one-line clarifier: operator sees immediately what broke
+#          and whether user traffic is affected.
+#
+
+# CHANGELOG v0.13.74:
+# - FIXED: TG health semantics in Tunnel Health — split into two independent metrics.
+#   check_health() now probes TWO paths and writes TWO keys to HEALTH_STATE_FILE:
+#     tg_direct=ok|fail    — raw curl, no proxy (expected fail under RKN)
+#     tg_transport=ok|fail — curl via primary mixed_proxy SOCKS (Podkop tier1)
+#   Returns 0 (success) if either path works.
+#   _write_socks_state() reads both keys from HEALTH_STATE_FILE and forwards
+#   them to SOCKS_STATE_FILE (keeps tg= for backward compat).
+#   Watchdog: updated grep to use [ tg_direct=ok ] || [ tg_transport=ok ]
+#   instead of pattern matching on "Connected|via SOCKS" string.
+# - UX:    Tunnel Health now shows two TG lines:
+#     "TG direct: ok|fail (no proxy)"
+#     "TG via SOCKS: ok|fail (Podkop tier1)"
+#   Under RKN: direct=fail, SOCKS=ok — both visible, no false alarm.
+#   "fail" on TG direct no longer triggers confusion because label is honest.
+#
+
+# CHANGELOG v0.13.73:
+# - UX:    Runtime Info split: heavy tests moved to new Diagnostics screen.
+#          Runtime Info now shows: connections, traffic, active proxy, selector,
+#          type/delay, bot route summary. Keyboard: Tunnel Health | Diagnostics |
+#          Configs & Logs | Refresh | Back. No heavy actions on this screen.
+# - NEW:   cmd_diagnostics — dedicated hub for all active test operations:
+#          Upstream Health, Global Check, Internal Diagnostics, Support Bundle.
+#          Intro text explains these are active tests that may take 10-30 sec.
+# - NEW:   ask_* confirm screens before every heavy action:
+#          ask_upstream_health, ask_run_podkop_tests, ask_run_internal_diag,
+#          ask_support_bundle. Each shows what the action does, estimated time,
+#          and Run / Cancel buttons. Consistent with existing ask_*/do_* pattern.
+# - UX:    Back navigation from all heavy actions now returns to cmd_diagnostics
+#          instead of cmd_runtime (upstream_health, global_check, internal_diag,
+#          support_bundle).
+# - FIXED: html_escape applied to human_name in Outbound Selector list text.
+#          URI fragment user-names with <>&  could break Telegram HTML parse mode.
+# - FIXED: html_escape applied to _fb, cp, bi, m_ip in Bot Settings tr_chain.
+#          After removing <code> wrapper these values render as raw HTML.
+#
+
+# CHANGELOG v0.13.72:
+# - NEW:   Bot self-update from Telegram menu (cmd_check_update_bot).
+#          Info screen now has two update buttons: podkop and bot separately.
+#          cmd_check_update_bot: fetches version.txt from GitHub, compares
+#          with BOT_VERSION, shows diff or "up to date" with force-update option.
+#          ask_update_bot_<ver>: confirm screen before applying.
+#          do_update_bot_<ver>: downloads to /tmp/podkop_bot_update.PID,
+#          validates shebang + BOT_VERSION present, atomic mv to BOT_PATH,
+#          kills HEALTH_PID (watchdog), then init.d restart or exec fallback.
+#          Sends confirmation message BEFORE restart (last message before down).
+# - FIXED: Installer: safe_stop_bot() added — kills main PID from pid file
+#          AND runs killall -9 podkop_bot before replacing binary during update.
+#          Prevents zombie watchdog subshells that survived procd SIGKILL.
+#
+
+# CHANGELOG v0.13.71:
+# - FIXED: ZeroTier/Tailscale interface line in Status merged with CPU Load line.
+#          $() subshell strips trailing newlines from awk output, so extra_ifs
+#          lost its trailing \n. Now explicitly appended when extra_ifs non-empty.
+# - FIXED: Tunnel Health "TG reach: fail" misleading when bot works via SOCKS.
+#          check_health() now tries direct curl first, then SOCKS fallback.
+#          HEALTH_STATE_FILE writes "Connected", "via SOCKS", or "Disconnected".
+#          Watchdog grep updated to match both "Connected" and "via SOCKS".
+#          Tunnel Health label renamed "TG direct" with "(fail under RKN is normal)"
+#          hint so users understand the distinction between direct and SOCKS reach.
+#
+
+# CHANGELOG v0.13.70:
+# - FIXED: routing_excluded_ips wrote to per-section UCI (podkop.<sec>.routing_excluded_ips)
+#          but podkop reads it from podkop.settings.routing_excluded_ips (global setting).
+#          All 5 references corrected. Card header now shows [global] with note.
+# - FIXED: url_proxy_links UCI key does not exist in podkop. proxy_config_type=url
+#          uses proxy_string (multiline textarea, one URL per line).
+#          get_url_proxy_links() rewritten to read proxy_string.
+#          _handle_url_links add/delete fully rewritten: add appends line to proxy_string,
+#          delete rebuilds proxy_string without target line, empty = uci delete.
+# - NEW:   proxy_mode_menu — full 4-mode selector (url/selector/urltest/outbound).
+#          Previously Mode button only toggled selector<->urltest.
+#          Now opens a menu with all modes; active mode shown with checkmark.
+#          ask_switch_mode_ expanded with correct warning text for each mode.
+#          proxy_mode_menu added to dispatch routing.
+# - UX:    Active proxy in Outbound Selector list: bold name + E_PLAY icon.
+#          Inactive proxies show latency icon only (no active_mark clutter).
+# - UX:    Bot Settings Fallback Route chain: active tier highlighted in bold
+#          with "◀ active" marker. Removed <code> wrapper so HTML renders.
+#          Active tier determined from LAST_ROUTE_FAST variable.
+#
+
 # CHANGELOG v0.13.69:
 # - FIXED: ZeroTier interfaces (zt<hex>, e.g. zt3jnfoa3b) were not shown
 #          in Status — pattern matched "zero" but ZeroTier uses "zt" prefix.
@@ -620,7 +767,10 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.69"
+BOT_VERSION="0.13.77"
+# Path to this script — used by self-update (mv + exec/restart).
+# Resolved at startup: follows symlinks, falls back to hardcoded installer path.
+BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
 
 BOT_START_TIME=$(date +%s)
 BOT_START_STR=$(date "+%Y-%m-%d %H:%M:%S")
@@ -689,6 +839,18 @@ SOCKS_PROBE_FILE="/tmp/podkop_bot_socks_probe"
 SOCKS_REPROBE_TS_FILE="/tmp/podkop_bot_socks_reprobe_ts"
 # Main process writes current route name here so watchdog subshell can read it
 MAIN_ROUTE_FILE="/tmp/podkop_bot_main_route"
+# Main process writes current route KEY here (tier1/tier2_N/tier3/tier4/tier5/fail).
+# Separate from MAIN_ROUTE_FILE (which holds human-readable name).
+# Watchdog reads this for per-cycle nudge logic — never writes to it.
+MAIN_ROUTE_KEY_FILE="/tmp/podkop_bot_main_route_key"
+
+# Write both route name and route key atomically from main process.
+# Called at every successful tier resolution so watchdog always reads fresh data.
+_write_main_route() {
+    local _key="$1" _name="$2"
+    printf '%s' "$_name" > "$MAIN_ROUTE_FILE"
+    printf '%s' "$_key"  > "$MAIN_ROUTE_KEY_FILE"
+}
 ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
 LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
 UNAUTH_FILE="/tmp/podkop_bot_unauth"
@@ -783,10 +945,12 @@ validate_domain() {
 }
 
 html_escape() {
+    # Escapes all 5 HTML special chars including " for safe use inside href="..."
     printf '%s' "$1" | sed \
         -e 's/&/\&amp;/g' \
         -e 's/</\&lt;/g' \
         -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
         -e "s/'/\&#39;/g"
 }
 
@@ -983,7 +1147,9 @@ _route_request() {
             logger -t podkop-bot "[Transport] IPC: watchdog=down -> FAST/POLL reset, RECOVERY_MODE=4"
         else
             RECOVERY_MODE=0
-            logger -t podkop-bot "[Transport] IPC: watchdog=up -> FAST/POLL reset, RECOVERY_MODE=0"
+            # Clear tier5 reprobe timestamp: forces immediate SOCKS retry on tier5 path
+            rm -f "$SOCKS_REPROBE_TS_FILE"
+            logger -t podkop-bot "[Transport] IPC: watchdog=up -> FAST/POLL reset, RECOVERY_MODE=0, reprobe_ts cleared"
         fi
     fi
     # ------------------------------------------------
@@ -998,6 +1164,7 @@ _route_request() {
                 [ "$_t_policy" != "direct" ] && \
                 _try_curl "-x socks5h://${_t_ip}:${_t_port}" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier1"; LAST_ROUTE_NAME="Podkop (SOCKS5:${_t_ip}:${_t_port})"
+                    _write_main_route "tier1" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier1"; return 0
                 }
                 ;;
@@ -1013,7 +1180,7 @@ _route_request() {
                 [ -n "$_fb" ] && \
                 _try_curl "-x $_fb" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="$_last"; LAST_ROUTE_NAME="Fallback SOCKS${_n} (${_fb})"
-                    printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
+                    _write_main_route "$_last" "$LAST_ROUTE_NAME"
                     eval "$_rvar=$_last"; return 0
                 }
                 ;;
@@ -1021,6 +1188,7 @@ _route_request() {
                 [ -n "$_t_custom" ] && \
                 _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "$_ct_sticky" && {
                     LAST_ROUTE="tier3"; LAST_ROUTE_NAME="Custom (${_t_custom})"
+                    _write_main_route "tier3" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier3"; return 0
                 }
                 ;;
@@ -1028,6 +1196,7 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "5" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Direct"
+                    _write_main_route "tier4" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier4"; return 0
                 }
                 ;;
@@ -1042,7 +1211,7 @@ _route_request() {
                     local ROUTE_KEY ROUTE_NAME
                     if _try_socks_tiers "$_args" "$_max" "2"; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
-                        printf '%s' "$ROUTE_NAME" > "$MAIN_ROUTE_FILE"
+                        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
                         logger -t podkop-bot "[Transport] tier5 reprobe: recovered via ${ROUTE_KEY} / ${ROUTE_NAME}"
                         return 0
@@ -1052,13 +1221,13 @@ _route_request() {
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "3" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Direct"
-                    printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
+                    _write_main_route "tier4" "$LAST_ROUTE_NAME"
                     eval "$_rvar=tier4"; return 0
                 }
                 for _eip in $TG_EMERGENCY_IPS; do
                     _try_curl "$_t_ifflag --resolve api.telegram.org:443:${_eip}" "$_max" "$_args" "3" && {
                         LAST_ROUTE="tier5"; LAST_ROUTE_NAME="Emergency IP (${_eip})"
-                        printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
+                        _write_main_route "tier5" "$LAST_ROUTE_NAME"
                         eval "$_rvar=tier5"; return 0
                     }
                 done
@@ -1073,7 +1242,7 @@ _route_request() {
         local _prev_name="$LAST_ROUTE_NAME"
         LAST_ROUTE="$ROUTE_KEY"
         LAST_ROUTE_NAME="$ROUTE_NAME"
-        printf '%s' "$ROUTE_NAME" > "$MAIN_ROUTE_FILE"
+        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
             logger -t podkop-bot "[Transport] recover old=fail new=${ROUTE_KEY} route=${ROUTE_NAME}"
@@ -1108,6 +1277,7 @@ api_request_fast() {
         local ROUTE_KEY ROUTE_NAME
         if _try_socks_tiers "$final_args" "$max_time" "3"; then
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
+            _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
             LAST_ROUTE_FAST="$ROUTE_KEY"
             RECOVERY_MODE=0
             logger -t podkop-bot "[Transport] fast recovery: new=${ROUTE_KEY} route=${ROUTE_NAME}"
@@ -1756,7 +1926,8 @@ build_tag_name_cache() {
     local tmp sec raw_list link frag tag
     sec=$(get_active_section)
     tmp=$(mktemp /tmp/podkop_tag_name.XXXXXX)
-    for uci_key in selector_proxy_links urltest_proxy_links url_proxy_links; do
+    # url mode uses proxy_string (plain option, one URL per line) — handle separately
+    for uci_key in selector_proxy_links urltest_proxy_links; do
         raw_list=$(uci -q show podkop.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
         [ -z "$raw_list" ] && continue
         eval "set -- $raw_list"
@@ -1775,6 +1946,21 @@ build_tag_name_cache() {
             [ -n "$tag" ] && printf '%s=%s\n' "$tag" "$frag" >> "$tmp"
         done
     done
+    # Also index fragments from proxy_string (url mode, multiline one-URL-per-line)
+    local ps_raw ps_link ps_frag ps_tag ps_srv
+    ps_raw=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+    if [ -n "$ps_raw" ]; then
+        printf '%s\n' "$ps_raw" | grep -v '^[[:space:]]*$' | while IFS= read -r ps_link; do
+            case "$ps_link" in *#?*) ps_frag="${ps_link##*#}" ;; *) continue ;; esac
+            ps_frag=$(url_decode "$ps_frag")
+            [ -z "$ps_frag" ] && continue
+            ps_srv=$(extract_server_port_from_uri "${ps_link%%#*}")
+            [ -z "$ps_srv" ] || [ "$ps_srv" = "N/A" ] && continue
+            ps_tag=$(grep "@${ps_srv}$\|:${ps_srv}$" "$TAG_URI_CACHE" 2>/dev/null \
+                | head -1 | cut -d= -f1)
+            [ -n "$ps_tag" ] && printf '%s=%s\n' "$ps_tag" "$ps_frag" >> "$tmp"
+        done
+    fi
     mv "$tmp" "$TAG_NAME_CACHE"
     logger -t podkop-bot "[Cache] tag_names rebuilt for '${sec}' ($(wc -l < "$TAG_NAME_CACHE" 2>/dev/null || echo 0) entries)"
 }
@@ -1791,11 +1977,13 @@ build_all_caches() {
 # Uses eval "set --" on UCI shell-quoted output - handles = signs inside
 # vless/hy2/vmess URLs correctly (base64 padding, query params, etc).
 get_url_proxy_links() {
-    local sec="$1" raw_list
-    raw_list=$(uci -q show podkop.${sec}.url_proxy_links 2>/dev/null | cut -d= -f2-)
-    [ -z "$raw_list" ] && return 0
-    eval "set -- $raw_list"
-    for link in "$@"; do printf '%s\n' "$link"; done
+    # proxy_config_type=url uses proxy_string (multiline textarea, one URL per line).
+    # url_proxy_links does NOT exist in podkop UCI schema — this helper now reads
+    # proxy_string and emits one non-empty line per URL.
+    local sec="$1" raw
+    raw=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+    [ -z "$raw" ] && return 0
+    printf '%s\n' "$raw" | grep -v '^[[:space:]]*$'
 }
 
 get_urltest_proxy_links() {
@@ -2156,20 +2344,59 @@ run_upstream_health_report() {
 #   last_ok=<last tier that worked>
 # ==============================================================================
 
+# check_health() — probes Telegram reachability via two independent paths.
+# Writes TWO keys to HEALTH_STATE_FILE (sourced by watchdog after call):
+#   tg_direct=ok|fail   — raw direct curl, no proxy (expected fail under RKN)
+#   tg_transport=ok|fail — via primary mixed_proxy SOCKS (Podkop tier1)
+# Return value: 0 if either path succeeded, 1 if both failed.
+# Does NOT touch LAST_ROUTE_* — uses its own independent curl sessions.
 check_health() {
-    local tmp_resp
-    tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 12 \
+    local tmp_resp _direct=fail _transport=fail
+    local _sec _port _ip
+
+    # A1: direct (no proxy) — raw internet reachability
+    tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
         -X GET "${API_URL}/getMe" 2>/dev/null)
     if printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
-        echo "${E_OK} Connected" > "$HEALTH_STATE_FILE"; return 0
-    else
-        echo "${E_ERR} Disconnected" > "$HEALTH_STATE_FILE"; return 1
+        _direct=ok
     fi
+
+    # A2: via primary SOCKS (mixed_proxy / Podkop tier1)
+    _sec=$(get_active_section)
+    _port=$(uci -q get podkop.${_sec}.mixed_proxy_port || echo "2080")
+    _ip=$(get_proxy_ip)
+    tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
+        --socks5-hostname "${_ip}:${_port}" \
+        -X GET "${API_URL}/getMe" 2>/dev/null)
+    if printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+        _transport=ok
+    fi
+
+    # Write both results; watchdog reads tg_direct= and tg_transport= separately
+    printf 'tg_direct=%s
+tg_transport=%s
+' "$_direct" "$_transport" > "$HEALTH_STATE_FILE"
+
+    # Return 0 (success) if at least one path works
+    [ "$_direct" = "ok" ] || [ "$_transport" = "ok" ]
 }
 
 _write_socks_state() {
-    printf 'tg=%s\nsocks=%s\nroute=%s\nlast_ok=%s\nroute_name=%s\n' \
-        "$1" "$2" "$LAST_ROUTE" "$3" "$LAST_ROUTE_NAME" > "$SOCKS_STATE_FILE"
+    # Args: $1=tg_aggregate(ok|fail)  $2=socks(up|down)  $3=last_ok_route
+    # Reads tg_direct/tg_transport from HEALTH_STATE_FILE (written by check_health).
+    # Keeps tg= for backward compat with any external tooling.
+    local _tg_direct _tg_transport
+    _tg_direct=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    _tg_transport=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
+    # Authoritative route key is in MAIN_ROUTE_KEY_FILE, written by main process.
+    printf 'tg=%s
+tg_direct=%s
+tg_transport=%s
+socks=%s
+last_ok=%s
+' \
+        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "$2" "$3" > "$SOCKS_STATE_FILE"
 }
 
 # send_health_alert: health daemon uses this instead of bare api_request_fast.
@@ -2214,15 +2441,6 @@ start_health_daemon() {
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
                 logger -t podkop-bot "[Watchdog] status: socks=${last_socks_state:-unknown} sb=${last_sb_state:-unknown} route=${LAST_ROUTE_NAME}"
                 probe_all_socks_write &
-                # If bot is stuck on degraded path (tier4/tier5), signal recovery attempt.
-                # This resets LAST_ROUTE_FAST/POLL so next request runs full discovery
-                # and can return to SOCKS tiers if they recovered.
-                case "$LAST_ROUTE" in
-                    tier4|tier5)
-                        logger -t podkop-bot "[Watchdog] Degraded route ($LAST_ROUTE) detected — sending IPC up to force rediscovery"
-                        printf 'up' > "$ROUTE_CMD_FILE"
-                        ;;
-                esac
             fi
 
             sec=$(get_active_section)
@@ -2230,14 +2448,20 @@ start_health_daemon() {
             m_ip=$(get_proxy_ip)
 
             # ------------------------------------------------------------------
-            # Check A: Telegram API connectivity (direct curl, no fallback)
-            # We use a direct curl here intentionally - this measures raw
-            # reachability, not routed through the bot's own transport stack,
-            # to avoid interfering with LAST_ROUTE_FAST/POLL state.
+            # Check A: Telegram API connectivity.
+            # Tries direct curl first (shown as "TG direct" in Tunnel Health).
+            # If direct fails, falls back to SOCKS probe (mixed_proxy).
+            # Does NOT touch LAST_ROUTE_FAST/POLL — uses its own curl session.
+            # Under RKN: direct fails, SOCKS succeeds → status "via SOCKS".
             # ------------------------------------------------------------------
             check_health
-            curr_tg_state=$(cat "$HEALTH_STATE_FILE" 2>/dev/null)
-            if printf '%s' "$curr_tg_state" | grep -q "Connected"; then
+            # check_health writes tg_direct= and tg_transport= to HEALTH_STATE_FILE.
+            # TG is "reachable" if either path works (direct OK or transport OK).
+            local _tgd _tgt
+            _tgd=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            _tgt=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            curr_tg_state="${_tgd}/${_tgt}"
+            if [ "$_tgd" = "ok" ] || [ "$_tgt" = "ok" ]; then
                 tg_fail_streak=0
                 tg_ok_streak=$((tg_ok_streak + 1))
                 if [ "$last_tg_state" = "fail" ] && [ "$tg_ok_streak" -ge 2 ]; then
@@ -2245,7 +2469,7 @@ start_health_daemon() {
                     logger -t podkop-bot "[Watchdog] TG connectivity: fail -> ok"
                     if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                         admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
-                            --arg txt "$(printf '<b>[%s]</b> %s <b>TG reachable</b>\n<b>Bot route:</b> <code>%s</code>' \
+                            --arg txt "$(printf '<b>[%s]</b> %s <b>TG reachable</b>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: bot control plane</i>' \
                                 "$_hn" "$E_OK" "${LAST_ROUTE_NAME:-unknown}")" \
                             '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                         send_health_alert "$admin_payload"
@@ -2260,7 +2484,7 @@ start_health_daemon() {
                     logger -t podkop-bot "[Watchdog] TG connectivity: ok -> fail streak=${tg_fail_streak}"
                     if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                         admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
-                            --arg txt "$(printf '<b>[%s]</b> %s <b>TG unreachable</b>\n<b>Bot route:</b> <code>%s</code>\n<b>SOCKS:</b> <code>%s</code>' \
+                            --arg txt "$(printf '<b>[%s]</b> %s <b>TG unreachable</b>\n<b>Bot route:</b> <code>%s</code>\n<b>SOCKS:</b> <code>%s</code>\n<i>Scope: bot control plane — podkop data routing may still work</i>' \
                                 "$_hn" "$E_ERR" "${LAST_ROUTE_NAME:-unknown}" "${last_socks_state:-unknown}")" \
                             '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                         send_health_alert "$admin_payload"
@@ -2281,7 +2505,7 @@ start_health_daemon() {
                         local _sb_leaf _sb_leaf_disp
                         _sb_leaf=$([ -n "$last_leaf" ] && echo "$last_leaf" || echo "unknown")
                         _sb_leaf_disp=$(display_proxy_name "$_sb_leaf")
-                        sb_alert_txt=$(printf '<b>[%s]</b> <b>%s sing-box STOPPED</b>\n<b>Section:</b> <code>%s</code>\n<b>Last proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
+                        sb_alert_txt=$(printf '<b>[%s]</b> <b>%s sing-box STOPPED</b>\n<b>Section:</b> <code>%s</code>\n<b>Last proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: data plane DOWN + bot transport resetting</i>' \
                             "$_hn" "$E_ERR" "$sec" "$_sb_leaf_disp" "${LAST_ROUTE_NAME:-unknown}")
                         # IPC: force transport reset — tier1/tier2 SOCKS are dead without sing-box
                         printf 'down' > "$ROUTE_CMD_FILE"
@@ -2291,7 +2515,7 @@ start_health_daemon() {
                         # Get current leaf after recovery (may take a moment to settle)
                         local _rec_leaf_disp
                         _rec_leaf_disp=$(display_proxy_name "${last_leaf:-unknown}")
-                        sb_alert_txt=$(printf '<b>[%s]</b> <b>%s sing-box RECOVERED</b>\n<b>PID:</b> <code>%s</code> | <b>Section:</b> <code>%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
+                        sb_alert_txt=$(printf '<b>[%s]</b> <b>%s sing-box RECOVERED</b>\n<b>PID:</b> <code>%s</code> | <b>Section:</b> <code>%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: data plane restored — bot transport rediscovering tier1</i>' \
                             "$_hn" "$E_OK" "${new_pid:-?}" "$sec" \
                             "$_rec_leaf_disp" "${LAST_ROUTE_NAME:-unknown}")
                         # IPC: signal recovery — let transport rediscover tier1
@@ -2368,7 +2592,7 @@ start_health_daemon() {
                         fi
                         [ -z "$_fb_avail" ] && _fb_avail="  (none configured)\n"
                         socks_alert_txt=$(printf \
-                            '<b>[%s]</b> <b>%s Bot SOCKS upstream DOWN</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<b>Fallback:</b>\n<code>%b</code>' \
+                            '<b>[%s]</b> <b>%s Bot SOCKS upstream DOWN</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<b>Fallback:</b>\n<code>%b</code><i>Scope: bot control plane — podkop data routing unaffected</i>' \
                             "$_hn" "$E_ERR" "$m_ip" "$m_port" \
                             "$active_px_display" \
                             "${LAST_ROUTE_NAME:-unknown}" \
@@ -2380,7 +2604,7 @@ start_health_daemon() {
                         last_ok_route="tier1"
                         logger -t podkop-bot "[Watchdog] SOCKS recovered - wrote route_cmd=up (DNS warmup done)"
                         socks_alert_txt=$(printf \
-                            '<b>[%s]</b> <b>%s Bot SOCKS upstream RECOVERED</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
+                            '<b>[%s]</b> <b>%s Bot SOCKS upstream RECOVERED</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: bot control plane — returning to tier1</i>' \
                             "$_hn" "$E_OK" "$m_ip" "$m_port" \
                             "$active_px_display" \
                             "${LAST_ROUTE_NAME:-unknown}")
@@ -2437,7 +2661,7 @@ start_health_daemon() {
                             # Read current bot route from MAIN_ROUTE_FILE (written by main process)
                             _bot_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null)
                             [ -z "$_bot_route" ] && _bot_route="unknown"
-                            leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy switched</b>\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n<b>Section:</b> <code>%s</code> | <b>Mode:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>' \
+                            leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy switched</b>\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n<b>Section:</b> <code>%s</code> | <b>Mode:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: outbound selection only — no service interruption</i>' \
                                 "$_hn" "$E_TGT" "$old_disp" "$new_disp" "$sec" "$_mode" "$_bot_route")
                             admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
                                 '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
@@ -2447,6 +2671,21 @@ start_health_daemon() {
                     # Only store fully-resolved leaf to avoid group tags as baseline
                     [ -n "$curr_leaf" ] && last_leaf="$curr_leaf"
                 fi
+            fi
+
+            # Per-cycle: if SOCKS is up but bot route is degraded (tier4/tier5/fail),
+            # send IPC up every cycle to nudge main loop back to SOCKS discovery.
+            # Per-cycle nudge: if SOCKS is up but bot route is degraded,
+            # send IPC up so main loop rediscovers tier1 within one health interval.
+            # Reads MAIN_ROUTE_KEY_FILE — written by main process, never stale.
+            if [ "$last_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
+                _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+                case "${_wd_cur_route:-unknown}" in
+                    tier4|tier5|fail|unknown)
+                        logger -t podkop-bot "[Watchdog] Degraded route (${_wd_cur_route}) + SOCKS up — nudging IPC up"
+                        printf 'up' > "$ROUTE_CMD_FILE"
+                        ;;
+                esac
             fi
 
             # Write structured state for status screens
@@ -2652,19 +2891,23 @@ _handle_proxy() {
                         else                                icon="${E_RED}"; fi ;;
                 esac
 
-                # Active marker
-                active_mark=""
-                [ "$name" = "$current_proxy" ] && active_mark="${E_PLAY} "
-
                 # Human-readable name (UCI fragment or tag)
                 human_name=$(display_proxy_name "$name")
                 # Button: just human name — clean, matches what user sees in list
                 short_name=$(json_escape "$human_name")
 
-                # List: [idx] icon Name | Type | Delay
-                list_text=$(printf '%s\n<code>[%s]</code> %s%s %s | %s | %s' \
-                    "$list_text" "$abs_idx" "$active_mark" "$icon" \
-                    "$human_name" "$ptype" "$delay_txt")
+                # List: active proxy gets ▶ + bold; others plain
+                # html_escape name: URI fragment may contain < > & from user input
+                safe_name=$(html_escape "$human_name")
+                if [ "$name" = "$current_proxy" ]; then
+                    list_text=$(printf '%s\n<code>[%s]</code> %s <b>%s</b> | %s | %s' \
+                        "$list_text" "$abs_idx" "${E_PLAY}" \
+                        "$safe_name" "$ptype" "$delay_txt")
+                else
+                    list_text=$(printf '%s\n<code>[%s]</code> %s %s | %s | %s' \
+                        "$list_text" "$abs_idx" "$icon" \
+                        "$safe_name" "$ptype" "$delay_txt")
+                fi
                 rows="${rows}[{\"text\":\"${short_name}\",\"callback_data\":\"px_view_${abs_idx}\"}],"
                 abs_idx=$((abs_idx + 1))
             done <<EOF
@@ -2889,7 +3132,8 @@ EOF
 
 # ------------------------------------------------------------------------------
 # 9.2b: URL Links Handler (proxy_config_type=url)
-# Paginated list of url_proxy_links, add/remove, reload on change.
+# Edits proxy_string (the real podkop UCI key for url mode).
+# proxy_string is a multiline textarea — one proxy URL per line.
 # Outbound info screen (proxy_config_type=outbound) - redirect to LuCI/console.
 # ------------------------------------------------------------------------------
 _handle_url_links() {
@@ -2913,7 +3157,15 @@ _handle_url_links() {
                 send_message "$(printf '%s <b>Duplicate!</b>\nThis link is already in the list.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"url_links_menu\"}]]}"
             else
-                uci add_list podkop.${sec}.url_proxy_links="$safe_link"
+                # Append new URL to proxy_string (one per line)
+                local existing new_val
+                existing=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+                if [ -z "$existing" ]; then
+                    new_val="$safe_link"
+                else
+                    new_val=$(printf '%s\n%s' "$existing" "$safe_link")
+                fi
+                uci set podkop.${sec}.proxy_string="$new_val"
                 uci_commit_safe podkop
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
@@ -2926,14 +3178,13 @@ _handle_url_links() {
     case "$cmd" in
         url_links_menu|url_links_p_*)
             rm -f "$STATE_FILE"
-            local page=0 raw link_list total total_pages
+            local page=0 link_list total total_pages
             local start_idx end_idx rows list_text nav_row kb abs_idx
             local short human
 
             [ "$cmd" != "url_links_menu" ] && page="${cmd#url_links_p_}"
 
-            # Load url_proxy_links list via get_url_proxy_links (eval "set --" based,
-            # handles = signs in URLs correctly - base64 padding, query params, etc).
+            # Load URLs from proxy_string (one per line, skip empty)
             link_list=$(get_url_proxy_links "$sec")
             if [ -z "$link_list" ]; then
                 total=0
@@ -2950,13 +3201,11 @@ _handle_url_links() {
             [ "$end_idx" -gt "$total" ] && end_idx="$total"
 
             rows=""; list_text=""; abs_idx=0
-            # Iterate all lines, display only current page window
             local line_n=0
             if [ "$total" -gt 0 ]; then
                 while IFS= read -r link; do
                     [ -z "$link" ] && continue
                     if [ "$line_n" -ge "$start_idx" ] && [ "$line_n" -lt "$end_idx" ]; then
-                        # Shorten link for display: show protocol+host only
                         local disp proto host
                         proto=$(echo "$link" | cut -d: -f1)
                         host=$(echo "$link" | sed 's|.*@||; s|/.*||; s|?.*||' | cut -c1-30)
@@ -2983,14 +3232,15 @@ EOF
                 nav_row="[{\"text\":\"< Prev\",\"callback_data\":\"${prev_cb}\"},{\"text\":\"$((page+1))/${total_pages}\",\"callback_data\":\"url_links_p_${page}\"},{\"text\":\"Next >\",\"callback_data\":\"${next_cb}\"}],"
             fi
 
-            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
             text=$(cat <<EOF
 ${E_GLOB} <b>URL Links</b> [<code>${sec}</code>]
 <b>Total:</b> ${total} link(s)
+${E_IDEA} <i>Stored in <code>proxy_string</code> — one URL per line.</i>
 
 ${list_text}
 
-<i>Tap [X] next to a link to remove it.</i>
+<i>Tap [${E_DEL}] next to a link to remove it.</i>
 EOF
 )
             send_or_edit "$mid" "$text" "$kb"
@@ -3005,8 +3255,7 @@ EOF
 
         "ask_del_ul_"*)
             local idx="${cmd#ask_del_ul_}"
-            local link_to_del=""
-            local ln=0
+            local link_to_del="" ln=0
             while IFS= read -r link; do
                 [ -z "$link" ] && continue
                 if [ "$ln" -eq "$idx" ]; then link_to_del="$link"; break; fi
@@ -3028,20 +3277,25 @@ EOF
 
         "do_del_ul_"*)
             local idx="${cmd#do_del_ul_}"
-            local link_to_del="" ln=0
+            local ln=0 new_val="" link
             while IFS= read -r link; do
                 [ -z "$link" ] && continue
-                if [ "$ln" -eq "$idx" ]; then link_to_del="$link"; break; fi
+                if [ "$ln" -ne "$idx" ]; then
+                    if [ -z "$new_val" ]; then new_val="$link"
+                    else new_val=$(printf '%s\n%s' "$new_val" "$link"); fi
+                fi
                 ln=$((ln + 1))
             done <<EOF
 $(get_url_proxy_links "$sec")
 EOF
-            if [ -n "$link_to_del" ]; then
-                uci del_list podkop.${sec}.url_proxy_links="$link_to_del"
-                uci_commit_safe podkop
-                send_or_edit "$mid" "$(printf '%s <b>Removed. Applying...</b>' "$E_RST")" ""
-                safe_reload_podkop "force"; sleep 1
+            send_or_edit "$mid" "$(printf '%s <b>Removed. Applying...</b>' "$E_RST")" ""
+            if [ -z "$new_val" ]; then
+                uci -q delete podkop.${sec}.proxy_string
+            else
+                uci set podkop.${sec}.proxy_string="$new_val"
             fi
+            uci_commit_safe podkop
+            safe_reload_podkop "force"; sleep 1
             _handle_url_links "url_links_menu" "$mid" "" ""
             ;;
 
@@ -3055,7 +3309,6 @@ EOF
             ;;
     esac
 }
-
 # ------------------------------------------------------------------------------
 # 9.3: Core Podkop Settings
 # ------------------------------------------------------------------------------
@@ -3112,15 +3365,14 @@ EOF
             [ "$interval" = "1d" ]  && next_int="3d"
             [ "$interval" = "3d" ]  && next_int="1h"
 
-            # proxy_config_type: selector = manual pick, urltest = auto best
-            local next_mode="urltest"; [ "$proxy_mode" = "urltest" ] && next_mode="selector"
-
             local mode_hint conn_hint
-            if [ "$proxy_mode" = "selector" ]; then
-                mode_hint="${E_IDEA} <i>Selector: you manually choose the active proxy.</i>"
-            else
-                mode_hint="${E_IDEA} <i>URLTest: sing-box auto-picks the fastest proxy.</i>"
-            fi
+            case "$proxy_mode" in
+                selector) mode_hint="${E_IDEA} <i>Selector: manually choose the active proxy.</i>" ;;
+                urltest)  mode_hint="${E_IDEA} <i>URLTest: sing-box auto-picks the fastest proxy.</i>" ;;
+                url)      mode_hint="${E_IDEA} <i>URL: single proxy_string connection.</i>" ;;
+                outbound) mode_hint="${E_IDEA} <i>Outbound: raw sing-box JSON config.</i>" ;;
+                *)        mode_hint="" ;;
+            esac
             case "$conn_type" in
                 proxy)     conn_hint="${E_IDEA} <i>Proxy: route matched traffic through VPN tunnel.</i>" ;;
                 vpn)       conn_hint="${E_IDEA} <i>VPN: full tunnel mode, all traffic goes through VPN.</i>" ;;
@@ -3146,12 +3398,8 @@ EOF
 )
             kb="{\"inline_keyboard\":["
             kb="${kb}[{\"text\":\"Conn: ${conn_type}\",\"callback_data\":\"conn_type_menu\"}],"
-            # Mode button: selector/urltest can toggle; url/outbound redirect to respective screen
-            case "$proxy_mode" in
-                url)      kb="${kb}[{\"text\":\"Mode: URL Links\",\"callback_data\":\"url_links_menu\"}]," ;;
-                outbound) kb="${kb}[{\"text\":\"Mode: Outbound (LuCI)\",\"callback_data\":\"outbound_info\"}]," ;;
-                *)        kb="${kb}[{\"text\":\"Mode: ${proxy_mode}\",\"callback_data\":\"ask_switch_mode_${next_mode}\"}]," ;;
-            esac
+            # Mode button: opens full mode selector (url / selector / urltest / outbound)
+            kb="${kb}[{\"text\":\"${E_TGT} Mode: ${proxy_mode}\",\"callback_data\":\"proxy_mode_menu\"}],"
             kb="${kb}[{\"text\":\"${dl} DL via Proxy\",\"callback_data\":\"ask_toggle_dl\"}],"
             kb="${kb}[{\"text\":\"${quic} Disable QUIC\",\"callback_data\":\"ask_toggle_quic\"}],"
             kb="${kb}[{\"text\":\"${wan} Bad WAN Monitor\",\"callback_data\":\"ask_toggle_wan\"},{\"text\":\"${mixed_en} Mixed Proxy\",\"callback_data\":\"ask_toggle_mixed\"}],"
@@ -3175,16 +3423,37 @@ EOF
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
+        "proxy_mode_menu")
+            local current_mode
+            current_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "selector")
+            local pm_txt kb_pm
+            pm_txt=$(printf '%s <b>Proxy Mode</b> [<code>%s</code>]\n\nCurrent: <code>%s</code>\n\n<b>url</b> — single proxy URL (proxy_string)\n<b>selector</b> — manual proxy selection\n<b>urltest</b> — auto best-ping selection\n<b>outbound</b> — raw sing-box JSON (LuCI/console only)' \
+                "$E_TGT" "$sec" "$current_mode")
+            kb_pm="{\"inline_keyboard\":[["
+            for _m in url selector urltest outbound; do
+                if [ "$_m" = "$current_mode" ]; then
+                    kb_pm="${kb_pm}{\"text\":\"${E_OK} ${_m}\",\"callback_data\":\"proxy_mode_menu\"},"
+                else
+                    kb_pm="${kb_pm}{\"text\":\"${_m}\",\"callback_data\":\"ask_switch_mode_${_m}\"},"
+                fi
+            done
+            # Remove trailing comma, close row and add back button
+            kb_pm="${kb_pm%,}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+            send_or_edit "$mid" "$pm_txt" "$kb_pm"
+            ;;
+
         "ask_switch_mode_"*)
             local target_mode="${cmd#ask_switch_mode_}"
             local current_mode warn_txt kb
             current_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "selector")
-            if [ "$target_mode" = "urltest" ]; then
-                warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nIn URLTest mode sing-box automatically picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n\nSection: <code>%s</code>' "$E_WARN" "$sec")
-            else
-                warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nIn Selector mode you manually pick the active proxy.\n\nSection: <code>%s</code>' "$E_WARN" "$sec")
-            fi
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Switch\",\"callback_data\":\"do_switch_mode_${target_mode}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+            case "$target_mode" in
+                urltest)  warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                selector) warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                url)      warn_txt=$(printf '%s <b>Switch to URL mode?</b>\n\nURL mode: single proxy connection via <code>proxy_string</code>.\nExisting selector/urltest links will be preserved in UCI but inactive.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                outbound) warn_txt=$(printf '%s <b>Switch to Outbound mode?</b>\n\nOutbound mode requires editing raw sing-box JSON via LuCI or console.\nBot cannot edit outbound JSON directly.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                *)        warn_txt=$(printf '%s Unknown mode: %s' "$E_ERR" "$target_mode") ;;
+            esac
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Switch\",\"callback_data\":\"do_switch_mode_${target_mode}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_mode_menu\"}]]}"
             send_or_edit "$mid" "$warn_txt" "$kb"
             ;;
 
@@ -3750,7 +4019,7 @@ _handle_lists() {
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"excl_ips_edit\"}]]}"
                 return
             fi
-            uci add_list podkop.${sec}.routing_excluded_ips="$ip"; uci_commit_safe podkop
+            uci add_list podkop.settings.routing_excluded_ips="$ip"; uci_commit_safe podkop
             send_message "$(printf '%s Excluded IP added: %s' "$E_OK" "$ip")" ""
             safe_reload_podkop "force"; sleep 1; _handle_lists "excl_ips_edit" "" "" ""
 
@@ -3851,7 +4120,7 @@ EOF
             fr_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.fully_routed_ips=")
             r_dom_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.remote_domain_lists=")
             r_sub_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.remote_subnet_lists=")
-            excl_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.routing_excluded_ips=")
+            excl_count=$(uci -q show podkop.settings 2>/dev/null | grep -c "^podkop\.settings\.routing_excluded_ips=")
 
             # FIXED: use eval "set --" for list parsing (uci get N broken on BusyBox)
             r_dom_text=""
@@ -4044,17 +4313,17 @@ EOF
         "excl_ips_edit")
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb excl_count=0
-            raw=$(uci -q show podkop.${sec}.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
+            raw=$(uci -q show podkop.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
             [ -n "$raw" ] && eval "set -- $raw" && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_excl_${ip}\"}],"
             done
             [ -n "$raw" ] && { eval "set -- $raw"; excl_count=$#; }
             text=$(cat <<EOF
-${E_FILE} <b>Routing Excluded IPs</b> [<code>${sec}</code>]
+${E_FILE} <b>Routing Excluded IPs</b> [<code>global</code>]
 ${excl_count} entries
 
 Tap an IP button to remove it.
-${E_IDEA} <i>Excluded IPs bypass the tunnel entirely — always go direct regardless of rules.</i>
+${E_IDEA} <i>Excluded IPs bypass the tunnel entirely — always go direct regardless of rules. This is a global setting (applies to all sections).</i>
 EOF
 )
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add IP\",\"callback_data\":\"cmd_add_excl_ip\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
@@ -4067,7 +4336,7 @@ EOF
                 send_or_edit "$mid" "$(printf '%s Invalid IP.' "$E_ERR")" ""; return
             fi
             send_or_edit "$mid" "$(printf '%s Applying...' "$E_RST")" ""
-            uci del_list podkop.${sec}.routing_excluded_ips="$ip"
+            uci del_list podkop.settings.routing_excluded_ips="$ip"
             uci_commit_safe podkop; safe_reload_podkop "force"; sleep 1
             _handle_lists "excl_ips_edit" "$mid" "" ""
             ;;
@@ -4485,6 +4754,9 @@ EOF
                     printf "%s %s (<code>%s</code>): <code>%s</code>\n", icon, label, iface, ip;
                 }
             }')
+            # $() strips trailing newlines — restore separator so CPU Load stays on its own line
+            [ -n "$extra_ifs" ] && extra_ifs="${extra_ifs}
+"
 
             if /etc/init.d/podkop status 2>&1 | grep -qi "running"; then
                 podkop_init_status="${E_OK} RUNNING"
@@ -4587,6 +4859,15 @@ EOF
             [ -z "$p_delay_raw" ] || [ "$p_delay_raw" = "0" ] && p_delay="N/A" || p_delay="${p_delay_raw}ms"
             p_type=$(echo "$proxies" | jq -r --arg n "$active_leaf" '.proxies[$n].type // .proxies[$n].adapterType // "Unknown"' 2>/dev/null)
 
+            # Bot transport summary line for Runtime Info
+            local rt_socks_state rt_transport_summary
+            rt_socks_state=$(grep "^socks=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            if [ "$rt_socks_state" = "up" ]; then
+                rt_transport_summary="${E_ON} ${LAST_ROUTE_NAME:-unknown}"
+            else
+                rt_transport_summary="${E_YLW} ${LAST_ROUTE_NAME:-unknown} (SOCKS down)"
+            fi
+
             text=$(cat <<EOF
 ${E_SCAN} <b>Runtime Info</b>
 <code>────────────────────</code>
@@ -4598,13 +4879,13 @@ ${E_GLOB} <b>Active proxy:</b> <code>${active_proxy_display}</code>
 ${E_SET} <b>Type:</b> ${p_type} | <b>Delay:</b> ${p_delay}
 <b>Selector:</b> <code>${selector}</code>
 <code>────────────────────</code>
+${E_SHLD} <b>Bot route:</b> ${rt_transport_summary}
 EOF
 )
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"${E_HEALTH} Tunnel Health\",\"callback_data\":\"cmd_tunnel_health\"}],
-                [{\"text\":\"${E_SCAN} Upstreams\",\"callback_data\":\"cmd_upstream_health\"}],
-                [{\"text\":\"${E_TEST} Global Check\",\"callback_data\":\"cmd_run_podkop_tests\"},{\"text\":\"${E_TEST} Internal Diag\",\"callback_data\":\"cmd_run_internal_diag\"}],
-                [{\"text\":\"${E_FILE} Configs & Logs\",\"callback_data\":\"cmd_files\"},{\"text\":\"${E_LOG} Support Bundle\",\"callback_data\":\"cmd_support_bundle\"}],
+                [{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"}],
+                [{\"text\":\"${E_FILE} Configs & Logs\",\"callback_data\":\"cmd_files\"}],
                 [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_status\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -4667,15 +4948,17 @@ EOF
             th_active_display=$(html_escape "$(display_proxy_name_with_tag "$th_active_proxy")")
             [ -z "$th_active_display" ] && th_active_display="N/A (Clash API unavailable)"
 
-            # Read structured watchdog state (tg=, socks=)
-            local wd_tg="?" wd_socks="?"
+            # Read structured watchdog state: two TG keys + socks
+            local wd_tg_direct="?" wd_tg_transport="?" wd_socks="?"
             if [ -f "$SOCKS_STATE_FILE" ]; then
-                wd_tg=$(grep "^tg=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+                wd_tg_direct=$(grep "^tg_direct=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+                wd_tg_transport=$(grep "^tg_transport=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
                 wd_socks=$(grep "^socks=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             fi
-            local tg_icon socks_icon
-            [ "$wd_tg" = "ok" ]   && tg_icon="$E_OK"   || tg_icon="$E_ERR"
-            [ "$wd_socks" = "up" ] && socks_icon="$E_OK" || socks_icon="$E_ERR"
+            local tgd_icon tgt_icon socks_icon
+            [ "$wd_tg_direct" = "ok" ]    && tgd_icon="$E_OK"  || tgd_icon="$E_ERR"
+            [ "$wd_tg_transport" = "ok" ] && tgt_icon="$E_OK"  || tgt_icon="$E_ERR"
+            [ "$wd_socks" = "up" ]        && socks_icon="$E_OK" || socks_icon="$E_ERR"
 
             # Read SOCKS latency probe results
             local probe_ts="" probe_tier1="" probe_fb_text="" probe_age_str="" probe_t3_text=""
@@ -4734,7 +5017,8 @@ ${E_SET} <b>Mode:</b> <code>${proxy_mode}</code>
 ${E_NET} <b>WAN iface:</b> <code>${wan_iface}</code>
 ${E_GLOB} <b>Active proxy:</b> <code>${th_active_display}</code>
 <code>────────────────────</code>
-${tg_icon} <b>TG reach:</b> <code>${wd_tg:-unknown}</code>
+${tgd_icon} <b>TG direct:</b> <code>${wd_tg_direct:-?}</code> <i>(no proxy)</i>
+${tgt_icon} <b>TG via Podkop (tier1):</b> <code>${wd_tg_transport:-?}</code> <i>(primary mixed_proxy — not full bot transport chain)</i>
 ${socks_icon} <b>SOCKS upstream:</b> <code>${wd_socks:-unknown}</code>
 ${E_SHLD} <b>Bot transport:</b> <code>${LAST_ROUTE_NAME}</code>
 ${E_NET} <b>Poll route:</b> <code>${LAST_ROUTE_POLL}</code> | <b>Fast:</b> <code>${LAST_ROUTE_FAST}</code>${probe_section}
@@ -4779,34 +5063,50 @@ EOF
             m_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
             m_ip=$(get_proxy_ip)
 
-            # Build fallback route chain: tier1, tier2_N fallback socks, tier3 custom, tier4 direct, tier5 emergency
-            local tr_chain="" _tier=1 _fb_raw _fb
+            # Build fallback route chain with active tier highlighted in bold.
+            # LAST_ROUTE_FAST holds the current tier key: tier1, tier2_N, tier3, tier4, tier5.
+            local tr_chain="" _tier=1 _fb_raw _fb _tier_key _tier_line
+            _active_tier="$LAST_ROUTE_FAST"
+
+            _fmt_tier() {
+                local _key="$1" _label="$2"
+                if [ "$_key" = "$_active_tier" ]; then
+                    printf '<b>%s. %s ◀ active</b>' "$_tier" "$_label"
+                else
+                    printf '%s. %s' "$_tier" "$_label"
+                fi
+            }
+
             if [ "$tr" != "direct" ]; then
-                tr_chain="${_tier}. SOCKS5 (${m_ip}:${m_port})"
+                _mip_esc=$(html_escape "$m_ip")
+                tr_chain=$(_fmt_tier "tier1" "SOCKS5 (${_mip_esc}:${m_port})")
                 _tier=$((_tier + 1))
-                # fallback_socks entries
                 _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_fb_raw" ]; then
                     eval "set -- $_fb_raw"
+                    local _fn=1
                     for _fb in "$@"; do
+                        _fb_esc=$(html_escape "$_fb")
                         tr_chain="${tr_chain}
-${_tier}. Fallback SOCKS (${_fb})"
-                        _tier=$((_tier + 1))
+$(_fmt_tier "tier2_${_fn}" "Fallback SOCKS (${_fb_esc})")"
+                        _tier=$((_tier + 1)); _fn=$((_fn + 1))
                     done
                 fi
             fi
             if [ "$cp" != "Not set" ]; then
+                _cp_esc=$(html_escape "$cp")
                 tr_chain="${tr_chain}
-${_tier}. Custom (${cp})"
+$(_fmt_tier "tier3" "Custom (${_cp_esc})")"
                 _tier=$((_tier + 1))
             fi
             if [ "$tr" != "socks" ]; then
-                local d_if=""; [ "$bi" != "Not set" ] && d_if=" via ${bi}"
+                _bi_esc=""; [ "$bi" != "Not set" ] && _bi_esc=" via $(html_escape "$bi")"
+                local d_if="$_bi_esc"
                 tr_chain="${tr_chain}
-${_tier}. Direct${d_if}"
+$(_fmt_tier "tier4" "Direct${d_if}")"
                 _tier=$((_tier + 1))
                 tr_chain="${tr_chain}
-${_tier}. Emergency IPs"
+$(_fmt_tier "tier5" "Emergency IPs")"
             fi
             [ -z "$tr_chain" ] && tr_chain="No valid transports!"
 
@@ -4868,7 +5168,7 @@ ${E_SHLD} <b>Transport Policy:</b> <code>${tr}</code>
 ${tr_hint}
 <b>Active Route:</b> <code>${LAST_ROUTE_NAME:-Initializing...}</code>
 <b>Fallback Route:</b>
-<code>${tr_chain}</code>
+${tr_chain}
 <b>TG Latency:</b> ${E_TIME} ${tg_lat}
 
 <b>Custom Proxy:</b> <code>${cp}</code>
@@ -4955,12 +5255,62 @@ EOF
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"}]]}"
             ;;
 
+        "cmd_diagnostics")
+            # Diagnostics hub: heavy tests with confirm flow.
+            # Separated from Runtime Info to avoid mixing "view" and "run" actions.
+            send_or_edit "$mid"                 "$(printf '%s <b>Diagnostics</b>
+
+All actions below run active tests.
+On slow routers they may take 10–30 seconds.' "$E_TEST")"                 "{"inline_keyboard":[
+                    [{"text":"${E_SCAN} Upstream Health","callback_data":"ask_upstream_health"}],
+                    [{"text":"${E_GLOB} Global Check","callback_data":"ask_run_podkop_tests"},{"text":"${E_CPU} Internal Diag","callback_data":"ask_run_internal_diag"}],
+                    [{"text":"${E_LOG} Support Bundle","callback_data":"ask_support_bundle"}],
+                    [{"text":"${E_BACK} Back","callback_data":"cmd_runtime"}]
+                ]}"
+            ;;
+
+        "ask_upstream_health")
+            send_or_edit "$mid"                 "$(printf '%s <b>Upstream Health</b>
+
+Tests all outbound proxies via Clash API.
+Sends results as a text file.
+
+<i>May take 10–30 sec on slow routers.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Run","callback_data":"cmd_upstream_health"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            ;;
+
+        "ask_run_podkop_tests")
+            send_or_edit "$mid"                 "$(printf '%s <b>Global Check</b>
+
+Runs <code>podkop global_check</code> — tests DNS, routing, connectivity.
+Sends results as a text file.
+
+<i>May take 10–30 sec.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Run","callback_data":"cmd_run_podkop_tests"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            ;;
+
+        "ask_run_internal_diag")
+            send_or_edit "$mid"                 "$(printf '%s <b>Internal Diagnostics</b>
+
+Gathers UCI config, routes, nft rules, syslog, bot state.
+Sends results as a text file.
+
+<i>~5 sec, light CPU load.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Run","callback_data":"cmd_run_internal_diag"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            ;;
+
+        "ask_support_bundle")
+            send_or_edit "$mid"                 "$(printf '%s <b>Support Bundle</b>
+
+Collects everything: versions, UCI config (token redacted), routes, nft, interfaces, bot transport state, last 80 syslog lines.
+Sends as a single text file.
+
+<i>~5 sec. Share with maintainer when reporting bugs.</i>' "$E_WARN")"                 "{"inline_keyboard":[[{"text":"${E_OK} Collect & Send","callback_data":"cmd_support_bundle"},{"text":"${E_BACK} Cancel","callback_data":"cmd_diagnostics"}]]}"
+            ;;
+
         "cmd_upstream_health")
             local uf="/tmp/podkop_upstream.txt"
             send_or_edit "$mid" "$(printf '%s Testing upstream proxies...' "$E_TIME")" ""
             if run_upstream_health_report "$uf"; then api_document "$uf" "Upstream Health"
             else send_message "$(printf '%s Done with failures.' "$E_WARN")" ""; api_document "$uf" "Upstream Health (failures)"; fi
-            rm -f "$uf"; delete_message "$mid"; _handle_bot "cmd_runtime" "" "" ""
+            rm -f "$uf"; delete_message "$mid"; _handle_bot "cmd_diagnostics" "" "" ""
             ;;
         "cmd_run_podkop_tests")
             local tf="/tmp/podkop_global_check.txt"
@@ -4968,7 +5318,7 @@ EOF
             /usr/bin/podkop global_check | sed "s/$(printf '\033')\\[[0-9;]*[a-zA-Z]//g" > "$tf" 2>&1 || \
                 echo "ERROR: global_check failed" >> "$tf"
             api_document "$tf" "Podkop Global Check"
-            rm -f "$tf"; delete_message "$mid"; _handle_bot "cmd_runtime" "" "" ""
+            rm -f "$tf"; delete_message "$mid"; _handle_bot "cmd_diagnostics" "" "" ""
             ;;
         "cmd_run_internal_diag")
             local tf="/tmp/podkop_internal_diag.txt"
@@ -4976,7 +5326,7 @@ EOF
             run_internal_diagnostics "$tf"
             api_document "$tf" "Internal Diagnostics" || \
                 send_message "$(printf '%s Failed to send.' "$E_ERR")" ""
-            rm -f "$tf"; delete_message "$mid"; _handle_bot "cmd_runtime" "" "" ""
+            rm -f "$tf"; delete_message "$mid"; _handle_bot "cmd_diagnostics" "" "" ""
             ;;
 
         "cmd_files")
@@ -5061,7 +5411,7 @@ EOF
             api_document "$bf" "Support Bundle [${hostname}]"
             rm -f "$bf"
             delete_message "$mid"
-            _handle_bot "cmd_runtime" "" "" ""
+            _handle_bot "cmd_diagnostics" "" "" ""
             ;;
 
         "cmd_info")
@@ -5083,7 +5433,7 @@ ${E_INFO} <b>System Information</b>
 <b>YACD:</b> $([ "$y_en" = "1" ] && echo "${E_ON} Enabled - http://${lan_ip}:9090/ui" || echo "${E_OFF} Disabled")
 EOF
 )
-            kb="{\"inline_keyboard\":[[{\"text\":\"Check Updates\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5127,6 +5477,106 @@ EOF
             else
                 send_message "$(printf '%s Downloaded script is invalid.' "$E_ERR")" ""
             fi
+            ;;
+
+        # ------------------------------------------------------------------
+        # Bot self-update: check version.txt on GitHub, download new script,
+        # replace binary atomically, restart via init.d or exec.
+        #
+        # Safety sequence before replacing binary:
+        #   1. Download to temp file and validate (must start with #!)
+        #   2. mv (atomic on same filesystem) — no window with missing binary
+        #   3. Kill watchdog subshell explicitly (HEALTH_PID)
+        #   4. /etc/init.d/podkop_bot restart — procd respawns from new binary
+        #      If no init.d: exec $BOT_PATH — replace current process in-place
+        #
+        # Note: the bot cannot reply AFTER exec — the restart confirmation
+        # is sent BEFORE the binary is replaced (send_or_edit → then update).
+        # ------------------------------------------------------------------
+        "cmd_check_update_bot")
+            local remote_ver
+            send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
+            remote_ver=$(wget -qO -                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"                 2>/dev/null | tr -d '[:space:]')
+            [ -z "$remote_ver" ] && remote_ver=$(curl -s --connect-timeout 8 --max-time 12                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"                 2>/dev/null | tr -d '[:space:]')
+            if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
+                send_or_edit "$mid"                     "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")"                     "{"inline_keyboard":[[{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                return
+            fi
+            if [ "$remote_ver" = "$BOT_VERSION" ]; then
+                send_or_edit "$mid"                     "$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")"                     "{"inline_keyboard":[[{"text":"${E_RST} Force Update","callback_data":"ask_update_bot_${remote_ver}"},{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+            else
+                local upd_txt
+                upd_txt=$(printf '%s <b>Bot Update Available!</b>
+
+<b>Installed:</b> v%s
+<b>Available:</b> v%s
+
+<i>The bot will restart automatically after update.
+You will receive a startup notification when it is back online.</i>'                     "$E_NEW" "$BOT_VERSION" "$remote_ver")
+                send_or_edit "$mid" "$upd_txt"                     "{"inline_keyboard":[[{"text":"${E_OK} Update to v${remote_ver}","callback_data":"ask_update_bot_${remote_ver}"}],[{"text":"${E_BACK} Cancel","callback_data":"cmd_info"}]]}"
+            fi
+            ;;
+
+        "ask_update_bot_"*)
+            local target_ver="${cmd#ask_update_bot_}"
+            send_or_edit "$mid"                 "$(printf '%s <b>Update bot to v%s?</b>
+
+The bot will download the new version and restart.
+All active menus will be interrupted.
+
+Section: <code>%s</code>'                     "$E_WARN" "$target_ver" "$(get_active_section)")"                 "{"inline_keyboard":[[{"text":"${E_OK} Yes, Update & Restart","callback_data":"do_update_bot_${target_ver}"}],[{"text":"${E_BACK} Cancel","callback_data":"cmd_info"}]]}"
+            ;;
+
+        "do_update_bot_"*)
+            local target_ver="${cmd#do_update_bot_}"
+            local bot_tmp="/tmp/podkop_bot_update.$$"
+            local bot_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
+
+            send_or_edit "$mid"                 "$(printf '%s <b>Downloading bot v%s...</b>' "$E_TIME" "$target_ver")" ""
+
+            # Download to temp file
+            if ! wget -qO "$bot_tmp" "$bot_url" 2>/dev/null &&                ! curl -s -o "$bot_tmp" "$bot_url" 2>/dev/null; then
+                rm -f "$bot_tmp"
+                send_message "$(printf '%s Download failed. Check connectivity.' "$E_ERR")"                     "{"inline_keyboard":[[{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                return
+            fi
+
+            # Validate: must start with shebang and contain BOT_VERSION
+            if ! head -1 "$bot_tmp" | grep -q '^#!' ||                ! grep -q '^BOT_VERSION=' "$bot_tmp"; then
+                rm -f "$bot_tmp"
+                send_message "$(printf '%s Downloaded file is invalid (not a bot script).' "$E_ERR")"                     "{"inline_keyboard":[[{"text":"${E_BACK} Back","callback_data":"cmd_info"}]]}"
+                return
+            fi
+
+            local new_ver
+            new_ver=$(grep '^BOT_VERSION=' "$bot_tmp" | cut -d'"' -f2)
+            chmod +x "$bot_tmp"
+
+            # Confirm to user BEFORE restart (last message the bot sends)
+            send_message                 "$(printf '%s <b>Bot updating to v%s</b>
+Restarting now — startup notification will confirm when back online.'                     "$E_RST" "${new_ver:-$target_ver}")" ""
+
+            # Atomic replace: mv on same filesystem is instantaneous
+            mv "$bot_tmp" "$BOT_PATH"
+
+            logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Restarting..."
+
+            # Restart: prefer init.d (procd respawns from new binary cleanly).
+            # Kill watchdog first so it doesn't outlive the restart.
+            kill "$HEALTH_PID" 2>/dev/null
+            sleep 1
+
+            if [ -f "/etc/init.d/podkop_bot" ]; then
+                /etc/init.d/podkop_bot restart &
+            else
+                # No init.d: exec replaces the current process image with the
+                # new binary. All subshells (watchdog) are orphaned and will
+                # self-exit on next IPC check or SIGTERM from OS cleanup.
+                exec "$BOT_PATH"
+            fi
+            # This point is not reached after exec; after init.d restart
+            # the current process receives SIGTERM from procd shortly.
+            exit 0
             ;;
 
         "ask_cmd_stop")
@@ -5223,7 +5673,7 @@ handle_command() {
         main_settings_menu|advanced_settings|\
         ask_toggle_dl|ask_toggle_quic|ask_toggle_wan|ask_toggle_ntp|ask_toggle_mixed|\
         do_toggle_dl|do_toggle_quic|do_toggle_wan|do_toggle_ntp|do_toggle_mixed|\
-        ask_switch_mode_*|do_switch_mode_*|set_log_*|set_update_int_*|conn_type_menu|do_set_conn_*|ask_toggle_autostart_off|ask_toggle_autostart_on|do_autostart_off|do_autostart_on)
+        proxy_mode_menu|ask_switch_mode_*|do_switch_mode_*|set_log_*|set_update_int_*|conn_type_menu|do_set_conn_*|ask_toggle_autostart_off|ask_toggle_autostart_on|do_autostart_off|do_autostart_on)
             _handle_settings "$cmd" "$mid" "" "" ;;
 
         urltest_settings|cmd_set_ut_url|cmd_set_ut_interval|cmd_set_ut_tolerance|\
@@ -5250,7 +5700,9 @@ handle_command() {
             _handle_lists "$cmd" "$mid" "" "" ;;
 
         do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|\
-        cmd_tunnel_health|cmd_support_bundle)
+        cmd_tunnel_health|cmd_support_bundle|\
+        cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
+        cmd_check_update_bot|ask_update_bot_*|do_update_bot_*)
             _handle_bot "$cmd" "$mid" "" "" ;;
 
         ask_set_tr_menu|ask_set_tr_*|do_set_tr_*)
@@ -5306,7 +5758,7 @@ send_startup_notification_async() {
         if api_request_fast "getMe" "{}" "5" >/dev/null; then
             load_bot_identity >/dev/null 2>&1
             # Write initial route so watchdog subshell can read it immediately
-            printf '%s' "$LAST_ROUTE_NAME" > "$MAIN_ROUTE_FILE"
+            _write_main_route "$LAST_ROUTE_FAST" "$LAST_ROUTE_NAME"
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
                 logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
@@ -5338,7 +5790,7 @@ EOF
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$BOT_PID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
