@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.80
+# Podkop Telegram Bot v0.13.85
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,54 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.85:
+# - FIXED: Nudge throttled to 120s (was every ~30s watchdog cycle). Continuous nudge
+#          caused IPC "up" to reset LAST_ROUTE_FAST=unknown on every cycle, triggering
+#          full discovery → recover old=fail new=tier4 loop. Bot could never stabilize.
+# - FIXED: Per-cycle nudge now uses curr_socks_state (current cycle) instead of
+#          last_socks_state (previous cycle). Nudge now fires on same cycle tier2
+#          is confirmed alive instead of one cycle later.
+# - FIXED: Watchdog baseline sends IPC "up" immediately if SOCKS is up but bot route
+#          is degraded (tier4/tier5/unknown) on first cycle. Previously baseline set
+#          last_socks_state=up → no down→up transition ever fired → no IPC up from
+#          RECOVERED handler → bot stuck on Direct indefinitely after cold start.
+# - FIXED: Check C (SOCKS probe) now also probes all fallback_socks (tier2_N) when
+#          tier1 is down. If any tier2 alive → curr_socks_state=up → nudge fires →
+#          bot rediscovers tier2 instead of staying on Direct.
+# - FIXED: api_request_fast no longer zeros RECOVERY_MODE on success — decrements
+#          instead. Zeroing caused next api_poll_long to skip SOCKS-first path and
+#          land on Direct if tier1 was slow to respond post-recovery.
+# - FIXED: IPC "up" sets RECOVERY_MODE=2 (was 0). RECOVERY_MODE=0 caused
+#          _try_all_tiers to miss tier1 on tight connect-timeout and fall through
+#          to Direct. With =2, next 2 poll cycles probe SOCKS aggressively.
+# - FIXED: Pre-initialize MAIN_ROUTE_KEY_FILE="unknown" and MAIN_ROUTE_FILE=
+#          "Initializing..." at startup before watchdog fork. Without this watchdog
+#          read empty file → sent nudge → IPC up reset FAST/POLL → bot landed on
+#          Direct before tier1 confirmed reachable.
+# - FIXED: Self-update and do_restart_bot: added killall -9 podkop_bot after
+#          init.d restart (sync ubus call) to clean up zombie watchdog subshells.
+#          init.d restart is now synchronous (no &) so procd queues restart before
+#          killall fires.
+# - FIXED: cmd_status health_st now reads SOCKS_STATE_FILE with icons instead of
+#          raw HEALTH_STATE_FILE keys (was showing "tg_direct=ok
+tg_transport=ok").
+# - FIXED: Bot Settings cp_hint blank line — empty cp_hint no longer leaves blank
+#          line between Custom Proxy and Bind Interface (${cp_hint:+
+${cp_hint}}).
+# - NEW:   Restart Bot button in Info (ask_restart_bot / do_restart_bot).
+# - NEW:   Restart Router button in Info with double confirmation:
+#          step 1: button press (ask_restart_router_1)
+#          step 2: type YES in chat (wait_restart_router_confirm state)
+#          Any other input cancels with echo of what was typed.
+# - UX:    Menu button added to all remaining deep screens: cmd_status, cmd_runtime,
+#          cmd_tunnel_health, fallback_socks_menu, urltest_settings,
+#          domain_resolver_settings, badwan_details, cmd_runtime Back row.
+# - UX:    installer: update flow now shows full summary (version, path, useful
+#          commands) instead of bare "Done." line followed by exit 0.
+# - UX:    installer: vv0.7.14-r1 → v0.7.14-r1 (opkg returns version with leading
+#          v, installer added another one via "v${PODKOP_VER}").
+#
+
 # CHANGELOG v0.13.80:
 # - FIXED: Watchdog summary log showed "route=Initializing..." permanently because
 #          LAST_ROUTE_NAME is a fork-time copy of the parent variable (always stays
@@ -811,7 +859,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.80"
+BOT_VERSION="0.13.85"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -2700,6 +2748,7 @@ start_health_daemon() {
                         tier4|tier5|fail|unknown)
                             logger -t podkop-bot "[Watchdog] Baseline up + degraded route (${_wd_cur_route}) — nudging IPC up"
                             printf 'up' > "$ROUTE_CMD_FILE"
+                            printf '%s' "$(date +%s)" > "/tmp/podkop_bot_last_nudge"
                             ;;
                     esac
                 fi
@@ -2760,14 +2809,22 @@ start_health_daemon() {
             # Per-cycle nudge: if SOCKS is up but bot route is degraded,
             # send IPC up so main loop rediscovers tier1 within one health interval.
             # Reads MAIN_ROUTE_KEY_FILE — written by main process, never stale.
-            # Use curr_socks_state (current cycle) not last_socks_state (previous cycle)
-            # so nudge fires on the same cycle tier2 is confirmed alive.
+            # Nudge: if SOCKS (tier2+) is alive but bot route is degraded,
+            # send IPC up to trigger SOCKS rediscovery.
+            # Throttled to once per 120s to avoid continuous LAST_ROUTE_FAST resets
+            # which would cause full discovery every poll cycle (recover old=fail loop).
             if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
                 _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
                 case "${_wd_cur_route:-unknown}" in
                     tier4|tier5|fail|unknown)
-                        logger -t podkop-bot "[Watchdog] Degraded route (${_wd_cur_route}) + SOCKS up — nudging IPC up"
-                        printf 'up' > "$ROUTE_CMD_FILE"
+                        local _now_nudge _last_nudge
+                        _now_nudge=$(date +%s)
+                        _last_nudge=$(cat "/tmp/podkop_bot_last_nudge" 2>/dev/null || echo 0)
+                        if [ $((_now_nudge - _last_nudge)) -ge 120 ]; then
+                            logger -t podkop-bot "[Watchdog] Degraded route (${_wd_cur_route}) + SOCKS up — nudging IPC up"
+                            printf 'up' > "$ROUTE_CMD_FILE"
+                            printf '%s' "$_now_nudge" > "/tmp/podkop_bot_last_nudge"
+                        fi
                         ;;
                 esac
             fi
@@ -5935,7 +5992,7 @@ EOF
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE" "/tmp/podkop_bot_last_nudge"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
