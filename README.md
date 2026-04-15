@@ -1,4 +1,4 @@
-# 🤖 podkop_bot v0.13.77
+# 🤖 podkop_bot v0.13.80
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
