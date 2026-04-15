@@ -15,6 +15,10 @@
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
 # CHANGELOG v0.13.85:
+# - FIXED: tier4 sticky now reprobe SOCKS tiers every 30s (mirrors tier5 mechanism).
+#          Previously bot stuck on Direct indefinitely when Telegram accessible directly
+#          (TG direct: ok) — sticky tier4 never failed so full discovery never ran.
+#          Now shares SOCKS_REPROBE_TS_FILE with tier5 for unified reprobe cadence.
 # - FIXED: Nudge throttled to 120s (was every ~30s watchdog cycle). Continuous nudge
 #          caused IPC "up" to reset LAST_ROUTE_FAST=unknown on every cycle, triggering
 #          full discovery → recover old=fail new=tier4 loop. Bot could never stabilize.
@@ -1289,6 +1293,26 @@ _route_request() {
                 }
                 ;;
             tier4)
+                # On degraded path (tier4): periodically try SOCKS tiers before using direct.
+                # Mirrors tier5 reprobe logic — prevents sticking on Direct when tier2
+                # recovers but tier1 is still down (Telegram accessible directly).
+                local _now _last_reprobe
+                _now=$(date +%s)
+                _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
+                if [ $((_now - _last_reprobe)) -ge 30 ]; then
+                    echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
+                    local ROUTE_KEY ROUTE_NAME
+                    # Try tier1+tier2 (SOCKS) first, then tier3 (custom proxy).
+                    # _try_socks_tiers alone misses tier3 (HTTP/SOCKS custom override).
+                    if _try_socks_tiers "$_args" "$_max" "2" ||                        { [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] &&                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2" &&                          ROUTE_KEY="tier3" && ROUTE_NAME="Custom (${_t_custom})"; }; then
+                        LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
+                        _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
+                        eval "$_rvar=$ROUTE_KEY"
+                        logger -t podkop-bot "[Transport] tier4 reprobe: recovered via ${ROUTE_KEY} / ${ROUTE_NAME}"
+                        return 0
+                    fi
+                fi
+                # Reprobe failed or not yet due — use direct path
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "5" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Direct"
@@ -1305,7 +1329,7 @@ _route_request() {
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
                     echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
                     local ROUTE_KEY ROUTE_NAME
-                    if _try_socks_tiers "$_args" "$_max" "2"; then
+                    if _try_socks_tiers "$_args" "$_max" "2" ||                        { [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] &&                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2" &&                          ROUTE_KEY="tier3" && ROUTE_NAME="Custom (${_t_custom})"; }; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
