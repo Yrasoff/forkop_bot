@@ -12,7 +12,6 @@
 # ── Self-check: detect accidental HTML download (wrong GitHub URL) ─────────────
 # Correct:  https://raw.githubusercontent.com/...
 # Wrong:    https://github.com/.../blob/main/...  -- downloads HTML page
-# Check only the first line: HTML starts with <!DOCTYPE or <html, shell starts with #!
 _first_line=$(head -1 "$0" 2>/dev/null)
 case "$_first_line" in
     '<!DOCTYPE'*|'<html'*)
@@ -41,10 +40,12 @@ OS_RELEASE_FILE="/etc/os-release"
 TOKEN_DISPLAY_LENGTH=10
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-die()  { echo ""; echo "ERROR: $1"; exit 1; }
-info() { echo "  $1"; }
-ok()   { echo "[OK] $1"; }
-warn() { echo "[!!] $1"; }
+die()     { echo ""; echo "ERROR: $1"; exit 1; }
+info()    { echo "  $1"; }
+ok()      { echo "[OK] $1"; }
+warn()    { echo "[!!] $1"; }
+step()    { echo ""; echo ">>> $1"; }
+section() { echo ""; echo "-------------------------------------------"; echo "  $1"; echo "-------------------------------------------"; echo ""; }
 
 download_file() {
     local url="$1" dest="$2"
@@ -55,6 +56,60 @@ download_file() {
 
 uci_get() { uci -q get "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
 
+# ── Safe bot stop: kills main process AND orphaned watchdog subshells ──────────
+# procd sends SIGTERM→SIGKILL to the main loop but watchdog subshells can
+# survive as zombies and keep sending duplicate alerts / holding state files.
+# Strategy:
+#   1. init.d stop  — clean procd shutdown (SIGTERM→SIGKILL on main loop)
+#   2. kill by PID file — target the specific main PID written at startup
+#   3. killall -9  — catch any remaining processes matching the script name
+#   4. Short sleep — let the OS reap zombie entries
+safe_stop_bot() {
+    local _pid_file="/tmp/podkop_bot.pid"
+    local _stopped=0
+
+    # Step 1: procd-managed stop
+    if [ -f "$INIT_PATH" ]; then
+        printf "  Stopping via init.d... "
+        "$INIT_PATH" stop >/dev/null 2>&1
+        sleep 1
+        echo "done"
+        _stopped=1
+    fi
+
+    # Step 2: kill by PID file (main loop PID written by bot at startup)
+    if [ -f "$_pid_file" ]; then
+        _main_pid=$(cat "$_pid_file" 2>/dev/null)
+        if [ -n "$_main_pid" ] && kill -0 "$_main_pid" 2>/dev/null; then
+            printf "  Killing main PID %s... " "$_main_pid"
+            kill "$_main_pid" 2>/dev/null
+            sleep 1
+            kill -9 "$_main_pid" 2>/dev/null
+            echo "done"
+        fi
+        rm -f "$_pid_file"
+    fi
+
+    # Step 3: killall -9 by script name — catches watchdog subshells, any
+    #         leftover ash processes running podkop_bot that survived above.
+    #         We match on the basename to avoid killing this installer itself.
+    _bot_basename=$(basename "$BOT_PATH")
+    if killall -0 "$_bot_basename" 2>/dev/null; then
+        printf "  Killing remaining '%s' processes... " "$_bot_basename"
+        killall -9 "$_bot_basename" 2>/dev/null
+        sleep 1
+        echo "done"
+    fi
+
+    # Step 4: reap zombies via wait (only works for children, best-effort)
+    wait 2>/dev/null || true
+}
+
+# Validate socks5[h]://host:port format
+validate_socks_url() {
+    echo "$1" | grep -qE '^socks5h?://[^:]+:[0-9]{1,5}$'
+}
+
 # ── Check OS ───────────────────────────────────────────────────────────────────
 if ! grep -qE "OpenWrt|immortalwrt|ImmortalWrt" "$OS_RELEASE_FILE" 2>/dev/null; then
     die "This script is designed for OpenWrt / ImmortalWrt only."
@@ -64,15 +119,10 @@ echo ""
 echo "==========================================="
 echo "  podkop_bot installer"
 echo "==========================================="
-echo ""
 
 # ── Detect package manager (opkg vs apk) ──────────────────────────────────────
 # OpenWrt 23.05 / 24.10  → opkg
 # OpenWrt 25.x+          → apk (Alpine Package Keeper)
-#
-# Detection order:
-#   1. Binary in PATH  — most reliable
-#   2. VERSION_ID in /etc/os-release — fallback when binary not yet in PATH
 PKG_MANAGER=""
 if command -v apk >/dev/null 2>&1; then
     PKG_MANAGER="apk"
@@ -90,13 +140,52 @@ else
 fi
 
 OWRT_VERSION=$(grep '^VERSION_ID=' "$OS_RELEASE_FILE" 2>/dev/null | cut -d'"' -f2)
+echo ""
 info "OpenWrt version : ${OWRT_VERSION:-unknown}"
 info "Package manager : ${PKG_MANAGER}"
-echo ""
+info "Hostname        : $(cat /proc/sys/kernel/hostname 2>/dev/null || echo unknown)"
+
+# ── Check podkop is installed ──────────────────────────────────────────────────
+step "Checking podkop..."
+PODKOP_OK=0
+if [ -f "/usr/bin/podkop" ] || [ -f "/usr/sbin/podkop" ]; then
+    PODKOP_OK=1
+fi
+# Also check via package manager
+if [ "$PODKOP_OK" = "0" ]; then
+    case "$PKG_MANAGER" in
+        apk)  apk info podkop >/dev/null 2>&1 && PODKOP_OK=1 ;;
+        opkg) opkg list-installed 2>/dev/null | grep -q "^podkop " && PODKOP_OK=1 ;;
+    esac
+fi
+# Check UCI config exists
+if [ "$PODKOP_OK" = "0" ] && uci -q get podkop.settings >/dev/null 2>&1; then
+    PODKOP_OK=1
+fi
+
+if [ "$PODKOP_OK" = "0" ]; then
+    warn "podkop does not appear to be installed on this system."
+    warn "podkop_bot requires podkop to function."
+    echo ""
+    echo "  Install podkop first:"
+    echo "    wget -O /tmp/install_podkop.sh https://podkop.net/install"
+    echo "    ash /tmp/install_podkop.sh"
+    echo ""
+    printf "Continue installation anyway? (y/N): "
+    read -r CONT_NO_PODKOP
+    [ "$CONT_NO_PODKOP" != "y" ] && [ "$CONT_NO_PODKOP" != "Y" ] && \
+        die "Installation aborted. Install podkop first."
+    warn "Continuing without podkop — bot will start but most features won't work."
+else
+    PODKOP_VER=""
+    case "$PKG_MANAGER" in
+        apk)  PODKOP_VER=$(apk info podkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) ;;
+        opkg) PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}') ;;
+    esac
+    ok "podkop found${PODKOP_VER:+ (v${PODKOP_VER})}."
+fi
 
 # ── Package manager wrappers ───────────────────────────────────────────────────
-# All install operations use these wrappers — rest of the script is PM-agnostic.
-
 pkg_update() {
     case "$PKG_MANAGER" in
         apk)  apk update >/dev/null 2>&1 ;;
@@ -121,28 +210,31 @@ pkg_install() {
 }
 
 # ── Install dependencies ───────────────────────────────────────────────────────
+step "Installing dependencies..."
 info "Updating package index..."
 pkg_update
 
-info "Installing dependencies: curl, jq"
 for pkg in curl jq; do
     if pkg_is_installed "$pkg"; then
-        info "  $pkg — already installed"
+        info "$pkg — already installed"
     else
-        info "  Installing $pkg..."
-        pkg_install "$pkg" || die "Failed to install $pkg."
-        ok "$pkg installed."
+        printf "  Installing %s... " "$pkg"
+        if pkg_install "$pkg"; then
+            echo "OK"
+        else
+            echo "FAILED"
+            die "Failed to install $pkg. Run 'opkg update' manually and retry."
+        fi
     fi
 done
-echo ""
 
 # ── Check existing installation ────────────────────────────────────────────────
+echo ""
 EXISTING_TOKEN=$(uci_get bot_token)
 EXISTING_CHAT=$(uci_get chat_id)
 
 if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; then
     TOKEN_SHORT=$(printf '%s' "$EXISTING_TOKEN" | cut -c1-${TOKEN_DISPLAY_LENGTH})
-    # Read installed version from BOT_VERSION= line in the script
     INSTALLED_VER=$(grep '^BOT_VERSION=' "$BOT_PATH" 2>/dev/null | cut -d'"' -f2)
     [ -z "$INSTALLED_VER" ] && INSTALLED_VER="unknown"
 
@@ -167,8 +259,8 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
             exit 0
             ;;
         1|*)
-            # Fetch remote version from version.txt — lightweight (~10 bytes vs ~200KB)
-            info "Fetching latest version info from GitHub..."
+            # ── Update flow ────────────────────────────────────────────────────
+            step "Checking for updates..."
             REMOTE_VER=$(wget -q -O - "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
             [ -z "$REMOTE_VER" ] && \
                 REMOTE_VER=$(curl -s "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
@@ -191,93 +283,155 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
                 printf "Update v${INSTALLED_VER} -> v${REMOTE_VER}? (Y/n): "
                 read -r CONFIRM_UPDATE
                 [ "$CONFIRM_UPDATE" = "n" ] || [ "$CONFIRM_UPDATE" = "N" ] && {
-                    ok "Update cancelled. No changes made."
+                    ok "Update cancelled."
                     exit 0
                 }
             fi
 
-            # Stop service before replacing binary
-            if [ -f "$INIT_PATH" ] && "$INIT_PATH" status >/dev/null 2>&1; then
-                info "Stopping service..."
-                "$INIT_PATH" stop >/dev/null 2>&1
-                sleep 1
-            fi
+            # Stop all bot processes (main loop + watchdog subshells) before
+            # replacing the binary — prevents zombie health daemons.
+            safe_stop_bot
 
-            info "Downloading v${REMOTE_VER}..."
+            # Update main bot script
+            printf "  Downloading bot v%s... " "${REMOTE_VER}"
             download_file "$BOT_URL" "$BOT_PATH"
             chmod +x "$BOT_PATH"
-            ok "Updated to v${REMOTE_VER}: $BOT_PATH"
+            echo "OK"
+
+            # Update init.d script if available in repo
+            # Use direct download attempt — wget --spider is unreliable on BusyBox
+            _init_tmp=$(mktemp /tmp/podkop_bot_init.XXXXXX)
+            if download_file "$INIT_URL" "$_init_tmp" 2>/dev/null && \
+               [ -s "$_init_tmp" ] && head -1 "$_init_tmp" | grep -q 'rc.common'; then
+                printf "  Updating init.d script... "
+                mv "$_init_tmp" "$INIT_PATH"
+                chmod +x "$INIT_PATH"
+                echo "OK"
+            else
+                rm -f "$_init_tmp"
+                info "init.d script not updated (repo version not available)."
+            fi
+
+            ok "Updated to v${REMOTE_VER}."
             echo ""
 
-            # Restart service if init.d script exists
+            # Restart service
             if [ -f "$INIT_PATH" ]; then
+                printf "  Starting service... "
                 "$INIT_PATH" start >/dev/null 2>&1
                 sleep 2
                 if "$INIT_PATH" status >/dev/null 2>&1; then
-                    ok "Service restarted."
+                    echo "OK"
+                    ok "Service restarted successfully."
                 else
-                    warn "Service did not start — check: logread | grep podkop-bot"
+                    echo "UNKNOWN"
+                    warn "Service status unclear. Check: logread | grep podkop-bot"
                 fi
             else
                 info "No init.d script found. Start manually: $BOT_PATH &"
             fi
-            echo "Done."
+
+            echo ""
+            echo "Done. Logs: logread -f | grep podkop-bot"
             exit 0
             ;;
     esac
 fi
 
 # ── Download bot script ────────────────────────────────────────────────────────
-info "Downloading podkop_bot..."
+step "Downloading podkop_bot..."
 download_file "$BOT_URL" "$BOT_PATH"
 chmod +x "$BOT_PATH"
-ok "Downloaded: $BOT_PATH"
-echo ""
+INSTALLED_VER=$(grep '^BOT_VERSION=' "$BOT_PATH" 2>/dev/null | cut -d'"' -f2)
+ok "Downloaded v${INSTALLED_VER:-unknown}: $BOT_PATH"
 
 # ── Bot token ─────────────────────────────────────────────────────────────────
-echo "-------------------------------------------"
-echo "  Bot configuration"
-echo "-------------------------------------------"
-echo ""
+section "Bot configuration"
+
 printf "Telegram bot token (from @BotFather):\n> "
 read -r BOT_TOKEN
 [ -z "$BOT_TOKEN" ] && die "Bot token cannot be empty."
 
-info "Verifying token with Telegram API..."
+printf "  Verifying token... "
 TG_CHECK=$(curl -s --connect-timeout 8 \
     "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null)
 if ! echo "$TG_CHECK" | grep -q '"ok":true'; then
-    warn "Could not verify token. Check the token and internet connection."
+    echo "FAILED"
+    warn "Could not verify token (network issue or invalid token)."
     printf "Continue with this token anyway? (y/N): "
     read -r CONT
     [ "$CONT" != "y" ] && [ "$CONT" != "Y" ] && die "Installation aborted."
 else
     BOT_NAME=$(echo "$TG_CHECK" | jq -r '.result.username // "unknown"' 2>/dev/null)
-    ok "Token valid. Bot: @${BOT_NAME}"
+    echo "OK — @${BOT_NAME}"
 fi
-echo ""
 
 # ── Chat ID ───────────────────────────────────────────────────────────────────
+echo ""
 printf "Chat ID or User ID for alerts\n(private chat, group, or supergroup):\n> "
 read -r CHAT_ID
 [ -z "$CHAT_ID" ] && die "Chat ID cannot be empty."
 
-# ── Additional admin IDs (optional) ───────────────────────────────────────────
+# ── Additional admin IDs ───────────────────────────────────────────────────────
 echo ""
-printf "Additional admin User IDs, space-separated (Enter to skip):\n> "
-read -r ADMIN_IDS
+echo "Additional admin User IDs (optional)."
+echo "These users can control the bot in addition to the main chat_id."
+echo "Example: 123456789 987654321"
+printf "(Enter to skip)\n> "
+read -r ADMIN_IDS_RAW
 
-# ── Anonymous group admins (optional) ─────────────────────────────────────────
+# ── Anonymous group admins ─────────────────────────────────────────────────────
 echo ""
-printf "Allow anonymous group admins? (Y/n): "
+printf "Allow anonymous group admins to control the bot? (Y/n): "
 read -r ANON_ADMINS
 ANON_ADMINS_VAL=1
 [ "$ANON_ADMINS" = "n" ] || [ "$ANON_ADMINS" = "N" ] && ANON_ADMINS_VAL=0
 
-# ── Write UCI config ───────────────────────────────────────────────────────────
-info "Writing UCI config..."
+# ── Fallback SOCKS ────────────────────────────────────────────────────────────
+echo ""
+echo "-------------------------------------------"
+echo "  Fallback SOCKS (optional but recommended)"
+echo "-------------------------------------------"
+echo ""
+echo "If podkop/sing-box stops, the bot loses its primary SOCKS5 tunnel."
+echo "Fallback SOCKS entries (tier2) let the bot keep reaching Telegram"
+echo "via an independent proxy while the tunnel recovers."
+echo ""
+echo "Format: socks5h://HOST:PORT  (socks5h resolves DNS through proxy — recommended)"
+echo "        socks5://HOST:PORT"
+echo ""
+echo "Examples:"
+echo "  socks5h://192.168.2.10:1080   — another router on LAN running a proxy"
+echo "  socks5h://10.0.0.5:18088      — VPS or secondary tunnel"
+echo ""
+printf "Add fallback SOCKS entries? (y/N): "
+read -r ADD_FB
+FALLBACK_SOCKS_LIST=""
 
-# Ensure config file exists before uci operations (fresh system)
+if [ "$ADD_FB" = "y" ] || [ "$ADD_FB" = "Y" ]; then
+    echo ""
+    echo "Enter one entry per line. Empty line = done."
+    _fb_n=1
+    while true; do
+        printf "  Entry %d (or Enter to finish): " "$_fb_n"
+        read -r _fb_entry
+        [ -z "$_fb_entry" ] && break
+        if validate_socks_url "$_fb_entry"; then
+            FALLBACK_SOCKS_LIST="${FALLBACK_SOCKS_LIST} ${_fb_entry}"
+            ok "Added: $_fb_entry"
+            _fb_n=$((_fb_n + 1))
+        else
+            warn "Invalid format. Expected: socks5h://HOST:PORT or socks5://HOST:PORT"
+        fi
+    done
+    _fb_count=$(echo "$FALLBACK_SOCKS_LIST" | tr ' ' '\n' | grep -c '.')
+    [ "$_fb_count" -gt 0 ] && ok "$_fb_count fallback SOCKS entry(s) configured." \
+                           || info "No valid entries added. Skipping fallback SOCKS."
+fi
+
+# ── Write UCI config ───────────────────────────────────────────────────────────
+step "Writing UCI config..."
+
 [ -f "/etc/config/${UCI_PKG}" ] || touch "/etc/config/${UCI_PKG}" \
     || die "Cannot create /etc/config/${UCI_PKG} — check filesystem."
 
@@ -288,32 +442,67 @@ uci set "${UCI_PKG}.${UCI_SEC}=settings" \
 uci set "${UCI_PKG}.${UCI_SEC}.bot_token=${BOT_TOKEN}"
 uci set "${UCI_PKG}.${UCI_SEC}.chat_id=${CHAT_ID}"
 uci set "${UCI_PKG}.${UCI_SEC}.allow_anonymous_admins=${ANON_ADMINS_VAL}"
-[ -n "$ADMIN_IDS" ] && uci set "${UCI_PKG}.${UCI_SEC}.admin_ids=${ADMIN_IDS}"
 uci set "${UCI_PKG}.${UCI_SEC}.transport=auto"
 uci set "${UCI_PKG}.${UCI_SEC}.health_interval=60"
 uci set "${UCI_PKG}.${UCI_SEC}.alert_notify=1"
 uci set "${UCI_PKG}.${UCI_SEC}.startup_notify=1"
 
+# admin_ids: space-separated list → multiple uci add_list calls (safe for spaces/special chars)
+# uci set with spaces in value is unreliable — use uci list approach via config file
+if [ -n "$ADMIN_IDS_RAW" ]; then
+    for _aid in $ADMIN_IDS_RAW; do
+        # Validate: admin IDs must be numeric
+        if echo "$_aid" | grep -qE '^-?[0-9]+$'; then
+            uci add_list "${UCI_PKG}.${UCI_SEC}.admin_ids=${_aid}"
+        else
+            warn "Skipping invalid admin ID (not numeric): $_aid"
+        fi
+    done
+fi
+
+# fallback_socks: one uci add_list per entry
+if [ -n "$FALLBACK_SOCKS_LIST" ]; then
+    for _fb in $FALLBACK_SOCKS_LIST; do
+        [ -n "$_fb" ] && uci add_list "${UCI_PKG}.${UCI_SEC}.fallback_socks=${_fb}"
+    done
+fi
+
 uci commit "$UCI_PKG" || die "uci commit failed."
 ok "Config written to /etc/config/${UCI_PKG}"
+
+# Show what was written
 echo ""
+echo "  UCI config summary:"
+echo "  ┌─ bot_token  : $(uci_get bot_token | cut -c1-${TOKEN_DISPLAY_LENGTH})..."
+echo "  ├─ chat_id    : $(uci_get chat_id)"
+_aids=$(uci -q get ${UCI_PKG}.${UCI_SEC}.admin_ids 2>/dev/null || echo "(none)")
+echo "  ├─ admin_ids  : ${_aids}"
+_fbs=$(uci -q show ${UCI_PKG}.${UCI_SEC}.fallback_socks 2>/dev/null \
+    | cut -d= -f2- | tr "'" ' ' | tr '\n' ' ' || echo "(none)")
+echo "  ├─ fb_socks   : ${_fbs:-(none)}"
+echo "  └─ transport  : auto"
 
 # ── Init script / autostart ────────────────────────────────────────────────────
-echo "-------------------------------------------"
-echo "  Autostart"
-echo "-------------------------------------------"
-echo ""
+section "Autostart"
+
 printf "Set up autostart via init.d? (Y/n): "
 read -r SETUP_INIT
 
 if [ "$SETUP_INIT" != "n" ] && [ "$SETUP_INIT" != "N" ]; then
-    # Try to download init script from repo; generate locally as fallback
+    # Try to download init script from repo; validate it looks like an rc.common script
+    _init_tmp=$(mktemp /tmp/podkop_bot_init.XXXXXX)
     INIT_OK=0
-    if wget -q --spider "$INIT_URL" >/dev/null 2>&1 \
-    || curl -sf --head "$INIT_URL" >/dev/null 2>&1; then
-        download_file "$INIT_URL" "$INIT_PATH"
+    printf "  Downloading init.d script... "
+    if download_file "$INIT_URL" "$_init_tmp" 2>/dev/null && \
+       [ -s "$_init_tmp" ] && head -1 "$_init_tmp" | grep -q 'rc.common'; then
+        mv "$_init_tmp" "$INIT_PATH"
         INIT_OK=1
+        echo "OK"
+    else
+        rm -f "$_init_tmp"
+        echo "not available — generating locally"
     fi
+
     if [ "$INIT_OK" = "0" ]; then
         # Generate procd init script — compatible with OpenWrt 23.05 / 24.10 / 25.x+
         cat > "$INIT_PATH" << 'INITEOF'
@@ -332,37 +521,43 @@ start_service() {
     procd_close_instance
 }
 INITEOF
+        info "Generated minimal procd init script."
     fi
+
     chmod +x "$INIT_PATH"
     "$INIT_PATH" enable >/dev/null 2>&1
-    ok "Autostart enabled: /etc/init.d/podkop_bot"
+    ok "Autostart enabled: $INIT_PATH"
 else
-    info "Autostart skipped. Run manually: $BOT_PATH &"
+    info "Autostart skipped. Start manually: $BOT_PATH &"
 fi
-echo ""
 
 # ── Start now ─────────────────────────────────────────────────────────────────
+echo ""
 printf "Start the bot now? (Y/n): "
 read -r START_NOW
 echo ""
 
 if [ "$START_NOW" != "n" ] && [ "$START_NOW" != "N" ]; then
     if [ -f "$INIT_PATH" ]; then
+        printf "  Starting via init.d... "
         "$INIT_PATH" start >/dev/null 2>&1
         sleep 2
         if "$INIT_PATH" status >/dev/null 2>&1; then
+            echo "OK"
             ok "Bot started via init.d."
         else
-            warn "init.d status unknown — starting directly..."
+            echo "UNKNOWN — falling back to direct start"
             "$BOT_PATH" &
-            ok "Bot started (PID: $!)."
+            ok "Bot started directly (PID: $!)."
         fi
     else
         "$BOT_PATH" &
         ok "Bot started (PID: $!)."
     fi
 else
-    info "Bot not started. Run: $BOT_PATH &"
+    info "Bot not started. Run when ready:"
+    info "  /etc/init.d/podkop_bot start"
+    info "  # or: $BOT_PATH &"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -371,19 +566,20 @@ echo "==========================================="
 echo "  Installation complete!"
 echo "==========================================="
 echo ""
-echo "  Script  : $BOT_PATH"
-echo "  Config  : /etc/config/${UCI_PKG}"
-echo "  Logs    : logread | grep podkop-bot"
-echo "  Pkg mgr : ${PKG_MANAGER}"
+echo "  Bot script : $BOT_PATH"
+echo "  Config     : /etc/config/${UCI_PKG}"
+echo "  Version    : ${INSTALLED_VER:-unknown}"
+echo "  Pkg mgr    : ${PKG_MANAGER}"
 echo ""
-echo "Service commands:"
-echo "  /etc/init.d/podkop_bot start|stop|restart|status"
-echo "  logread -f | grep podkop-bot"
+echo "Useful commands:"
+echo "  logread -f | grep podkop-bot          — live logs"
+echo "  /etc/init.d/podkop_bot restart        — restart bot"
+echo "  /etc/init.d/podkop_bot status         — check status"
 echo ""
-echo "UCI config:"
+echo "Edit config:"
 echo "  uci show ${UCI_PKG}"
+echo "  uci add_list ${UCI_PKG}.${UCI_SEC}.fallback_socks='socks5h://HOST:PORT'"
 echo "  uci set ${UCI_PKG}.${UCI_SEC}.health_interval=60"
-echo "  uci set ${UCI_PKG}.${UCI_SEC}.alert_notify=0"
-echo "  uci commit ${UCI_PKG}"
+echo "  uci commit ${UCI_PKG} && /etc/init.d/podkop_bot restart"
 echo ""
 echo "GitHub: https://github.com/Medvedolog/podkop_bot"
