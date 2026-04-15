@@ -2596,8 +2596,27 @@ start_health_daemon() {
                     [ "$last_socks_state" != "up" ] && \
                         logger -t podkop-bot "[Watchdog] SOCKS ok via ${m_ip}:${m_port}"
                 else
+                    # tier1 down — check if any tier2 fallback_socks is reachable.
+                    # If so, mark socks=up so IPC "up" fires and bot uses tier2
+                    # instead of staying on Direct indefinitely.
                     curr_socks_state="down"
                     logger -t podkop-bot "[Watchdog] SOCKS FAIL via ${m_ip}:${m_port}"
+                    local _fb_raw _fb _fb_ok=0
+                    _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
+                    if [ -n "$_fb_raw" ]; then
+                        eval "set -- $_fb_raw"
+                        for _fb in "$@"; do
+                            local _fb_ip _fb_port
+                            _fb_ip=$(echo "$_fb" | sed 's|socks5h\?://||' | cut -d: -f1)
+                            _fb_port=$(echo "$_fb" | sed 's|socks5h\?://||' | cut -d: -f2)
+                            if probe_socks_upstream "$_fb_ip" "$_fb_port"; then
+                                curr_socks_state="up"
+                                _fb_ok=1
+                                logger -t podkop-bot "[Watchdog] tier1 down but fallback ${_fb} alive — marking socks=up"
+                                break
+                            fi
+                        done
+                    fi
                 fi
             fi
 
@@ -5245,8 +5264,8 @@ ${E_TIME} <b>TG Latency:</b> ${tg_lat}
 ${tr_chain}
 <code>────────────────────</code>
 <b>Overrides:</b>
-<b>Custom Proxy:</b> <code>${cp}</code>
-${cp_hint}
+<b>Custom Proxy:</b> <code>${cp}</code>${cp_hint:+
+${cp_hint}}
 <b>Bind Interface:</b> <code>${bi}</code>
 <code>────────────────────</code>
 <b>Bot Uptime:</b> ${uptime_sys}
@@ -5858,6 +5877,7 @@ logger -t podkop-bot "=== Podkop Bot v${BOT_VERSION} Starting ==="
 # full discovery but may land on tier4 (Direct) before tier1 is confirmed reachable.
 # Setting "unknown" explicitly ensures nudge fires and triggers SOCKS-first rediscovery.
 printf 'unknown' > "$MAIN_ROUTE_KEY_FILE"
+printf 'Initializing...' > "$MAIN_ROUTE_FILE"
 
 # Startup notification runs in background subprocess to not block the main loop
 send_startup_notification_async() {
