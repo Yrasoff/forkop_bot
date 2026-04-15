@@ -2692,6 +2692,17 @@ start_health_daemon() {
             if [ -z "$last_socks_state" ]; then
                 last_socks_state="$curr_socks_state"
                 logger -t podkop-bot "[Watchdog] SOCKS baseline: ${curr_socks_state} via ${m_ip}:${m_port}"
+                # If baseline is "up" but bot is already on degraded route,
+                # send IPC up immediately — no transition will fire later.
+                if [ "$curr_socks_state" = "up" ]; then
+                    _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+                    case "${_wd_cur_route:-unknown}" in
+                        tier4|tier5|fail|unknown)
+                            logger -t podkop-bot "[Watchdog] Baseline up + degraded route (${_wd_cur_route}) — nudging IPC up"
+                            printf 'up' > "$ROUTE_CMD_FILE"
+                            ;;
+                    esac
+                fi
             fi
 
             # ------------------------------------------------------------------
@@ -2749,7 +2760,9 @@ start_health_daemon() {
             # Per-cycle nudge: if SOCKS is up but bot route is degraded,
             # send IPC up so main loop rediscovers tier1 within one health interval.
             # Reads MAIN_ROUTE_KEY_FILE — written by main process, never stale.
-            if [ "$last_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
+            # Use curr_socks_state (current cycle) not last_socks_state (previous cycle)
+            # so nudge fires on the same cycle tier2 is confirmed alive.
+            if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
                 _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
                 case "${_wd_cur_route:-unknown}" in
                     tier4|tier5|fail|unknown)
