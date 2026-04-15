@@ -2768,11 +2768,15 @@ start_health_daemon() {
                 # send IPC up immediately — no transition will fire later.
                 if [ "$curr_socks_state" = "up" ]; then
                     _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+                    logger -t podkop-bot "[Watchdog] Baseline nudge check: route_key='${_wd_cur_route}' key_file=$MAIN_ROUTE_KEY_FILE"
                     case "${_wd_cur_route:-unknown}" in
                         tier4|tier5|fail|unknown)
                             logger -t podkop-bot "[Watchdog] Baseline up + degraded route (${_wd_cur_route}) — nudging IPC up"
                             printf 'up' > "$ROUTE_CMD_FILE"
                             printf '%s' "$(date +%s)" > "/tmp/podkop_bot_last_nudge"
+                            ;;
+                        *)
+                            logger -t podkop-bot "[Watchdog] Baseline up + route OK (${_wd_cur_route}) — no nudge needed"
                             ;;
                     esac
                 fi
