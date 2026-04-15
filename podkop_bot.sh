@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.85
+# Podkop Telegram Bot v0.13.86
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -14,6 +14,17 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
+# CHANGELOG v0.13.86:
+# - FIXED: Nudge case uses negative match (tier1|tier2_* = good, everything else = nudge).
+#          Previously explicit list (tier4|tier5|fail|unknown) missed stale/typo values
+#          like 'tir4' left on disk from old bot versions after killall -9 (no trap).
+#          Both baseline nudge and per-cycle nudge updated.
+# - FIXED: installer safe_stop_bot now calls cleanup_bot_runtime_files() which removes
+#          all /tmp/podkop_bot_* IPC/state files before deploying new binary.
+#          Prevents stale route keys, nudge timestamps, socks state from old versions
+#          affecting the new bot's startup behavior.
+#
+
 # CHANGELOG v0.13.85:
 # - FIXED: tier4 sticky now reprobe SOCKS tiers every 30s (mirrors tier5 mechanism).
 #          Previously bot stuck on Direct indefinitely when Telegram accessible directly
@@ -863,7 +874,7 @@ ${cp_hint}}).
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.85"
+BOT_VERSION="0.13.86"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -2768,15 +2779,16 @@ start_health_daemon() {
                 # send IPC up immediately — no transition will fire later.
                 if [ "$curr_socks_state" = "up" ]; then
                     _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
-                    logger -t podkop-bot "[Watchdog] Baseline nudge check: route_key='${_wd_cur_route}' key_file=$MAIN_ROUTE_KEY_FILE"
+                    # Nudge if route is NOT a good SOCKS tier (tier1 or tier2_N).
+                    # Use negative match to handle unknown values, typos, stale files.
                     case "${_wd_cur_route:-unknown}" in
-                        tier4|tier5|fail|unknown)
+                        tier1|tier2_*)
+                            logger -t podkop-bot "[Watchdog] Baseline up + route OK (${_wd_cur_route}) — no nudge needed"
+                            ;;
+                        *)
                             logger -t podkop-bot "[Watchdog] Baseline up + degraded route (${_wd_cur_route}) — nudging IPC up"
                             printf 'up' > "$ROUTE_CMD_FILE"
                             printf '%s' "$(date +%s)" > "/tmp/podkop_bot_last_nudge"
-                            ;;
-                        *)
-                            logger -t podkop-bot "[Watchdog] Baseline up + route OK (${_wd_cur_route}) — no nudge needed"
                             ;;
                     esac
                 fi
@@ -2843,8 +2855,13 @@ start_health_daemon() {
             # which would cause full discovery every poll cycle (recover old=fail loop).
             if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
                 _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+                # Negative match: nudge on anything that is NOT tier1/tier2_*
+                # Handles stale files with typos/old values from previous bot versions.
                 case "${_wd_cur_route:-unknown}" in
-                    tier4|tier5|fail|unknown)
+                    tier1|tier2_*)
+                        : # good route, no nudge needed
+                        ;;
+                    *)
                         local _now_nudge _last_nudge
                         _now_nudge=$(date +%s)
                         _last_nudge=$(cat "/tmp/podkop_bot_last_nudge" 2>/dev/null || echo 0)
