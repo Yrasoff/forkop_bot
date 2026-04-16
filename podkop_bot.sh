@@ -1480,7 +1480,7 @@ _route_request() {
         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
-            logger -t podkop-bot "[Transport] recover old=fail new=${ROUTE_KEY} route=${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] recover old=${_last} new=${ROUTE_KEY} route=${ROUTE_NAME}"
             RECOVERY_MODE=0
         elif [ "$_prev_name" != "$ROUTE_NAME" ]; then
             logger -t podkop-bot "[Transport] route=${ROUTE_KEY} ok name=${ROUTE_NAME}"
@@ -1556,7 +1556,7 @@ api_poll_long() {
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             LAST_ROUTE_POLL="$ROUTE_KEY"
             [ "$_prev" = "fail" ] && \
-                logger -t podkop-bot "[Transport] recover old=fail new=${ROUTE_KEY} route=${ROUTE_NAME}"
+                logger -t podkop-bot "[Transport] recover old=${_prev} new=${ROUTE_KEY} route=${ROUTE_NAME}"
             return 0
         fi
         # SOCKS still down in recovery — fall through to full cascade
@@ -2984,6 +2984,9 @@ start_health_daemon() {
             # which would cause full discovery every poll cycle (recover old=fail loop).
             if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
                 _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+                # DEBUG: log hex bytes to catch "tir1" mystery - remove after diagnosis
+                _wd_hex=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+                logger -t podkop-bot "[Watchdog] route_key_raw='$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null)' hex=${_wd_hex} clean=${_wd_cur_route}"
                 # Negative match: nudge on anything that is NOT tier1/tier2_*
                 # Handles stale files with typos/old values from previous bot versions.
                 case "${_wd_cur_route:-unknown}" in
@@ -3477,21 +3480,59 @@ EOF
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"px_view_${p_idx}\"}]]}"
                 return
             fi
-            printf '%s\n%s\n%s\n' "wait_del_confirm" "$raw_link" "$p_idx" > "$STATE_FILE"
+            # Store link in STATE_FILE keyed by clash index so do_del_px_confirmed_N
+            # can verify it's reading the right entry even if STATE_FILE was recycled.
+            printf '%s\n%s\n' "$p_idx" "$raw_link" > "$STATE_FILE"
             p_display_name=$(html_escape "$(display_proxy_name "$p_name")")
             text=$(printf '%s <b>Confirm Delete</b>\n\nSection <code>%s</code>:\n<code>%s</code>' "$E_WARN" "$sec" "$p_display_name")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Delete\",\"callback_data\":\"do_del_confirmed\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"px_view_${p_idx}\"}]]}"
+            # Callback carries the clash index — no reliance on STATE_FILE alone
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Delete\",\"callback_data\":\"do_del_px_confirmed_${p_idx}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"px_view_${p_idx}\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
-        "do_del_confirmed")
-            local raw_link p_idx ret_page=0
+        "do_del_px_confirmed_"*)
+            local p_idx="${cmd#do_del_px_confirmed_}" raw_link state_idx ret_page=0
+            # Read link from STATE_FILE and cross-check that the stored index matches.
+            # If STATE_FILE was recycled (parallel action), re-resolve by server:port.
+            state_idx=$(sed -n '1p' "$STATE_FILE" 2>/dev/null)
             raw_link=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
-            p_idx=$(sed -n '3p' "$STATE_FILE" 2>/dev/null)
             rm -f "$STATE_FILE"
+
+            # Index mismatch or empty STATE_FILE — re-resolve the link
+            if [ -z "$raw_link" ] || [ "$state_idx" != "$p_idx" ]; then
+                local proxies selector p_name _cached_uri _srv_port _sec
+                _sec=$(get_active_section)
+                proxies=$(clash_request "/proxies"); selector=$(get_selector_tag "$proxies")
+                p_name=$(echo "$proxies" | jq -r --arg sel "$selector" --arg idx "$p_idx" \
+                    '.proxies[$sel].all[$idx|tonumber] // empty')
+                _cached_uri=$(get_uri_by_tag "$p_name")
+                if [ -n "$_cached_uri" ] && [ "$_cached_uri" != "N/A" ]; then
+                    _srv_port=$(extract_server_port_from_uri "$_cached_uri")
+                    if [ -n "$_srv_port" ] && [ "$_srv_port" != "N/A" ]; then
+                        [ -f "$UCI_LINKS_CACHE" ] || build_uci_links_cache
+                        raw_link=$(grep -m1 \
+                            "@${_srv_port}[/?#]\|@${_srv_port}$\|://${_srv_port}[/?#]\|://${_srv_port}$" \
+                            "$UCI_LINKS_CACHE" 2>/dev/null)
+                        if [ -z "$raw_link" ]; then
+                            local _raw_uci
+                            _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                            if [ -n "$_raw_uci" ]; then
+                                eval "set -- $_raw_uci"
+                                for _link in "$@"; do
+                                    case "$_link" in
+                                        *"@${_srv_port}"*|*"://${_srv_port}"*)
+                                            raw_link="$_link"; break ;;
+                                    esac
+                                done
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+
             if [ -z "$raw_link" ]; then
-                send_or_edit "$mid" "$(printf '%s <b>Delete failed!</b>\nState expired.' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"proxy_menu\"}]]}"
+                send_or_edit "$mid" "$(printf '%s <b>Delete failed!</b>\nCould not resolve link. Try Reload Podkop.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
                 return
             fi
             [ -n "$p_idx" ] && ret_page=$(( p_idx / per_page ))
@@ -6069,7 +6110,7 @@ handle_command() {
             rm -f "$STATE_FILE"; _handle_bot "main_menu" "$mid" "" ""; return
         fi
         case "$state" in
-            wait_proxy_link|wait_del_confirm)
+            wait_proxy_link)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_url_link)
                 _handle_url_links "STATE_INPUT" "$mid" "$cmd" "$state" ;;
@@ -6095,7 +6136,7 @@ handle_command() {
         "delete_msg")     delete_message "$mid" ;;
 
         proxy_menu|proxy_menu_p_*|px_view_*|do_px_*|do_del_px_*|test_px_*|\
-        cmd_proxy_add|ask_del_px_*|cmd_all_delay_test)
+        cmd_proxy_add|ask_del_px_*|do_del_px_confirmed_*|cmd_all_delay_test)
             _handle_proxy "$cmd" "$mid" "" "" ;;
 
         url_links_menu|url_links_p_*|\
