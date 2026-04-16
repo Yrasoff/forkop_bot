@@ -2929,7 +2929,7 @@ EOF
             case "$target_mode" in
                 urltest)
                     local _utl_count
-                    _utl_count=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -c "urltest_proxy_links=")
+                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { eval "set -- $_utl_raw"; _utl_count=$#; }
                     if [ "${_utl_count:-0}" -eq 0 ]; then
                         warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
                     else
@@ -2945,8 +2945,10 @@ EOF
             local _kb_extra=""
             if [ "$target_mode" = "urltest" ]; then
                 local _utl_c _sel_c
-                _utl_c=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -c "urltest_proxy_links=")
-                _sel_c=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | grep -c "selector_proxy_links=")
+                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { eval "set -- $_utl_raw2"; _utl_c=$#; }
+                # Use Clash API count — captures ALL proxies, not just those added via bot
+                _sel_c=$(clash_request "/proxies" 2>/dev/null | \
+                    jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
                 if [ "${_utl_c:-0}" -eq 0 ] && [ "${_sel_c:-0}" -gt 0 ]; then
                     _kb_extra="[{\"text\":\"${E_RST} Clone ${_sel_c} links from Selector first\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
                 fi
@@ -3134,11 +3136,19 @@ _handle_section_extras() {
             ut_url=$(uci -q get podkop.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
             ut_interval=$(uci -q get podkop.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
             ut_tol=$(uci -q get podkop.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
-            ut_links_count=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -c "urltest_proxy_links=")
-            sel_links_count=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | grep -c "selector_proxy_links=")
+            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { eval "set -- $_utl_lraw"; ut_links_count=$#; }
+            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { eval "set -- $_sel_lraw"; sel_links_count=$#; }
             local _clone_btn=""
-            [ "${sel_links_count:-0}" -gt 0 ] && \
+            if [ "${sel_links_count:-0}" -gt 0 ]; then
                 _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+            else
+                # Fallback: check Clash API for proxy count even if UCI is empty
+                local _clash_count
+                _clash_count=$(clash_request "/proxies" 2>/dev/null | \
+                    jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
+                [ "${_clash_count:-0}" -gt 0 ] && \
+                    _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${_clash_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+            fi
             local _links_hint=""
             [ "${ut_links_count:-0}" -eq 0 ] && \
                 _links_hint="\n${E_ERR} <b>Empty — podkop will abort in URLTest mode!</b>"
@@ -3310,35 +3320,71 @@ EOF
             ;;
 
         "cmd_clone_sel_to_utl")
-            # Clone all selector_proxy_links into urltest_proxy_links.
-            # Appends to existing urltest links (does not overwrite).
-            local _sel_raw _added=0 _skipped=0 _link _existing_utl
-            _sel_raw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
-            if [ -z "$_sel_raw" ]; then
-                send_or_edit "$mid" "$(printf '%s Selector Proxy Links is empty — nothing to clone.' "$E_ERR")" \
+            # Clone all outbound proxies from Clash API into urltest_proxy_links.
+            # Uses Clash API as source (not just UCI selector_proxy_links) so it
+            # captures ALL proxies including those added outside the bot.
+            # Matches each proxy's server:port back to its full original UCI link.
+            local _added=0 _skipped=0 _not_found=0
+            local proxies selector proxy_name proxy_names_file
+
+            proxies=$(clash_request "/proxies")
+            selector=$(get_selector_tag "$proxies")
+            if [ -z "$proxies" ] || [ "$proxies" = "null" ] || [ -z "$selector" ]; then
+                send_or_edit "$mid" "$(printf '%s Clash API unavailable — cannot read proxy list.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
                 return
             fi
-            eval "set -- $_sel_raw"
-            for _link in "$@"; do
-                [ -z "$_link" ] && continue
-                # Skip duplicates
-                _existing_utl=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null)
-                if printf '%s' "$_existing_utl" | grep -qF "'${_link}'"; then
+
+            proxy_names_file=$(mktemp /tmp/podkop_clone.XXXXXX 2>/dev/null) || return
+            echo "$proxies" | jq -r --arg sel "$selector" '.proxies[$sel].all[]?' 2>/dev/null > "$proxy_names_file"
+
+            [ -f "$UCI_LINKS_CACHE" ] || build_uci_links_cache
+
+            while IFS= read -r proxy_name; do
+                [ -z "$proxy_name" ] && continue
+                # Get server:port from TAG_URI_CACHE
+                local _cached_uri _srv_port _full_link
+                _cached_uri=$(get_uri_by_tag "$proxy_name")
+                [ -z "$_cached_uri" ] && { _not_found=$((_not_found + 1)); continue; }
+                _srv_port=$(extract_server_port_from_uri "$_cached_uri")
+                [ -z "$_srv_port" ] || [ "$_srv_port" = "N/A" ] && { _not_found=$((_not_found + 1)); continue; }
+                # Find full original link in UCI_LINKS_CACHE
+                _full_link=$(grep -m1 \
+                    "@${_srv_port}[/?#]\|@${_srv_port}$\|://${_srv_port}[/?#]\|://${_srv_port}$" \
+                    "$UCI_LINKS_CACHE" 2>/dev/null)
+                if [ -z "$_full_link" ]; then
+                    # Fallback: try live uci show
+                    local _raw_uci
+                    _raw_uci=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                    if [ -n "$_raw_uci" ]; then
+                        eval "set -- $_raw_uci"
+                        for _l in "$@"; do
+                            case "$_l" in *"@${_srv_port}"*|*"://${_srv_port}"*)
+                                _full_link="$_l"; break ;;
+                            esac
+                        done
+                    fi
+                fi
+                if [ -z "$_full_link" ]; then
+                    _not_found=$((_not_found + 1)); continue
+                fi
+                # Skip duplicates already in urltest_proxy_links
+                if uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -qF "'${_full_link}'"; then
                     _skipped=$((_skipped + 1))
                 else
-                    uci add_list podkop.${sec}.urltest_proxy_links="$_link"
+                    uci add_list podkop.${sec}.urltest_proxy_links="$_full_link"
                     _added=$((_added + 1))
                 fi
-            done
+            done < "$proxy_names_file"
+            rm -f "$proxy_names_file"
+
             uci_commit_safe podkop
             build_tag_name_cache
+
             local _result
-            if [ "$_skipped" -gt 0 ]; then
-                _result=$(printf '%s <b>Cloned %s link(s)</b> from Selector.\n<i>%s duplicate(s) skipped.</i>' "$E_OK" "$_added" "$_skipped")
-            else
-                _result=$(printf '%s <b>Cloned %s link(s)</b> from Selector.' "$E_OK" "$_added")
-            fi
+            _result=$(printf '%s <b>Cloned %s link(s)</b> from Selector.' "$E_OK" "$_added")
+            [ "$_skipped" -gt 0 ] && _result=$(printf '%s\n<i>%s duplicate(s) skipped.</i>' "$_result" "$_skipped")
+            [ "$_not_found" -gt 0 ] && _result=$(printf '%s\n<i>%s proxy/proxies not in UCI (added outside bot) — skipped.</i>' "$_result" "$_not_found")
             send_or_edit "$mid" "$_result" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_GLOB} View URLTest Links\",\"callback_data\":\"urltest_links_menu\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
