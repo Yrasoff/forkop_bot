@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.88
+# Podkop Telegram Bot v0.13.89
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -13,6 +13,29 @@
 # 4. Sub-Function Routing: _handle_proxy / _handle_settings / _handle_lists /
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
+#
+# CHANGELOG v0.13.89:
+# - FIXED: Proxy delete (ask_del_px_*) never worked when UCI_LINKS_CACHE lookup
+#          failed. Fallback path used get_uri_by_tag() which returns a TRUNCATED
+#          URI (uuid@host:port only, no query params / flow / security fields).
+#          uci del_list requires an EXACT string match — truncated URI never
+#          matched the full original link in selector_proxy_links → silent no-op.
+#          New fallback: extract server:port from cached URI, then scan
+#          UCI_LINKS_CACHE and selector_proxy_links directly for the full
+#          original link containing that server:port. Falls back through
+#          3 levels: (1) tag index → cache, (2) server:port grep in cache file,
+#          (3) server:port scan of live uci show output.
+# - FIXED: Test All (cmd_all_delay_test) replaced the proxy card with a loading
+#          message, causing visual jump: card disappears, then reappears.
+#          Now sends a SEPARATE status message below the card (sendMessage, not
+#          edit), deletes it when done, then refreshes the card inline via
+#          proxy_menu_p_${page}. Card stays visible throughout.
+#          Also: page variable now passed to refresh so pagination is preserved.
+#          Also: mktemp failure now handled cleanly (delete status + return).
+# - FIXED: Refresh button (proxy_menu_p_N): clash_request could return empty on
+#          slow sing-box response, immediately showing "Clash API Unavailable"
+#          error. Added one automatic retry with 2s delay. Error message updated
+#          with hint "sing-box may be restarting" and a Retry button.
 #
 # CHANGELOG v0.13.88:
 # - FIXED: clash_request() missing --max-time on all curl calls. connect-timeout 3
@@ -927,7 +950,7 @@ ${cp_hint}}).
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.88"
+BOT_VERSION="0.13.89"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -2350,7 +2373,10 @@ display_proxy_name_with_tag() {
 
 extract_server_port_from_uri() {
     local clean="${1%%#*}" sp
-    sp=$(printf '%s\n' "$clean" | sed -nE 's|^[^:]+://[^@]*@([^/?]+).*|\1|p')
+    # Handles both formats:
+    #   with auth:    scheme://user[:pass]@host:port  (vless, hy2, trojan, tuic, ss+auth)
+    #   without auth: scheme://host:port              (ss no-auth as stored in TAG_URI_CACHE)
+    sp=$(printf '%s\n' "$clean" | sed -nE 's|^[^:]+://([^@/?]+@)?([^/?#]+).*|\2|p')
     [ -n "$sp" ] && printf '%s' "$sp" || printf 'N/A'
 }
 
@@ -3075,9 +3101,14 @@ _handle_proxy() {
             [ "$cmd" != "proxy_menu" ] && page="${cmd#proxy_menu_p_}"
 
             proxies=$(clash_request "/proxies")
+            # Clash API can be slow on busy routers — retry once before giving up
             if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
-                send_or_edit "$mid" "$(printf '%s <b>Clash API Unavailable</b>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                sleep 2
+                proxies=$(clash_request "/proxies")
+            fi
+            if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Clash API Unavailable</b>\n<i>sing-box may be restarting. Try Refresh in a moment.</i>' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Retry\",\"callback_data\":\"proxy_menu\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -3233,11 +3264,23 @@ EOF
 
         "cmd_all_delay_test")
             # FIXED: collect explicit PIDs, wait only on those (not on HEALTH_PID)
-            local names_file pids="" pid p name_url batch=0
-            send_or_edit "$mid" "$(printf '%s Testing all proxy delays...' "$E_TIME")" ""
+            # UX FIX: send a separate status message below the card (don't replace it),
+            # then delete the status message and refresh the card inline when done.
+            local names_file pids="" pid p name_url batch=0 status_resp status_mid
+            # Send a NEW message below (not edit) so the card stays visible
+            local _status_payload
+            _status_payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" \
+                --arg txt "$(printf '%s <b>Testing all proxies...</b>' "$E_TIME")" \
+                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+            status_resp=$(api_request_fast "sendMessage" "$_status_payload")
+            status_mid=$(printf '%s' "$status_resp" | jq -r '.result.message_id // empty' 2>/dev/null)
+
             proxies=$(clash_request "/proxies")
             selector=$(get_selector_tag "$proxies")
-            names_file=$(mktemp /tmp/podkop_delay_test.XXXXXX)
+            names_file=$(mktemp /tmp/podkop_delay_test.XXXXXX 2>/dev/null) || {
+                [ -n "$status_mid" ] && delete_message "$status_mid"
+                return
+            }
             echo "$proxies" | jq -r --arg sel "$selector" '.proxies[$sel].all[]?' 2>/dev/null > "$names_file"
 
             while IFS= read -r name; do
@@ -3254,7 +3297,9 @@ EOF
             for p in $pids; do wait "$p" 2>/dev/null; done
 
             sleep 1; rm -f "$names_file"
-            _handle_proxy "proxy_menu" "$mid" "" ""
+            # Delete the status message, then refresh the card inline
+            [ -n "$status_mid" ] && delete_message "$status_mid"
+            _handle_proxy "proxy_menu_p_${page}" "$mid" "" ""
             ;;
 
         "px_view_"*)
@@ -3372,10 +3417,50 @@ EOF
             p_name=$(echo "$proxies" | jq -r --arg sel "$selector" --arg idx "$p_idx" \
                 '.proxies[$sel].all[$idx|tonumber] // empty')
             tag_idx=$(get_proxy_index_by_tag "$p_name")
+
+            # Step 1: try direct index lookup in UCI_LINKS_CACHE (most reliable)
             [ -n "$tag_idx" ] && raw_link=$(get_selector_link_by_index "$tag_idx")
-            [ -z "$raw_link" ] && raw_link=$(get_uri_by_tag "$p_name")
+
+            # Step 2: if cache lookup failed, find by server:port match in selector_proxy_links.
+            # TAG_URI_CACHE builds a truncated URI (uuid@host:port only, no query params/flow).
+            # uci del_list requires an EXACT match — truncated URI never matches.
+            # Instead: extract server:port from the cached URI and find the full original link.
             if [ -z "$raw_link" ]; then
-                send_or_edit "$mid" "$(printf '%s Cannot resolve link for deletion.' "$E_ERR")" \
+                local _cached_uri _srv_port _sec
+                _sec=$(get_active_section)
+                _cached_uri=$(get_uri_by_tag "$p_name")
+                if [ -n "$_cached_uri" ]; then
+                    _srv_port=$(extract_server_port_from_uri "$_cached_uri")
+                    if [ -n "$_srv_port" ] && [ "$_srv_port" != "N/A" ]; then
+                        # Rebuild cache if missing, then search for the full link by server:port.
+                        # Patterns cover:
+                        #   @host:port   — vless, hy2, trojan, tuic, ss+auth
+                        #   ://host:port — ss no-auth (stored without @ in TAG_URI_CACHE)
+                        [ -f "$UCI_LINKS_CACHE" ] || build_uci_links_cache
+                        raw_link=$(grep -m1 \
+                            "@${_srv_port}[/?#]\|@${_srv_port}$\|://${_srv_port}[/?#]\|://${_srv_port}$" \
+                            "$UCI_LINKS_CACHE" 2>/dev/null)
+                        # Also search selector_proxy_links directly if cache still missed
+                        if [ -z "$raw_link" ]; then
+                            local _raw_uci
+                            _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                            if [ -n "$_raw_uci" ]; then
+                                eval "set -- $_raw_uci"
+                                for _link in "$@"; do
+                                    case "$_link" in
+                                        *"@${_srv_port}"*|*"@${_srv_port}/"*|*"@${_srv_port}#"*|\
+                                        *"://${_srv_port}"*|*"://${_srv_port}/"*|*"://${_srv_port}#"*)
+                                            raw_link="$_link"; break ;;
+                                    esac
+                                done
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+
+            if [ -z "$raw_link" ]; then
+                send_or_edit "$mid" "$(printf '%s Cannot resolve link for deletion.\n<i>Try reloading podkop to rebuild caches.</i>' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
                 return
             fi
