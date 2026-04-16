@@ -14,963 +14,6 @@
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
-# CHANGELOG v0.13.90:
-# - FIXED: ROOT CAUSE of "tir1" watchdog false-positive nudge loop — diagnosed
-#          via [RouteWrite] + hex dump debug logs added in v0.13.89.
-#          Log showed: route_key_raw='tier1' hex= clean=tir1
-#          Root cause: BusyBox tr on MIPS (AX6000 / MT7986) incorrectly treats
-#          'e' (0x65) as a member of [:space:] character class. This is a known
-#          BusyBox platform bug with POSIX character classes in certain builds.
-#          Effect: tr -d '[:space:]' on "tier1" produced "tir1" (dropped 'e'),
-#          which did not match the case pattern tier1|tier2_* → watchdog fired
-#          IPC nudge every 120s indefinitely, causing continuous RECOVERY_MODE=2
-#          cycles, extra transport resets, and "recover old=unknown" log spam.
-#          Fix: replaced ALL tr -d '[:space:]' with tr -d '\n\r\t ' (explicit
-#          whitespace chars only). Affects 2 watchdog reads + 5 user input
-#          validators + 2 IP fetch cleaners. sed 's/[[:space:]]//g' uses sed's
-#          own regex engine (unaffected) and was left unchanged.
-# - REMOVED: [RouteWrite] debug logger from _write_main_route (was added in
-#          v0.13.89 for diagnosis, now spammed every API call — removed).
-# - REMOVED: [Watchdog] route_key_raw/hex debug logger (same, now resolved).
-#
-# CHANGELOG v0.13.89:
-# - FIXED: Proxy delete (ask_del_px_*) — root cause identified and fixed.
-#          get_selector_link_by_index(tag_idx) assumed "main-N-out" tag == UCI
-#          list position N-1. This is false: after any add/remove the tag
-#          numbering in sing-box config.json diverges from UCI list order.
-#          Wrong index → wrong link → uci del_list silently deleted a DIFFERENT
-#          proxy or nothing. Tag index step removed entirely.
-#          New approach: always match by server:port from TAG_URI_CACHE
-#          (order-independent, unique per outbound). Two fallback levels:
-#          (1) grep in UCI_LINKS_CACHE, (2) live uci show scan.
-#          Covers all protocol types: vless, hy2, trojan, tuic, ss+auth,
-#          ss-no-auth (no @ in URI). Error message now returns to px_view_N
-#          instead of proxy_menu.
-# - FIXED: extract_server_port_from_uri() failed on ss no-auth format
-#          "ss://host:port" (no @ present). Old regex required @ in URI.
-#          New regex handles both: with-auth scheme://user@host:port and
-#          no-auth scheme://host:port. Affects all server:port matching.
-# - FIXED: test_px_ (Test button in proxy card) replaced the card with
-#          a loading message, causing visual jump: card disappears → reappears.
-#          Now sends a separate status message below the card, keeps card
-#          visible throughout, deletes status message when done.
-# - FIXED: cmd_all_delay_test same jump issue — already fixed in this version,
-#          now also preserves current page number in refresh call.
-# - FIXED: Refresh button (proxy_menu_p_N) appeared frozen for ~10s with no
-#          feedback. Now shows inline loading indicator immediately by editing
-#          the card to "Refreshing..." before the clash_request call.
-#          Also: retry logic on empty response + better error message with
-#          Retry button.
-#
-# CHANGELOG v0.13.88:
-# - FIXED: clash_request() missing --max-time on all curl calls. connect-timeout 3
-#          only covers TCP handshake; if Clash API accepts connection but hangs
-#          on response (sing-box under OOM/high load), watchdog Check D blocked
-#          the entire health cycle indefinitely. Added --max-time 10 to all
-#          4 curl invocations (GET+auth, GET, PUT+auth, PUT).
-# - FIXED: Watchdog probe zombie accumulation at long uptime (30d+).
-#          probe_all_socks_write runs as background & every PROBE_EVERY cycles
-#          (~every 5 min). In BusyBox ash, background subshells stay as zombies
-#          until parent calls wait(). Over a month: ~8640 zombies × (3 curl +
-#          1 ash subshell). Fixed: track _last_probe_pid, call
-#          wait "$_last_probe_pid" before launching the next probe.
-# - FIXED: refresh_public_ip_cache() temp file leaks under RAM pressure.
-#          (a) mktemp for f1/f2/f3 was unchecked — if any failed, lockdir
-#              leaked and curl subshells forked into /dev/null. Now each
-#              mktemp is checked with explicit rollback (rm previous + rm lockdir).
-#          (b) Final mktemp for atomic write also unchecked — same lockdir leak.
-#          (c) mv "$tmp" "$PUBIP_CACHE" could fail (full tmpfs) leaving $tmp
-#              orphaned. Now: mv || { rm -f "$tmp"; ... }.
-# - FIXED: probe_all_socks_write() unchecked mv — temp file leaked if tmpfs
-#          full. Now: mv || rm -f "$_probe_tmp".
-# - FIXED: tier4/tier5 reprobe compound condition bug. Pattern
-#          `_try_socks_tiers || { [...] && _try_curl && ROUTE_KEY=tier3 && ... }`
-#          is ambiguous in some BusyBox ash versions: the && chain inside {...}
-#          after || can fail to assign ROUTE_KEY/ROUTE_NAME before the outer if
-#          tests the result. Replaced with explicit if/elif/else + `[ -n "$ROUTE_KEY" ]`
-#          guard — unambiguous in all POSIX ash implementations.
-# - FIXED: trap missing glob cleanup for orphaned temp files. Added:
-#          /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.*
-#          /tmp/podkop_ip[123].* /tmp/podkop_pubip.*
-#          These files are created mid-cycle and not cleaned if bot receives
-#          SIGKILL (which bypasses trap).
-# - NEW:   Startup stale temp file cleanup: find+stat sweep of /tmp for
-#          all podkop_* temp file patterns older than 60s. Runs once after
-#          singleton guard. Removes orphans from previous SIGKILL'd runs
-#          without racing against a legitimate concurrent process.
-#
-# CHANGELOG v0.13.87:
-# - UX:    Core Settings keyboard redesigned — 2-column layout grouped by theme:
-#          Row 1: Conn type + Proxy mode         (core routing behaviour)
-#          Row 2: Mixed Proxy toggle + Port       (same entity, same row)
-#          Row 3: Outbound iface + DNS            (network routing config)
-#          Row 4: URLTest + Domain Resolver       (per-section extras)
-#          Row 5: YACD + Autostart               (system-level)
-#          Row 6: Disable QUIC + Update interval  (global flags)
-#          Row 7: DL via Proxy + Excl. NTP        (global flags)
-#          Row 8: Bad WAN toggle + Bad WAN Details (same entity, same row)
-#          Row 9: Log level + Back
-#          Card body trimmed: separators instead of verbose multi-line hints,
-#          all state visible at a glance in one compact block.
-#          outbound_iface now read into local var at top of handler (was a
-#          mid-keyboard inline local — inconsistent with other vars).
-#
-# CHANGELOG v0.13.86:
-# - FIXED: Nudge case uses negative match (tier1|tier2_* = good, everything else = nudge).
-#          Previously explicit list (tier4|tier5|fail|unknown) missed stale/typo values
-#          like 'tir4' left on disk from old bot versions after killall -9 (no trap).
-#          Both baseline nudge and per-cycle nudge updated.
-# - FIXED: installer safe_stop_bot now calls cleanup_bot_runtime_files() which removes
-#          all /tmp/podkop_bot_* IPC/state files before deploying new binary.
-#          Prevents stale route keys, nudge timestamps, socks state from old versions
-#          affecting the new bot's startup behavior.
-#
-
-# CHANGELOG v0.13.85:
-# - FIXED: tier4 sticky now reprobe SOCKS tiers every 30s (mirrors tier5 mechanism).
-#          Previously bot stuck on Direct indefinitely when Telegram accessible directly
-#          (TG direct: ok) — sticky tier4 never failed so full discovery never ran.
-#          Now shares SOCKS_REPROBE_TS_FILE with tier5 for unified reprobe cadence.
-# - FIXED: Nudge throttled to 120s (was every ~30s watchdog cycle). Continuous nudge
-#          caused IPC "up" to reset LAST_ROUTE_FAST=unknown on every cycle, triggering
-#          full discovery → recover old=fail new=tier4 loop. Bot could never stabilize.
-# - FIXED: Per-cycle nudge now uses curr_socks_state (current cycle) instead of
-#          last_socks_state (previous cycle). Nudge now fires on same cycle tier2
-#          is confirmed alive instead of one cycle later.
-# - FIXED: Watchdog baseline sends IPC "up" immediately if SOCKS is up but bot route
-#          is degraded (tier4/tier5/unknown) on first cycle. Previously baseline set
-#          last_socks_state=up → no down→up transition ever fired → no IPC up from
-#          RECOVERED handler → bot stuck on Direct indefinitely after cold start.
-# - FIXED: Check C (SOCKS probe) now also probes all fallback_socks (tier2_N) when
-#          tier1 is down. If any tier2 alive → curr_socks_state=up → nudge fires →
-#          bot rediscovers tier2 instead of staying on Direct.
-# - FIXED: api_request_fast no longer zeros RECOVERY_MODE on success — decrements
-#          instead. Zeroing caused next api_poll_long to skip SOCKS-first path and
-#          land on Direct if tier1 was slow to respond post-recovery.
-# - FIXED: IPC "up" sets RECOVERY_MODE=2 (was 0). RECOVERY_MODE=0 caused
-#          _try_all_tiers to miss tier1 on tight connect-timeout and fall through
-#          to Direct. With =2, next 2 poll cycles probe SOCKS aggressively.
-# - FIXED: Pre-initialize MAIN_ROUTE_KEY_FILE="unknown" and MAIN_ROUTE_FILE=
-#          "Initializing..." at startup before watchdog fork. Without this watchdog
-#          read empty file → sent nudge → IPC up reset FAST/POLL → bot landed on
-#          Direct before tier1 confirmed reachable.
-# - FIXED: Self-update and do_restart_bot: added killall -9 podkop_bot after
-#          init.d restart (sync ubus call) to clean up zombie watchdog subshells.
-#          init.d restart is now synchronous (no &) so procd queues restart before
-#          killall fires.
-# - FIXED: cmd_status health_st now reads SOCKS_STATE_FILE with icons instead of
-#          raw HEALTH_STATE_FILE keys (was showing "tg_direct=ok
-tg_transport=ok").
-# - FIXED: Bot Settings cp_hint blank line — empty cp_hint no longer leaves blank
-#          line between Custom Proxy and Bind Interface (${cp_hint:+
-${cp_hint}}).
-# - NEW:   Restart Bot button in Info (ask_restart_bot / do_restart_bot).
-# - NEW:   Restart Router button in Info with double confirmation:
-#          step 1: button press (ask_restart_router_1)
-#          step 2: type YES in chat (wait_restart_router_confirm state)
-#          Any other input cancels with echo of what was typed.
-# - UX:    Menu button added to all remaining deep screens: cmd_status, cmd_runtime,
-#          cmd_tunnel_health, fallback_socks_menu, urltest_settings,
-#          domain_resolver_settings, badwan_details, cmd_runtime Back row.
-# - UX:    installer: update flow now shows full summary (version, path, useful
-#          commands) instead of bare "Done." line followed by exit 0.
-# - UX:    installer: vv0.7.14-r1 → v0.7.14-r1 (opkg returns version with leading
-#          v, installer added another one via "v${PODKOP_VER}").
-#
-
-# CHANGELOG v0.13.80:
-# - FIXED: Watchdog summary log showed "route=Initializing..." permanently because
-#          LAST_ROUTE_NAME is a fork-time copy of the parent variable (always stays
-#          "Initializing..." in the watchdog subshell). Now reads from MAIN_ROUTE_FILE
-#          which is written by the main process on every successful tier resolution.
-# - COSMETIC: Removed duplicate singleton guard comment ("by scriptname" line
-#             left over from v0.13.78 rename, sat above the correct "by BOT_PATH
-#             pattern" comment). No behavior change.
-#
-
-# CHANGELOG v0.13.79:
-# - UX:    Bot Settings card redesigned into 4 visual blocks with separators:
-#          [1] Transport Policy + Active Route + TG Latency
-#          [2] Fallback Chain (active tier bold ◀ active)
-#          [3] Overrides: Custom Proxy + cp_hint + Bind Interface
-#          [4] Uptime + Started / Last Command / Unauthorized Attempts
-#          Keyboard restructured into 3 semantic rows:
-#          Row 1: Transport | Health Interval
-#          Row 2: Fallback SOCKS
-#          Row 3: Custom Proxy | Bind Iface
-#          Row 4: Startup Notify | Alert Notify
-#          Row 5: Menu
-#          st/al icons pre-computed into variables (no inline $() in kb string).
-# - UX:    cmd_files (Configs & Logs) now has Menu button alongside Back.
-# - FIX:   Singleton guard comment updated: "by scriptname" → "by BOT_PATH pattern".
-#
-
-# CHANGELOG v0.13.78:
-# - FIXED: Broken reply_markup JSON in Diagnostics (cmd_diagnostics, ask_upstream_health,
-#          ask_run_podkop_tests, ask_run_internal_diag, ask_support_bundle) and
-#          Bot self-update (cmd_check_update_bot, ask_update_bot_*, do_update_bot_*
-#          error branches). Unescaped {"inline_keyboard":...} as literal shell arg
-#          caused Telegram to reject all requests silently (no keyboard rendered).
-#          Fixed by using kb="{\"inline_keyboard\":...}" variable pattern throughout.
-# - FIXED: Self-update wget without timeout replaced with curl --connect-timeout 5
-#          --max-time 8/15. wget -qO- on OpenWrt hangs indefinitely without -T flag.
-# - FIXED: Singleton guard: pgrep -f "podkop_bot" → pgrep -f "$BOT_PATH" to avoid
-#          matching unrelated processes. Less greedy, more precise.
-# - UX:    Menu button added to all Diagnostics screens (hub + 4 ask_* confirms)
-#          and Bot self-update screens (check, ask, error branches).
-# - UX:    cp_hint spacing: explicit newline between cp_hint and Bind Interface line
-#          prevents visual merge when hint is non-empty.
-#
-
-# CHANGELOG v0.13.77:
-# - FIXED: Source of truth for route key in watchdog — architectural cleanup.
-#   Root cause: MAIN_ROUTE_FILE holds human-readable names ("Podkop (SOCKS5:...)"),
-#   not tier keys. grep -oE 'tier[0-9_]+' on it always returned empty.
-#   SOCKS_STATE_FILE.route= was written by watchdog from stale subshell LAST_ROUTE.
-#   Both fallbacks in per-cycle nudge therefore read wrong/stale data.
-#
-#   Fix: new MAIN_ROUTE_KEY_FILE (/tmp/podkop_bot_main_route_key) written by
-#   main process at every successful tier resolution via _write_main_route() helper.
-#   _write_main_route(key, name) atomically updates both KEY and NAME files.
-#   All tier resolution points updated: tier1..tier5 sticky + full discovery +
-#   tier5 reprobe + api_request_fast recovery path.
-#
-#   Per-cycle nudge now reads MAIN_ROUTE_KEY_FILE directly — no grep heuristics,
-#   no stale var, no fallback chain needed.
-#
-#   _write_socks_state() drops route= and route_name= fields (were stale subshell
-#   copies). SOCKS_STATE_FILE now contains: tg, tg_direct, tg_transport, socks,
-#   last_ok only. Tunnel Health and rt_socks_state reads unaffected (use socks= key).
-#
-#   MAIN_ROUTE_KEY_FILE added to trap cleanup.
-#
-
-# CHANGELOG v0.13.76:
-# - FIXED: BOT_PATH not declared — self-update mv/exec expanded to empty string.
-#          Added: BOT_PATH=$(readlink -f "$0" || echo "/usr/bin/podkop_bot")
-#          near BOT_VERSION. readlink -f resolves symlinks at runtime, fallback
-#          matches installer default path.
-# - FIXED: Per-cycle watchdog nudge read stale LAST_ROUTE from subshell scope
-#          (fork-time copy, never updated). Now reads from MAIN_ROUTE_FILE
-#          (written by main process on every successful tier resolution) with
-#          fallback to route= key in SOCKS_STATE_FILE. Both are file-based IPC,
-#          same pattern as ROUTE_CMD_FILE already used for watchdog→main comms.
-# - FIXED: html_escape() missing double-quote escaping. URLs in remote_domain/
-#          subnet list <a href="..."> cards could contain " and break HTML parse
-#          mode → Telegram 400. Added: -e 's/"/\&quot;/g'
-# - UX:    Tunnel Health "TG via SOCKS" renamed to "TG via Podkop (tier1)"
-#          with note "(primary mixed_proxy — not full bot transport chain)".
-#          Prevents confusion: this metric only probes tier1, not tier2_N/tier3.
-#
-
-# CHANGELOG v0.13.75:
-# - FIXED: Transport tier return logic — bot now reliably comes back to tier1
-#          after podkop/sing-box recovers. Three-part fix:
-#   1. IPC "up" now also clears SOCKS_REPROBE_TS_FILE → tier5 reprobe fires
-#      immediately on next _route_request, not after 30s timer.
-#   2. Per-cycle watchdog nudge: every health cycle, if socks=up AND sing-box
-#      running AND bot route=tier4/tier5/fail, sends IPC "up" to main loop.
-#      Replaces the previous PROBE_EVERY-only nudge (was up to ~5 min lag).
-#   3. Removed duplicate IPC "up" from PROBE_EVERY block (now per-cycle).
-# - UX:    Scope line added to all 7 watchdog alert types:
-#          TG reachable/unreachable: "Scope: bot control plane"
-#          sing-box STOPPED: "Scope: data plane DOWN + bot transport resetting"
-#          sing-box RECOVERED: "Scope: data plane restored — bot returning to tier1"
-#          Bot SOCKS DOWN: "Scope: bot control plane — podkop data routing unaffected"
-#          Bot SOCKS RECOVERED: "Scope: bot control plane — returning to tier1"
-#          Proxy switched: "Scope: outbound selection only — no service interruption"
-#          Consistent one-line clarifier: operator sees immediately what broke
-#          and whether user traffic is affected.
-#
-
-# CHANGELOG v0.13.74:
-# - FIXED: TG health semantics in Tunnel Health — split into two independent metrics.
-#   check_health() now probes TWO paths and writes TWO keys to HEALTH_STATE_FILE:
-#     tg_direct=ok|fail    — raw curl, no proxy (expected fail under RKN)
-#     tg_transport=ok|fail — curl via primary mixed_proxy SOCKS (Podkop tier1)
-#   Returns 0 (success) if either path works.
-#   _write_socks_state() reads both keys from HEALTH_STATE_FILE and forwards
-#   them to SOCKS_STATE_FILE (keeps tg= for backward compat).
-#   Watchdog: updated grep to use [ tg_direct=ok ] || [ tg_transport=ok ]
-#   instead of pattern matching on "Connected|via SOCKS" string.
-# - UX:    Tunnel Health now shows two TG lines:
-#     "TG direct: ok|fail (no proxy)"
-#     "TG via SOCKS: ok|fail (Podkop tier1)"
-#   Under RKN: direct=fail, SOCKS=ok — both visible, no false alarm.
-#   "fail" on TG direct no longer triggers confusion because label is honest.
-#
-
-# CHANGELOG v0.13.73:
-# - UX:    Runtime Info split: heavy tests moved to new Diagnostics screen.
-#          Runtime Info now shows: connections, traffic, active proxy, selector,
-#          type/delay, bot route summary. Keyboard: Tunnel Health | Diagnostics |
-#          Configs & Logs | Refresh | Back. No heavy actions on this screen.
-# - NEW:   cmd_diagnostics — dedicated hub for all active test operations:
-#          Upstream Health, Global Check, Internal Diagnostics, Support Bundle.
-#          Intro text explains these are active tests that may take 10-30 sec.
-# - NEW:   ask_* confirm screens before every heavy action:
-#          ask_upstream_health, ask_run_podkop_tests, ask_run_internal_diag,
-#          ask_support_bundle. Each shows what the action does, estimated time,
-#          and Run / Cancel buttons. Consistent with existing ask_*/do_* pattern.
-# - UX:    Back navigation from all heavy actions now returns to cmd_diagnostics
-#          instead of cmd_runtime (upstream_health, global_check, internal_diag,
-#          support_bundle).
-# - FIXED: html_escape applied to human_name in Outbound Selector list text.
-#          URI fragment user-names with <>&  could break Telegram HTML parse mode.
-# - FIXED: html_escape applied to _fb, cp, bi, m_ip in Bot Settings tr_chain.
-#          After removing <code> wrapper these values render as raw HTML.
-#
-
-# CHANGELOG v0.13.72:
-# - NEW:   Bot self-update from Telegram menu (cmd_check_update_bot).
-#          Info screen now has two update buttons: podkop and bot separately.
-#          cmd_check_update_bot: fetches version.txt from GitHub, compares
-#          with BOT_VERSION, shows diff or "up to date" with force-update option.
-#          ask_update_bot_<ver>: confirm screen before applying.
-#          do_update_bot_<ver>: downloads to /tmp/podkop_bot_update.PID,
-#          validates shebang + BOT_VERSION present, atomic mv to BOT_PATH,
-#          kills HEALTH_PID (watchdog), then init.d restart or exec fallback.
-#          Sends confirmation message BEFORE restart (last message before down).
-# - FIXED: Installer: safe_stop_bot() added — kills main PID from pid file
-#          AND runs killall -9 podkop_bot before replacing binary during update.
-#          Prevents zombie watchdog subshells that survived procd SIGKILL.
-#
-
-# CHANGELOG v0.13.71:
-# - FIXED: ZeroTier/Tailscale interface line in Status merged with CPU Load line.
-#          $() subshell strips trailing newlines from awk output, so extra_ifs
-#          lost its trailing \n. Now explicitly appended when extra_ifs non-empty.
-# - FIXED: Tunnel Health "TG reach: fail" misleading when bot works via SOCKS.
-#          check_health() now tries direct curl first, then SOCKS fallback.
-#          HEALTH_STATE_FILE writes "Connected", "via SOCKS", or "Disconnected".
-#          Watchdog grep updated to match both "Connected" and "via SOCKS".
-#          Tunnel Health label renamed "TG direct" with "(fail under RKN is normal)"
-#          hint so users understand the distinction between direct and SOCKS reach.
-#
-
-# CHANGELOG v0.13.70:
-# - FIXED: routing_excluded_ips wrote to per-section UCI (podkop.<sec>.routing_excluded_ips)
-#          but podkop reads it from podkop.settings.routing_excluded_ips (global setting).
-#          All 5 references corrected. Card header now shows [global] with note.
-# - FIXED: url_proxy_links UCI key does not exist in podkop. proxy_config_type=url
-#          uses proxy_string (multiline textarea, one URL per line).
-#          get_url_proxy_links() rewritten to read proxy_string.
-#          _handle_url_links add/delete fully rewritten: add appends line to proxy_string,
-#          delete rebuilds proxy_string without target line, empty = uci delete.
-# - NEW:   proxy_mode_menu — full 4-mode selector (url/selector/urltest/outbound).
-#          Previously Mode button only toggled selector<->urltest.
-#          Now opens a menu with all modes; active mode shown with checkmark.
-#          ask_switch_mode_ expanded with correct warning text for each mode.
-#          proxy_mode_menu added to dispatch routing.
-# - UX:    Active proxy in Outbound Selector list: bold name + E_PLAY icon.
-#          Inactive proxies show latency icon only (no active_mark clutter).
-# - UX:    Bot Settings Fallback Route chain: active tier highlighted in bold
-#          with "◀ active" marker. Removed <code> wrapper so HTML renders.
-#          Active tier determined from LAST_ROUTE_FAST variable.
-#
-
-# CHANGELOG v0.13.69:
-# - FIXED: ZeroTier interfaces (zt<hex>, e.g. zt3jnfoa3b) were not shown
-#          in Status — pattern matched "zero" but ZeroTier uses "zt" prefix.
-#          Added "zt" to the interface filter regex.
-# - UX:    Extra VPN interfaces now show human-readable labels:
-#          Tailscale, ZeroTier, AmneziaWG, WireGuard, VPN (tun*)
-#          Format: "🌐 Tailscale (tailscale0): 100.x.x.x"
-#
-
-# CHANGELOG v0.13.68:
-# - FIXED: Alert flood — root cause was two bot instances running simultaneously.
-#          procd sends SIGTERM then SIGKILL, but watchdog subshell can survive.
-#          New singleton guard at startup: reads BOT_PID_FILE, kills stale
-#          instance + its subshells, writes own PID. Prevents duplicate
-#          watchdog processes each sending independent leaf-change alerts.
-# - FIXED: "Bot route: Initializing..." persisted because MAIN_ROUTE_FILE
-#          was only written on tier resolution, but watchdog starts in parallel
-#          and fires Check D before main loop resolves first route.
-#          Fix: write MAIN_ROUTE_FILE immediately after first successful
-#          api_request_fast at startup, before watchdog is forked.
-#
-
-# CHANGELOG v0.13.67:
-# - FIXED: Proxy names with flag emojis showed as raw xNN bytes. BusyBox
-#          printf does not support xNN escapes in %b. url_decode() rewritten
-#          to use awk (hex->octal conversion) + printf octal escapes, which
-#          works correctly on all OpenWrt variants for multi-byte UTF-8.
-# - FIXED: "Bot route: Initializing..." in Proxy switched alerts. Watchdog
-#          is a subshell and cannot see parent LAST_ROUTE_NAME updates.
-#          New MAIN_ROUTE_FILE (/tmp/podkop_bot_main_route): main process
-#          writes current route name there on every successful tier resolution
-#          (all sticky + full discovery paths). Check D reads from this file.
-# - FIXED: Proxy switched alert spam during URLTest failover (every few secs).
-#          Added 60s debounce: leaf-change alert fires at most once per minute.
-#          Rapid consecutive switches (e.g. URLTest probing dead servers) are
-#          logged but only the first triggers an alert per 60s window.
-#
-
-# CHANGELOG v0.13.66:
-# - FIXED: "Proxy switched" alert showed "From: main-urltest-out" (URLTest
-#          group tag) instead of the actual leaf proxy. Root cause: at watchdog
-#          startup URLTest .now is empty, so _resolve_leaf returned the group
-#          itself as last_leaf baseline. Fix: after _resolve_leaf, check the
-#          resolved node's type — if it's still a group (Selector/URLTest/
-#          Fallback/LoadBalance), discard it and keep last_leaf unchanged.
-#          Only fully-resolved leaf proxies are stored as last_leaf.
-# - FIXED: "Bot route: Initializing..." in Proxy switched alert. Watchdog
-#          runs as a subshell and cannot see LAST_ROUTE_NAME from the parent
-#          process. Fix: _write_socks_state() now writes route_name= to
-#          SOCKS_STATE_FILE. Check D reads it via grep before sending the alert.
-#
-
-# CHANGELOG v0.13.65:
-# - NEW:   Bot Control Plane card now shows "Active Route" — the tier
-#          currently used by the bot to reach Telegram. Placed between
-#          Transport Policy and Fallback Route list so the operator
-#          immediately sees whether the bot is on tier1 (Podkop SOCKS5),
-#          tier2_N (Fallback SOCKS), tier4 (Direct), tier5 (Emergency IP)
-#          or still Initializing. No extra API calls needed — reads
-#          LAST_ROUTE_NAME which is always current.
-#
-
-# CHANGELOG v0.13.64:
-# - FIXED: Podkop version showed "Unknown" on OpenWrt 25.x (apk). All 5
-#          version detection sites now try opkg first, fall back to apk.
-#          apk package name format: "podkop-0.7.x" -> strips "podkop-" prefix.
-# - FIXED: Main menu button showed "URL Test" in urltest mode instead of
-#          "Outbounds". Now consistent: selector/urltest both show "Outbounds".
-# - FIXED: Alert "Tunnel upstream DOWN/RECOVERED" was misleading — implied
-#          the VPN tunnel for router traffic was affected. Renamed to
-#          "Bot SOCKS upstream DOWN/RECOVERED" to clarify this is the bot's
-#          own transport path to Telegram, not the podkop/sing-box tunnel.
-#
-
-# CHANGELOG v0.13.63:
-# - NEW:   URLTest mode: Auto (best ping) button in Outbound Selector.
-#          Selector .now pointing at URLTest group = auto mode (sing-box picks
-#          fastest). Selector .now pointing at a leaf proxy = manual/fixed.
-#          Card header shows "| Auto: best ping" or "| Manual: fixed" hint.
-#          Auto button: grayed with checkmark when already auto, active button
-#          when manual is fixed — one tap returns to URLTest auto selection.
-#          Handler do_px_auto_urltest: PUT /proxies/selector with URLTest group
-#          name, detected via .proxies[*].type == "URLTest".
-# - FIXED: display_proxy_name now checks TAG_NAME_CACHE (built from all UCI
-#          link lists including urltest_proxy_links) before server:port fallback.
-#          URLTest outbound names now show #fragment human names (DE Senko -11d)
-#          instead of raw sing-box tags (main-4-out).
-#
-
-# CHANGELOG v0.13.62:
-# - FIXED: URLTest outbound names showed raw sing-box tags (main-4-out,
-#          main-urltest-out) instead of human names from #fragment in URI.
-#          Root cause: TAG_URI_CACHE (from sing-box config.json) has no
-#          #fragment; UCI_LINKS_CACHE only included selector_proxy_links.
-#          Fix: new TAG_NAME_CACHE (/tmp/podkop_tag_name_cache.txt) built
-#          from ALL UCI link lists (selector + urltest + url). Matches
-#          tag by server:port from TAG_URI_CACHE, stores tag=Human Name.
-#          display_proxy_name() now checks TAG_NAME_CACHE as step 2,
-#          before falling back to [type] server:port or raw tag.
-# - FIXED: build_all_caches() now includes build_tag_name_cache().
-#          Section switch, link add/delete all trigger full cache rebuild.
-#          Lazy-init in get_selector_link_by_index unchanged (UCI only).
-#
-
-# CHANGELOG v0.13.61:
-# - FIXED: /start and text commands after clearing chat history returned no
-#          response. send_or_edit with user's message_id tried to edit user
-#          message (impossible) → silent fail. Plain text now passes empty mid
-#          so send_or_edit always sends a new bot message.
-#          Also fixes second admin /start in a fresh private chat.
-# - FIXED: Bot could stay on tier5 (Emergency IP) indefinitely even after
-#          fallback_socks recovered. tier5 sticky never probed SOCKS tiers
-#          while tier5 itself worked. Now: every 30s, tier5 sticky path
-#          tries _try_socks_tiers first. On success: switches back immediately.
-#          Timestamp tracked in SOCKS_REPROBE_TS_FILE (atomic, no watchdog dep).
-# - FIXED: Watchdog now sends IPC "up" every PROBE_EVERY cycles (default 5min)
-#          when LAST_ROUTE is tier4/tier5. Forces route reset so next request
-#          runs full discovery. Complements tier5 reprobe for tier4 case.
-#
-
-# CHANGELOG v0.13.60:
-# - FIXED: api_request_fast (button presses, sendMessage, editMessage) did not
-#          respect RECOVERY_MODE. After podkop stop, FAST route stuck on tier5
-#          sticky and never probed tier2_N even when fallback SOCKS recovered.
-#          RECOVERY_MODE was only checked in api_poll_long (getUpdates).
-#          Fix: api_request_fast now probes SOCKS tiers first when RECOVERY_MODE>0,
-#          same as api_poll_long. On success: sets LAST_ROUTE_FAST, clears
-#          RECOVERY_MODE. This ensures button presses resume via fallback SOCKS
-#          as soon as a tier2_N becomes available after tunnel restart.
-# NOTE:    In the test log, tier2_1 (192.168.2.238:18088) was genuinely down
-#          for ~2 minutes after podkop stop (xray was restarting). The bot
-#          correctly used Emergency IP during that window. Once tier2_1
-#          recovered, the bot will now switch back via this fix.
-#
-
-# CHANGELOG v0.13.59:
-# - UX:    Renamed "Proxy Selector" to "Outbounds" / "Outbound Selector"
-#          throughout UI. Aligns with sing-box native terminology.
-#          Callback names (proxy_menu, cmd_proxy_add etc.) unchanged —
-#          only user-visible labels updated. No state/UCI changes.
-#          Affected: main menu button, card title, add prompts, URLTest screen.
-#          Display of proxy names (from #fragment in URI) unchanged — already
-#          works for all protocols (vless/hy2/ss/trojan/vmess/tuic).
-#
-
-# CHANGELOG v0.13.58:
-# - FIXED: Check A comment said "via full fallback cascade" but check_health()
-#          uses direct curl, not bot transport stack. Corrected to
-#          "direct reachability" — no behavior change, semantic fix only.
-# - NEW:   Proxy switched alert adds Mode (proxy_config_type) and Bot route.
-#          e.g. "Section: main | Mode: urltest / Bot route: Podkop (SOCKS5:...)"
-# - NEW:   sing-box RECOVERED now symmetric with STOPPED:
-#          PID, Section, Proxy (last known leaf), Bot route at recovery time.
-#
-
-# CHANGELOG v0.13.57:
-# - FIXED: SOCKS alert had double clash_request call (nested get_selector_tag
-#          inside another clash_request). Replaced with last_leaf variable
-#          already populated by Check D — zero extra curl calls.
-# - FIXED: Check D (leaf tracking) runs every cycle using a single
-#          clash_request to localhost:9090 — fast, no TG API calls.
-#          Baseline set on first read, no false alarm at startup.
-#
-
-# CHANGELOG v0.13.56:
-# - NEW:   Verbose watchdog alerts — all 3 types enriched with context:
-#          SOCKS DOWN/UP: primary endpoint, active proxy, bot route,
-#            fallback tier availability from last SOCKS_PROBE_FILE.
-#          sing-box STOPPED: section, last active proxy, bot route.
-#          sing-box RECOVERED: PID, section.
-#          TG unreachable: bot route, SOCKS state.
-#          TG reachable: bot route.
-# - NEW:   Proxy leaf change tracking (Check D in watchdog). Per-cycle
-#          snapshot of selector.now -> resolved leaf. Alert fires when
-#          sing-box auto-switches proxy (URLTest/Selector change).
-#          Format: [Host] 🎯 Proxy switched / From: X / To: Y / Section: Z
-#          Does not fire at startup — baseline set on first successful read.
-#
-
-# CHANGELOG v0.13.55:
-# - FIXED: do_del_fb debug logging removed (served its purpose in 0.13.54).
-#          do_del_fb handler is now clean: find by idx, del_list by value,
-#          verify, rebuild if del_list failed.
-#          ROOT CAUSE was in 0.13.54: "do_del_*" wildcard in proxy dispatch
-#          intercepted do_del_fb_* before it reached _handle_fallback_socks.
-#
-
-# CHANGELOG v0.13.54:
-# - FIXED: ROOT CAUSE of fallback SOCKS delete never working.
-#          dispatch pattern "do_del_*" in proxy block matched ALL do_del_
-#          commands including do_del_fb_N, do_del_ul_N, do_del_utl_N.
-#          They all silently went to _handle_proxy which has no handler
-#          for them and returned without doing anything.
-#          Fixed: changed "do_del_*" to "do_del_px_*" — the only actual
-#          proxy deletion pattern. do_del_ul_* and do_del_utl_* already
-#          have their own dispatch entries further down.
-#
-
-# CHANGELOG v0.13.53:
-# - FIXED: probe_socks_latency and _probe_fast returned 0ms for dead proxies.
-#          curl returns time_total even on connection refused (fast fail ~0ms).
-#          Now checks HTTP response code: only 204 = alive, else "timeout".
-#          Dead proxies now correctly show "timeout" with red icon.
-# - FIXED: probe_socks_latency same issue — watchdog telemetry also showed
-#          0ms as green in Tunnel Health Transport Latency section.
-# - DEBUG: do_del_fb now logs idx, total, value being deleted, and state
-#          after deletion to syslog. Also tries del_list by value first,
-#          then falls back to full rebuild if del_list failed (verification
-#          via grep after commit). This will reveal the root cause.
-#
-
-# CHANGELOG v0.13.52:
-# - FIXED: tier5 (Emergency IP) missing from sticky case in _route_request.
-#          After finding tier5, LAST_ROUTE_FAST=tier5 was set but next call
-#          found no matching case -> logged "sticky=tier5 miss" and ran full
-#          discovery every time. Infinite churn in log. Now tier5 sticky path
-#          skips SOCKS tiers and tries direct then emergency IPs directly.
-# - FIXED: sing-box stop did not send IPC down to main loop. Only sent alert.
-#          Result: LAST_ROUTE_FAST stayed tier1, sticky probed dead SOCKS every
-#          call, then fell to tier5 Emergency IP. Now: watchdog writes "down"
-#          to ROUTE_CMD_FILE on sing-box stop (triggers RECOVERY_MODE=4 + route
-#          reset). On sing-box recover, writes "up" (triggers route rediscovery).
-#          This is the root cause of bot being unresponsive after podkop stop.
-#
-
-# CHANGELOG v0.13.51:
-# - FIXED: Fallback SOCKS delete — after uci rebuild, called
-#          fallback_socks_menu with empty mid causing send_message instead
-#          of edit. Now passes "$mid" so existing card is updated in-place.
-# - FIXED: Fallback SOCKS add — redundant "Added." toast before menu refresh
-#          caused two separate messages. Removed toast, menu refreshes directly.
-# - FIXED: cmd_test_fb_socks used probe_socks_latency (8s timeout per endpoint).
-#          With 4 endpoints = up to 32s hang. Replaced with inline _probe_fast()
-#          using 3s connect / 5s max per endpoint. Max wait now ~20s for 4 tiers.
-#
-
-# CHANGELOG v0.13.50:
-# - FIXED: Fallback SOCKS delete did not work. uci del_list by value is
-#          unreliable on some OpenWrt builds. Now rebuilds the list:
-#          uci delete the whole key, then uci add_list for all entries
-#          except the deleted index. Reliable on all OpenWrt versions.
-# - FIXED: Duplicate check treated socks5:// and socks5h:// as different
-#          endpoints. Now normalizes to host:port before comparison.
-# - NEW:   "Test All" button in Fallback SOCKS menu — probes tier1 (Podkop)
-#          and all tier2_N via gstatic 204, shows latency per endpoint.
-#          cmd_test_fb_socks handler uses probe_socks_latency().
-#
-
-# CHANGELOG v0.13.49:
-# - FIXED: Proxy list and button format restored to original readable style.
-#          List: [idx] icon Name | Type | Delay — same as before.
-#          Button: human name only (no "· Type" suffix added in 0.13.48).
-#          The · separator was unnecessary and made buttons wider.
-#
-
-# CHANGELOG v0.13.48:
-# - FIXED: TSV update parsing caused field shift when callback_id empty.
-#          @tsv uses \t (shell whitespace) so consecutive empty fields
-#          collapse: user_id received "false" (is_bot value) -> auth failed.
-#          Switched to join("\u001f") + IFS=$(printf '\037') read.
-#          U+001F (Unit Separator) is never shell whitespace, empty fields safe.
-# - FIXED: Proxy Selector buttons showed "main-2-outHysteria20" (no separator).
-#          Button label now "Name · Type" with middle dot separator.
-# - FIXED: Proxy list showed "[0] 🔴 main-1-out | VLESS | 0 | | N/A" — extra
-#          pipe from empty delay. New format: [00] 🔴  N/A   main-1-out
-#          Delay left-padded to 5 chars in <code> for vertical column alignment.
-#
-
-# CHANGELOG v0.13.47:
-# - FIXED: ask_cmd_stop had no handler body in _handle_bot — button pressed
-#          but no confirmation dialog appeared. Added case with "Stop Podkop?"
-#          confirm / cancel screen before do_cmd_stop executes.
-# - FIXED: [Watchdog] SOCKS probe ok logged every cycle (~13s = 270 lines/hr).
-#          Now logs only on state change (ok->fail or fail->ok). Per-cycle
-#          spam suppressed. SOCKS fail always logged regardless.
-# - NEW:   Summary log every PROBE_EVERY cycles (default 5 min):
-#          [Watchdog] status: socks=up sb=running route=Podkop (SOCKS5:...)
-#          Replaces ok-spam with periodic health snapshot.
-#
-
-# CHANGELOG v0.13.46:
-# - UX:    Replaced all 17 <code>---...---</code> separators with
-#          <code>────────────────────</code> (20x U+2500 box-drawing).
-#          Monospace dashes (32 chars) wrapped to 2 lines on mobile;
-#          box-drawing at 20 chars fits single line on all screen widths.
-#
-
-# CHANGELOG v0.13.45:
-# - NEW:   Hostname prefix in all watchdog alerts for multi-router supergroup.
-#          All 4 alert types now start with [hostname]:
-#          [Router] sing-box STOPPED/RECOVERED
-#          [Router] ALERT: Bot SOCKS upstream DOWN/RECOVERED
-#          [Router] TG Connectivity: ...
-#          Hostname read once at watchdog startup from /proc/sys/kernel/hostname.
-#          Set per-router via: uci set system.@system[0].hostname=MyRouter
-#
-
-# CHANGELOG v0.13.44:
-# - FIXED: probe_all_socks_write() now includes tier3 (custom_proxy) in latency
-#          probe if set. Full transport picture: tier1 + tier2_N + tier3.
-#          Tunnel Health section renamed "Transport Latency" to reflect scope.
-# - FIXED: SOCKS_PROBE_FILE write is now atomic: tmp file + mv, same pattern
-#          as PUBIP_CACHE. Prevents partial reads by Tunnel Health display.
-# - VERIFIED: No stray trailing ' in printf format strings. All new strings
-#          from v0.13.38-43 end correctly with ' \\ (format close + line
-#          continuation). ChatGPT review was incorrect on this point.
-#
-# CHANGELOG v0.13.43:
-# - NEW:   mixed_proxy_port editor in Core Settings. Button shows current
-#          port, text input with 1024-65535 validation, reload on change.
-#          With confirmation via separate ask/do flow (port change requires
-#          reload — user sees "Applying..." before return).
-# - NEW:   outbound_interface editor in Core Settings. Shows current value
-#          (auto if unset), text input for UCI iface name, empty = delete
-#          (reset to auto). Reload on change.
-# - NEW:   URLTest Proxy Links editor (urltest_links_menu). Paginated list,
-#          add with protocol validation (same as selector_proxy_links),
-#          delete with confirmation. Accessible from URLTest Settings screen.
-#          Uses get_urltest_proxy_links() helper (eval "set --" pattern,
-#          handles = in URLs correctly).
-# - NEW:   get_urltest_proxy_links() — mirrors get_url_proxy_links() for
-#          the urltest_proxy_links UCI list key.
-#
-# CHANGELOG v0.13.42:
-# - NEW:   probe_socks_latency() — measures round-trip latency through any SOCKS
-#          endpoint using single HTTP probe to gstatic 204. Returns "Xms" or
-#          "timeout". No side effects on transport state.
-# - NEW:   probe_all_socks_write() — probes tier1 (Podkop SOCKS) and all
-#          tier2_N (fallback_socks list) in sequence, writes structured results
-#          to SOCKS_PROBE_FILE (/tmp/podkop_bot_socks_probe). Format:
-#          ts=<epoch>  tier1=<ms>  tier2_1=<ms> url=<endpoint>  ...
-#          Runs in background (&) to avoid blocking watchdog cycle.
-# - NEW:   Watchdog calls probe_all_socks_write every 5 health cycles (default
-#          every 5 minutes at 60s interval). Configurable via PROBE_EVERY.
-#          First probe runs at cycle 5 (not on startup) to avoid boot load.
-# - NEW:   Tunnel Health screen shows SOCKS Latency section with per-tier
-#          results: tier1 + all fallback_socks entries with icons and "probed
-#          Xm ago" timestamp. Shows "not yet probed" before first probe cycle.
-# - FIXED: socks5h:// now accepted in Fallback SOCKS validator (v0.13.41).
-#
-# CHANGELOG v0.13.41:
-# - FIXED: Fallback SOCKS validator rejected socks5h:// protocol.
-#          socks5h:// is critical under RKN: DNS resolves through the proxy
-#          tunnel instead of locally (prevents DNS poisoning/blocking).
-#          Regex changed from ^socks5:// to ^socks5h?:// to accept both.
-#          Error message updated to show both formats and explain the difference.
-#
-# CHANGELOG v0.13.40:
-# - FIXED: ask_set_tr_menu / ask_set_tr_* / do_set_tr_* were caught by the
-#          generic ask_* catchall in the main router before reaching _handle_bot.
-#          Result: pressing "Transport: Auto" showed "Confirm Action set_tr_menu?"
-#          instead of the transport selector screen. Fixed by adding explicit
-#          dispatch entries before the ask_* fallthrough.
-# - FIXED: delete_message() called with empty string mid caused jq error:
-#          "string ("") cannot be parsed as a number". Happened after
-#          cmd_upstream_health / cmd_run_podkop_tests which call
-#          _handle_bot "cmd_runtime" "" "" "" (empty mid on return path).
-#          Added guard: [ -z "$1" ] return 0; numeric check before jq call.
-# - UX:    Bot Settings shows a migration hint when custom_proxy is a socks5://
-#          URL, suggesting to move it to Fallback SOCKS (tier2) for correct
-#          failover ordering. The Fallback SOCKS button is directly below.
-#
-# CHANGELOG v0.13.39:
-# - NEW:   Support Bundle (cmd_support_bundle) — one button in Runtime Info
-#          collects and sends a single .txt file containing:
-#          hostname/versions, active section, podkop/sing-box status,
-#          full UCI config (bot_token/chat_id redacted), ip route/rule,
-#          nft podkop rules, network interfaces, public IP cache,
-#          bot transport state (LAST_ROUTE_FAST/POLL/RECOVERY_MODE,
-#          SOCKS_STATE_FILE contents), last 80 lines of podkop syslog.
-#          Sends via api_document, returns to Runtime Info on completion.
-#          Does not duplicate or replace existing individual export buttons
-#          (Podkop Config, Sing-box JSON, Syslog, Upstream Health, etc.)
-#
-# CHANGELOG v0.13.38 — P1 LuCI Coverage:
-# - NEW:   Mixed Proxy toggle (mixed_proxy_enabled) in Core Settings.
-#          Shows current port, ask/confirm before toggle, reloads on change.
-# - NEW:   URLTest Settings screen (urltest_testing_url, urltest_check_interval,
-#          urltest_tolerance) — editable per-section via text input with
-#          format validation. Accessible from Core Settings button.
-# - NEW:   Domain Resolver per-section screen (domain_resolver_enabled,
-#          domain_resolver_dns_type, domain_resolver_dns_server). Toggle,
-#          cycle DNS type (udp/doh/dot), set server via text input.
-# - NEW:   Bad WAN Details screen — expands existing toggle with
-#          badwan_monitored_interfaces (space-separated, text input) and
-#          badwan_reload_delay (seconds, validated). Toggle button reuses
-#          do_toggle_wan so main Core Settings stays in sync.
-# - NEW:   Routing Excluded IPs (routing_excluded_ips) in Routing & Lists.
-#          Same UX as Fully Routed IPs: list, add/remove with validation,
-#          reload on change. excl_ips_edit / del_excl_* / cmd_add_excl_ip.
-# - NEW:   _handle_section_extras() — new handler for URLTest/DR/BadWAN.
-#          STATE_INPUT dispatch covers 6 new wait_ states.
-#
-# CHANGELOG v0.13.37:
-# - FIXED: flock FD 200 replaced with FD 9 in uci_commit_safe() and
-#          safe_reload_podkop(). FD 200 is non-standard and causes sh -n
-#          (dash) parse failure. FD 9 is conventional for advisory locks.
-# - FIXED: cmd_dns_server had unescaped JSON as third arg to send_or_edit.
-#          Shell parsed closing " of printf string as end of arg, leaving
-#          inline_keyboard JSON unquoted — Telegram rejected with 400.
-#          Fixed with proper backslash-escaped JSON and multiline call.
-# - FIXED: Delete buttons in url_links_menu and fallback_socks_menu used
-#          literal "X" instead of ${E_DEL}. Now consistent with rest of UI.
-# - FIXED: api_document() did not respect transport policy for fallback_socks
-#          and custom_url tiers. In "direct" mode these SOCKS tiers were still
-#          attempted. Restructured into policy != "direct" / policy != "socks"
-#          blocks matching the semantics of _try_all_tiers().
-# - PERF:  Main loop update parsing: replaced 12 separate jq forks per update
-#          with a single jq @tsv call + shell read. On MIPS routers this
-#          eliminates ~11 process spawns per button tap (~0.5-1s latency saved).
-#          Text field newlines preserved via printf '%b' on @tsv-encoded value.
-#
-# CHANGELOG v0.13.36:
-# - FIXED: Transport Policy change (Auto/Socks/Direct) was applied instantly
-#          on button tap with no confirmation. Switching to "socks" or "direct"
-#          under active RKN blocks could permanently break bot connectivity
-#          (bot loses Telegram and can't recover without physical access).
-#   Fix:   Three-step confirmation flow:
-#          1. "Transport: Auto" button -> ask_set_tr_menu (mode selector screen)
-#          2. User picks Auto/Socks only/Direct only -> ask_set_tr_<mode>
-#             (confirmation screen with mode-specific risk warning)
-#          3. Confirm -> do_set_tr_<mode> (apply + return to Bot Settings)
-#          If new mode == current mode, skips confirmation and returns directly.
-#          "socks" and "direct" show E_WARN + explicit consequence description.
-#          "auto" shows E_OK (safe choice, still requires confirm for symmetry).
-#
-# CHANGELOG v0.13.35:
-# - FIXED: Missing local declarations — variables leaked into global scope:
-#   * run_upstream_health_report(): added leaf_n to local list. Was assigned
-#     in the while-read loop but not scoped, risking pollution across calls.
-#   * cmd_status case: added pub_ip_display to local list. Read from cache
-#     and used in heredoc text but declared globally.
-#   * cmd_runtime case: added active_leaf to local list. Assigned via
-#     _resolve_leaf() call but not scoped, could bleed into next handler.
-#
-# CHANGELOG v0.13.34:
-# - FIXED: refresh_public_ip_cache() lockfile used $$ which in a background
-#          subshell (&) always returns the PARENT process PID, not the subshell.
-#          If the subshell died (OOM kill, segfault), kill -0 $lock_pid would
-#          succeed forever (parent is alive) — permanent lock until bot restart.
-#   Fix:   Replaced file-based lock with atomic mkdir lock. mkdir is a single
-#          POSIX syscall with link(2) semantics — either succeeds or fails
-#          atomically, no race. Lock is a directory (PUBIP_REFRESH_LOCK now ends
-#          in .lockdir) so rm -rf cleans it. Added 5-minute stale-lock timeout:
-#          if lockdir mtime > 300s old, it is force-removed and re-acquired
-#          (covers crash/OOM scenario without leaking the lock forever).
-#          trap updated to use rm -rf for the lockdir on bot exit.
-#
-# CHANGELOG v0.13.33:
-# - FIXED: Critical architectural bug — watchdog subshell cannot modify parent
-#          process variables. In v0.13.28 watchdog wrote LAST_ROUTE_FAST="unknown"
-#          and RECOVERY_MODE=4 directly, but as a subshell ( ... )& it only
-#          changed its own copy. Main polling loop never saw the reset.
-#   Fix:   IPC via ROUTE_CMD_FILE (/tmp/podkop_bot_route_cmd).
-#          Watchdog writes "down" or "up" to the file instead of modifying vars.
-#          _route_request() reads the file at the top of every call (both
-#          api_request_fast and api_poll_long paths), acts on it immediately,
-#          then deletes the file. One file = one atomic signal per event.
-#          On "down": LAST_ROUTE_FAST/POLL/LAST_ROUTE="unknown", RECOVERY_MODE=4.
-#          On "up":   same reset + RECOVERY_MODE=0 (tier1 rediscovery on next poll).
-# - FIXED: Dead code in cmd_tunnel_health: wd_route and wd_last_ok were parsed
-#          from SOCKS_STATE_FILE but never used in the output template. Removed
-#          the two grep calls and the variable declarations.
-# - NEW:   ROUTE_CMD_FILE constant + added to trap cleanup.
-#
-# CHANGELOG v0.13.32:
-# - FIXED: api_document() declared twice (regression from P1 overhaul merge).
-#          Old 4-tier version (lines ~880-941) that wrote to global LAST_ROUTE
-#          was silently overwriting the new isolated version (LAST_ROUTE_DOC).
-#          Deleted the old duplicate. Only the new version (line ~601) remains.
-# - FIXED: _route_request() tier2_* sticky path: for-loop iterator variable
-#          retained last value when break never fired (index out of range).
-#          Fixed by using separate _item iterator + _fb="" result variable,
-#          only assigned on successful break. Prevents stale fallback_socks
-#          endpoint being used after list shrinks below cached tier index.
-#          Same fix applied consistently (get_tg_latency already used correct
-#          pattern with explicit _fb_url="" reset inside loop body).
-# - FIXED: Stray spaces inside case pattern in handle_command() router:
-#          "set_update_int_*|        conn_type_menu" cleaned to proper pipe-
-#          delimited pattern without embedded whitespace.
-#
-# CHANGELOG v0.13.31:
-# - FIXED: Health alert / menu interleaving. When watchdog sends an alert
-#          (sing-box down, SOCKS down, TG connectivity change), the alert
-#          message pushed the active menu card up in chat. Next user action
-#          edited the buried card — user saw stale menu below the alert.
-#   Fix:   send_message() now captures and saves the sent msg_id to
-#          LAST_MENU_MSG_FILE. send_health_alert() (new helper wrapping
-#          watchdog sendMessage calls) saves the alert msg_id to
-#          LAST_ALERT_MSG_FILE. send_or_edit() compares the two: if alert
-#          is newer than menu, it deletes the buried menu card and sends a
-#          fresh one at the current chat position (below the alert), then
-#          clears LAST_ALERT_MSG_FILE so subsequent edits work normally.
-# - FIXED: refresh_public_ip_cache() bare wait replaced with explicit PID
-#          wait (p1/p2/p3) — same pattern as cmd_all_delay_test fix.
-#
-# CHANGELOG v0.13.30:
-# - FIXED: refresh_public_ip_cache() bare wait replaced with explicit PID wait.
-#          Three curl PIDs (p1/p2/p3) now collected before wait, then waited
-#          with "wait $p1 $p2 $p3". Prevents hang if function call context
-#          ever inherits background processes from outer shell.
-#          Mirrors the same fix previously applied to cmd_all_delay_test.
-# - VERIFIED: No local declarations in global while-loop scope (main poll loop
-#          starts at line 3831+). Unauthorized-access block and audit block
-#          use bare assignments — correct for global scope in POSIX ash.
-#
-# CHANGELOG v0.13.29:
-# - FIXED: get_tg_latency() tier2_* now resolves actual fallback SOCKS endpoint
-#          by index from UCI list instead of incorrectly using custom_proxy.
-#          Previously tier2_N fast-route showed wrong latency or Timeout when
-#          bot was actually running on a fallback SOCKS, not custom_proxy.
-# - FIXED: api_document() sticky-path comment removed — function intentionally
-#          uses full cascade (no sticky) for multipart uploads. LAST_ROUTE_DOC
-#          is set for diagnostics only and does not affect FAST/POLL routing.
-# - FIXED: Bot Settings tr_hint updated to reflect actual tier order:
-#          Podkop SOCKS -> Fallback SOCKS (tier2_N) -> Custom -> Direct -> Emergency.
-#          Previous hint omitted fallback_socks tiers entirely.
-#
-# CHANGELOG v0.13.28 — P1 Transport Overhaul:
-# - NEW:   api_request_fast() — dedicated fast path for sendMessage/edit/
-#          answerCB/deleteMessage: connect-timeout 2s sticky/3s full, max 8s.
-# - NEW:   api_poll_long() — dedicated poll path for getUpdates: connect-
-#          timeout 3s sticky/4s full, max 65s. Never shares state with fast.
-# - NEW:   LAST_ROUTE_FAST / LAST_ROUTE_POLL / LAST_ROUTE_DOC — split route
-#          tracking. api_document() no longer poisons fast/poll route state.
-# - NEW:   Tier 2_N: UCI list fallback_socks (podkop_bot.settings.fallback_socks)
-#          tried in order between Podkop SOCKS and custom_proxy. Old tiers
-#          renumbered: tier3=custom, tier4=direct, tier5=emergency.
-# - NEW:   RECOVERY_MODE counter (0-4): after All transports FAILED, next 4
-#          poll cycles aggressively probe SOCKS tiers before falling to direct.
-# - NEW:   probe_socks_upstream() — 3 probe endpoints (gstatic x2 + cloudflare).
-#          Reduces false "SOCKS down" from single-endpoint block.
-# - NEW:   Anti-flap hysteresis 2/2 for both SOCKS and TG alerts: alert fires
-#          only after 2 consecutive same-state probes.
-# - NEW:   Structured SOCKS_STATE_FILE (tg/socks/route/last_ok key=value).
-#          Tunnel Health screen reads and displays split TG/SOCKS state.
-# - NEW:   Fallback SOCKS manager in Bot Settings: add/view/remove entries
-#          (UI: Bot Settings -> Fallback SOCKS button).
-# - FIXED: check_health() uses direct curl, not bot's own transport stack,
-#          to avoid interfering with LAST_ROUTE_FAST/POLL during checks.
-# - FIXED: Tunnel Health shows Poll/Fast route keys separately.
-# - FIXED: startup notify uses api_request_fast, logs fast route on connect.
-#
-# CHANGELOG v0.13.27:
-# - FIXED: Separator lines wrapped in <code>...</code> tags so Telegram renders
-#          them in monospace font - dashes are now uniform width and visually
-#          span the full message width alongside bold/emoji content.
-#          All 13 heredoc separators + 1 inline printf separator updated.
-#
-# CHANGELOG v0.13.26:
-# - STYLE: Separator lines extended to 32 dashes (was 21) to visually span
-#          full message width in Telegram proportional font alongside emoji content.
-#          Covers all 13 heredoc separators + 1 inline printf separator.
-#
-# CHANGELOG v0.13.25:
-# - FIXED: url_proxy_links parsing hardened - replaced heuristic
-#          "grep | cut -d= | tr -d '" with get_url_proxy_links() helper
-#          using eval "set --" on UCI shell-quoted output. Correctly handles
-#          = signs inside URLs (base64 padding in vless/vmess, query params).
-#          Affected: url_links_menu list load, ask_del_ul_*, do_del_ul_*,
-#          and duplicate check on add.
-# - NEW:   get_url_proxy_links() helper function (mirrors build_uci_links_cache
-#          pattern already proven for selector_proxy_links).
-# - STYLE: ASCII separator lines extended from 14 to 21 dashes for better
-#          visual separation in Telegram messages.
-#
-# CHANGELOG v0.13.24:
-# - NEW:   proxy_config_type=url (URL Connection) full support in bot:
-#          view list of links, add new link, remove by index, reload on change.
-#          Proxy menu button switches label to "URL Links" in this mode.
-# - NEW:   proxy_config_type=outbound (Outbound Config) shows info screen:
-#          warns user to use LuCI/console for JSON editing, links to LuCI.
-# - FIXED: main_menu "Proxy Selector" button is now mode-aware: shows
-#          "Proxy Selector" (selector), "URL Test" (urltest), "URL Links" (url),
-#          "Outbound" (outbound) so user always sees current mode.
-# - FIXED: Status screen Mode: field shows human-readable label instead of raw UCI value.
-#
-# CHANGELOG v0.13.23:
-# - FIXED: Header/CHANGELOG version synced to BOT_VERSION (was stuck at 0.13.21)
-# - FIXED: Tunnel Health keyboard had spurious "Menu" button (duplicate nav);
-#          now shows only Refresh + Back, consistent with other detail screens
-# - FIXED: Last reload reads sing-box process start time from /proc/PID/stat
-#          when RELOAD_TS_FILE is absent (covers LuCI/console reloads, not just bot)
-# - NEW:   Connection Type selector (proxy/vpn/block/exclusion) in Core Settings
-# - NEW:   Active proxy line added to Tunnel Health from Clash API
-# - FIXED: ASCII hygiene - em-dashes replaced with ASCII hyphens in runtime
-#          strings (logger lines, verdict text, bot HTML output)
-#
-# CHANGELOG v0.13.21:
-# - FIXED: cmd_all_delay_test hung forever (wait without args caught HEALTH_PID)
-#          Now uses explicit per-PID wait loop, max 10 concurrent clash_request
-# - FIXED: build_uci_links_cache reverted to eval "set --" (uci get N broken on BusyBox)
-# - FIXED: remote_domain_lists / remote_subnet_lists display reverted to eval
-# - FIXED: wan_ip removed blocking curl to api.ipify.org in cmd_status (was 4s delay)
-#          Replaced with ip route + uci get network.wan.ipaddr (instant)
-# - FIXED: get_tg_latency removed from main_menu (was 3s delay every open)
-# - NEW:   Tunnel Health screen (from Runtime Info) - nftables rules, sing-box RAM,
-#          last reload time, section mode, active community lists, WAN iface
-# - NEW:   proxy_config_type switch (selector <-> urltest) with mandatory confirm
-# - NEW:   user_domains_text line editor: view paginated, add line, remove by index
-# - NEW:   user_subnets_text line editor: same as domains
-# - NEW:   Sections menu: active section shown in header only (no spinning button)
 # ==============================================================================
 
 export LC_ALL=C
@@ -1291,7 +334,7 @@ _try_socks_tiers() {
     local _n=0 _fb
     for _fb in $_t_fb_socks; do
         _n=$((_n + 1))
-        logger -t podkop-bot "[Transport] probing tier2_${_n}: ${_fb}"
+        logger -t podkop-bot "[Transport] Trying fallback SOCKS: ${_fb}"
         if _try_curl "-x ${_fb}" "$max_time" "$args" "$ct"; then
             ROUTE_KEY="tier2_${_n}"
             ROUTE_NAME="Fallback SOCKS${_n} (${_fb})"
@@ -1357,7 +400,7 @@ _route_request() {
         LAST_ROUTE="unknown"
         if [ "$_wd_cmd" = "down" ]; then
             RECOVERY_MODE=4
-            logger -t podkop-bot "[Transport] IPC: watchdog=down -> FAST/POLL reset, RECOVERY_MODE=4"
+            logger -t podkop-bot "[Transport] sing-box down signal received. Resetting routes."
         else
             # RECOVERY_MODE=2: next 2 poll cycles probe SOCKS tiers first (aggressive),
             # preventing bot from settling on tier4/Direct when tier1 just recovered.
@@ -1366,7 +409,7 @@ _route_request() {
             RECOVERY_MODE=2
             # Clear tier5 reprobe timestamp: forces immediate SOCKS retry on tier5 path
             rm -f "$SOCKS_REPROBE_TS_FILE"
-            logger -t podkop-bot "[Transport] IPC: watchdog=up -> FAST/POLL reset, RECOVERY_MODE=2, reprobe_ts cleared"
+            logger -t podkop-bot "[Transport] Recovery signal received. Resetting routes, forcing SOCKS rediscovery."
         fi
     fi
     # ------------------------------------------------
@@ -1436,7 +479,7 @@ _route_request() {
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
-                        logger -t podkop-bot "[Transport] tier4 reprobe: recovered via ${ROUTE_KEY} / ${ROUTE_NAME}"
+                        logger -t podkop-bot "[Transport] Recovered from Direct. Active route: ${ROUTE_NAME}"
                         return 0
                     fi
                 fi
@@ -1469,7 +512,7 @@ _route_request() {
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
-                        logger -t podkop-bot "[Transport] tier5 reprobe: recovered via ${ROUTE_KEY} / ${ROUTE_NAME}"
+                        logger -t podkop-bot "[Transport] Recovered from Emergency IP. Active route: ${ROUTE_NAME}"
                         return 0
                     fi
                 fi
@@ -1491,7 +534,7 @@ _route_request() {
                 ;;
         esac
         # Sticky path failed — log and fall through to full discovery
-        logger -t podkop-bot "[Transport] sticky=$_last miss, full discovery"
+        logger -t podkop-bot "[Transport] Sticky route missed, running full discovery."
     fi
 
     # --- Full discovery cascade ---
@@ -1502,17 +545,17 @@ _route_request() {
         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
         eval "$_rvar=$ROUTE_KEY"
         if [ "$_last" = "fail" ] || [ "$_last" = "unknown" ]; then
-            logger -t podkop-bot "[Transport] recover old=${_last} new=${ROUTE_KEY} route=${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
             RECOVERY_MODE=0
         elif [ "$_prev_name" != "$ROUTE_NAME" ]; then
-            logger -t podkop-bot "[Transport] route=${ROUTE_KEY} ok name=${ROUTE_NAME}"
+            logger -t podkop-bot "[Transport] Route: ${ROUTE_NAME}"
         fi
         return 0
     fi
 
     # --- All tiers failed ---
     if [ "$_last" != "fail" ]; then
-        logger -t podkop-bot "[Transport] fail method=${_rvar} all tiers exhausted"
+        logger -t podkop-bot "[Transport] Connection failed. All proxy tiers exhausted."
         RECOVERY_MODE=4
     fi
     LAST_ROUTE="fail"; LAST_ROUTE_NAME="Disconnected"
@@ -1536,7 +579,7 @@ api_request_fast() {
         # Default max_time=8s with ct=3s means tier1 alone can consume all 8s before
         # tier2 gets a chance. Cap at 5s per tier: tier1(3s ct)+tier2(3s ct) = ~6s total.
         local _fast_max=5
-        logger -t podkop-bot "[Transport] fast recovery start: RECOVERY_MODE=${RECOVERY_MODE} fb_socks='${_t_fb_socks}' policy=${_t_policy}"
+        logger -t podkop-bot "[Transport] Fast recovery starting. Trying SOCKS tiers..."
         if _try_socks_tiers "$final_args" "$_fast_max" "3"; then
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
@@ -1545,10 +588,10 @@ api_request_fast() {
             # before fully exiting recovery mode. Zeroing here causes the next
             # poll cycle to skip SOCKS-first and potentially land on Direct.
             RECOVERY_MODE=$((RECOVERY_MODE > 1 ? RECOVERY_MODE - 1 : 0))
-            logger -t podkop-bot "[Transport] fast recovery: new=${ROUTE_KEY} route=${ROUTE_NAME} recovery_mode=${RECOVERY_MODE}"
+            logger -t podkop-bot "[Transport] Fast recovery: connected via ${ROUTE_NAME}"
             rm -f "$tmp"; echo "$API_RESPONSE"; return 0
         else
-            logger -t podkop-bot "[Transport] fast recovery: _try_socks_tiers failed for all tiers"
+            logger -t podkop-bot "[Transport] Fast recovery: all SOCKS tiers unavailable."
         fi
     fi
     if _route_request "$final_args" "$max_time" "2" "3" "LAST_ROUTE_FAST"; then
@@ -1571,14 +614,14 @@ api_poll_long() {
     # Recovery mode: aggressively try SOCKS tiers, skip sticky
     if [ "$RECOVERY_MODE" -gt 0 ]; then
         RECOVERY_MODE=$((RECOVERY_MODE - 1))
-        logger -t podkop-bot "[Transport] recovery_mode=${RECOVERY_MODE} probing SOCKS tiers"
+        logger -t podkop-bot "[Transport] Probing SOCKS tiers (recovery mode)..."
         local ROUTE_KEY ROUTE_NAME
         if _try_socks_tiers "$args" "65" "4"; then
             local _prev="$LAST_ROUTE_POLL"
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             LAST_ROUTE_POLL="$ROUTE_KEY"
             [ "$_prev" = "fail" ] && \
-                logger -t podkop-bot "[Transport] recover old=${_prev} new=${ROUTE_KEY} route=${ROUTE_NAME}"
+                logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
             return 0
         fi
         # SOCKS still down in recovery — fall through to full cascade
@@ -1642,7 +685,7 @@ probe_all_socks_write() {
     # tier1: primary Podkop SOCKS
     lat=$(probe_socks_latency "socks5h://${m_ip}:${m_port}")
     out="${out}\ntier1=${lat}"
-    logger -t podkop-bot "[SOCKSProbe] tier1 ${m_ip}:${m_port} -> ${lat}"
+    logger -t podkop-bot "[SOCKSProbe] Primary (${m_ip}:${m_port}): ${lat}"
 
     # tier2_N: fallback_socks list
     local _fb_raw _n=0 _item _fb=""
@@ -1653,7 +696,7 @@ probe_all_socks_write() {
             _n=$((_n + 1))
             lat=$(probe_socks_latency "$_item")
             out="${out}\ntier2_${_n}=${lat} url=${_item}"
-            logger -t podkop-bot "[SOCKSProbe] tier2_${_n} ${_item} -> ${lat}"
+            logger -t podkop-bot "[SOCKSProbe] Fallback-${_n} (${_item}): ${lat}"
         done
     fi
 
@@ -1662,7 +705,7 @@ probe_all_socks_write() {
     if [ -n "$_custom" ]; then
         lat=$(probe_socks_latency "$_custom")
         out="${out}\ntier3=${lat} url=${_custom}"
-        logger -t podkop-bot "[SOCKSProbe] tier3 ${_custom} -> ${lat}"
+        logger -t podkop-bot "[SOCKSProbe] Custom proxy (${_custom}): ${lat}"
     fi
 
     local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
@@ -2172,7 +1215,7 @@ build_tag_uri_cache() {
         )
     ' /etc/sing-box/config.json 2>/dev/null > "$tmp"
     mv "$tmp" "$TAG_URI_CACHE"
-    logger -t podkop-bot "[Cache] tag->uri rebuilt ($(wc -l < "$TAG_URI_CACHE" 2>/dev/null || echo 0) entries)"
+    logger -t podkop-bot "[Core] Proxy URI cache ready ($(wc -l < "$TAG_URI_CACHE" 2>/dev/null || echo 0) entries)"
 }
 
 # Build UCI proxy links cache using eval "set --" (uci get option N is broken on BusyBox)
@@ -2187,7 +1230,7 @@ build_uci_links_cache() {
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
     fi
     mv "$tmp" "$UCI_LINKS_CACHE"
-    logger -t podkop-bot "[Cache] uci_links rebuilt for '${sec}' ($(wc -l < "$UCI_LINKS_CACHE" 2>/dev/null || echo 0) entries)"
+    logger -t podkop-bot "[Core] Proxy link cache ready for '${sec}' ($(wc -l < "$UCI_LINKS_CACHE" 2>/dev/null || echo 0) entries)"
 }
 
 # Build tag->human_name cache from #fragment in ALL UCI proxy link lists.
@@ -2235,7 +1278,7 @@ build_tag_name_cache() {
         done
     fi
     mv "$tmp" "$TAG_NAME_CACHE"
-    logger -t podkop-bot "[Cache] tag_names rebuilt for '${sec}' ($(wc -l < "$TAG_NAME_CACHE" 2>/dev/null || echo 0) entries)"
+    logger -t podkop-bot "[Core] Proxy name cache ready for '${sec}' ($(wc -l < "$TAG_NAME_CACHE" 2>/dev/null || echo 0) entries)"
 }
 
 # Rebuild all caches. Community lists cache intentionally NOT cleared here
@@ -2478,7 +1521,7 @@ safe_reload_podkop() {
           echo "$now" > "$RELOAD_TS_FILE"
           exit 0
         ) 9>/tmp/podkop_reload.lock || {
-            logger -t podkop-bot "[Reload] Skipped: cooldown active (< 10s)"; return 1
+            logger -t podkop-bot "[Reload] Skipped (cooldown active)"; return 1
         }
     else
         local now last diff
@@ -2720,7 +1763,7 @@ start_health_daemon() {
                 probe_cycle=0
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
                 _wd_log_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
-                logger -t podkop-bot "[Watchdog] status: socks=${last_socks_state:-unknown} sb=${last_sb_state:-unknown} route=${_wd_log_route}"
+                logger -t podkop-bot "[Health] System OK | SOCKS: ${last_socks_state:-?} | sing-box: ${last_sb_state:-?} | Route: ${_wd_log_route}"
                 # Reap previous probe subshell before launching a new one.
                 # In BusyBox ash, background children become zombies until the parent
                 # calls wait. Over months of uptime these accumulate (one per 5min cycle).
@@ -2752,10 +1795,10 @@ start_health_daemon() {
                 tg_ok_streak=$((tg_ok_streak + 1))
                 if [ "$last_tg_state" = "fail" ] && [ "$tg_ok_streak" -ge 2 ]; then
                     last_tg_state="ok"
-                    logger -t podkop-bot "[Watchdog] TG connectivity: fail -> ok"
+                    logger -t podkop-bot "[Watchdog] Telegram reachable again."
                     if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                         admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
-                            --arg txt "$(printf '<b>[%s]</b> %s <b>TG reachable</b>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: bot control plane</i>' \
+                            --arg txt "$(printf '<b>[%s]</b> %s <b>Telegram reachable</b>\n\nBot connection restored.\n<b>Route:</b> <code>%s</code>' \
                                 "$_hn" "$E_OK" "${LAST_ROUTE_NAME:-unknown}")" \
                             '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                         send_health_alert "$admin_payload"
@@ -2767,11 +1810,11 @@ start_health_daemon() {
                 tg_fail_streak=$((tg_fail_streak + 1))
                 if [ "$last_tg_state" = "ok" ] && [ "$tg_fail_streak" -ge 2 ]; then
                     last_tg_state="fail"
-                    logger -t podkop-bot "[Watchdog] TG connectivity: ok -> fail streak=${tg_fail_streak}"
+                    logger -t podkop-bot "[Watchdog] Telegram unreachable."
                     if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
                         admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
-                            --arg txt "$(printf '<b>[%s]</b> %s <b>TG unreachable</b>\n<b>Bot route:</b> <code>%s</code>\n<b>SOCKS:</b> <code>%s</code>\n<i>Scope: bot control plane — podkop data routing may still work</i>' \
-                                "$_hn" "$E_ERR" "${LAST_ROUTE_NAME:-unknown}" "${last_socks_state:-unknown}")" \
+                            --arg txt "$(printf '<b>[%s]</b> %s <b>Telegram unreachable</b>\n\nBot lost connection.\n<b>podkop proxy:</b> unaffected, running normally.' \
+                                "$_hn" "$E_WARN" "${LAST_ROUTE_NAME:-unknown}")" \
                             '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                         send_health_alert "$admin_payload"
                     fi
@@ -2791,22 +1834,21 @@ start_health_daemon() {
                         local _sb_leaf _sb_leaf_disp
                         _sb_leaf=$([ -n "$last_leaf" ] && echo "$last_leaf" || echo "unknown")
                         _sb_leaf_disp=$(display_proxy_name "$_sb_leaf")
-                        sb_alert_txt=$(printf '<b>[%s]</b> <b>%s sing-box STOPPED</b>\n<b>Section:</b> <code>%s</code>\n<b>Last proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: data plane DOWN + bot transport resetting</i>' \
-                            "$_hn" "$E_ERR" "$sec" "$_sb_leaf_disp" "${LAST_ROUTE_NAME:-unknown}")
+                        sb_alert_txt=$(printf '<b>[%s]</b> %s <b>sing-box stopped</b>\n\nVPN tunnel is down.\n<b>Last proxy:</b> <code>%s</code>\n\n<i>Traffic routing interrupted. Bot switching to fallback channel.</i>' \
+                            "$_hn" "$E_ERR" "$_sb_leaf_disp")
                         # IPC: force transport reset — tier1/tier2 SOCKS are dead without sing-box
                         printf 'down' > "$ROUTE_CMD_FILE"
-                        logger -t podkop-bot "[Transport] IPC: sing-box stopped -> route_cmd=down, FAST/POLL will reset"
+                        logger -t podkop-bot "[Transport] sing-box stopped. Signalling route reset."
                     else
                         new_pid=$(pidof sing-box 2>/dev/null | awk '{print $1}')
                         # Get current leaf after recovery (may take a moment to settle)
                         local _rec_leaf_disp
                         _rec_leaf_disp=$(display_proxy_name "${last_leaf:-unknown}")
-                        sb_alert_txt=$(printf '<b>[%s]</b> <b>%s sing-box RECOVERED</b>\n<b>PID:</b> <code>%s</code> | <b>Section:</b> <code>%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: data plane restored — bot transport rediscovering tier1</i>' \
-                            "$_hn" "$E_OK" "${new_pid:-?}" "$sec" \
-                            "$_rec_leaf_disp" "${LAST_ROUTE_NAME:-unknown}")
+                        sb_alert_txt=$(printf '<b>[%s]</b> %s <b>sing-box recovered</b>\n\nVPN tunnel is back up.\n<b>Active proxy:</b> <code>%s</code>\n\n<i>Traffic routing restored.</i>' \
+                            "$_hn" "$E_OK" "$_rec_leaf_disp")
                         # IPC: signal recovery — let transport rediscover tier1
                         printf 'up' > "$ROUTE_CMD_FILE"
-                        logger -t podkop-bot "[Transport] IPC: sing-box recovered -> route_cmd=up, FAST/POLL will reset"
+                        logger -t podkop-bot "[Transport] sing-box recovered. Signalling route rediscovery."
                     fi
                     admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$sb_alert_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
@@ -2822,19 +1864,19 @@ start_health_daemon() {
             # ------------------------------------------------------------------
             if [ "$curr_sb_state" = "stopped" ]; then
                 curr_socks_state="${last_socks_state:-up}"
-                logger -t podkop-bot "[Watchdog] SOCKS probe skipped (sing-box stopped)"
+                logger -t podkop-bot "[Watchdog] SOCKS probe skipped (sing-box is stopped)"
             else
                 if probe_socks_upstream "$m_ip" "$m_port"; then
                     curr_socks_state="up"
                     # Log ok only on state change — suppress per-cycle spam
                     [ "$last_socks_state" != "up" ] && \
-                        logger -t podkop-bot "[Watchdog] SOCKS ok via ${m_ip}:${m_port}"
+                        logger -t podkop-bot "[Watchdog] SOCKS proxy reachable (${m_ip}:${m_port})"
                 else
                     # tier1 down — check if any tier2 fallback_socks is reachable.
                     # If so, mark socks=up so IPC "up" fires and bot uses tier2
                     # instead of staying on Direct indefinitely.
                     curr_socks_state="down"
-                    logger -t podkop-bot "[Watchdog] SOCKS FAIL via ${m_ip}:${m_port}"
+                    logger -t podkop-bot "[Watchdog] SOCKS proxy unreachable (${m_ip}:${m_port})"
                     local _fb_raw _fb _fb_ok=0
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
@@ -2846,7 +1888,7 @@ start_health_daemon() {
                             if probe_socks_upstream "$_fb_ip" "$_fb_port"; then
                                 curr_socks_state="up"
                                 _fb_ok=1
-                                logger -t podkop-bot "[Watchdog] tier1 down but fallback ${_fb} alive — marking socks=up"
+                                logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback ${_fb} is alive."
                                 break
                             fi
                         done
@@ -2882,7 +1924,7 @@ start_health_daemon() {
                         # IPC: signal main process to reset route state and enter recovery mode.
                         # Cannot modify parent variables directly (subshell isolation).
                         printf 'down' > "$ROUTE_CMD_FILE"
-                        logger -t podkop-bot "[Watchdog] SOCKS down - wrote route_cmd=down (recovery=4 on next _route_request)"
+                        logger -t podkop-bot "[Watchdog] SOCKS down. Triggering route reset."
                         # Build fallback availability from last probe file
                         local _fb_avail=""
                         if [ -f "$SOCKS_PROBE_FILE" ]; then
@@ -2897,35 +1939,33 @@ start_health_daemon() {
                         fi
                         [ -z "$_fb_avail" ] && _fb_avail="  (none configured)\n"
                         socks_alert_txt=$(printf \
-                            '<b>[%s]</b> <b>%s Bot SOCKS upstream DOWN</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<b>Fallback:</b>\n<code>%b</code><i>Scope: bot control plane — podkop data routing unaffected</i>' \
+                            '<b>[%s]</b> %s <b>Primary SOCKS unavailable</b>\n\nBot switching to fallback channels.\n\n<b>Down:</b> <code>%s:%s</code>\n<b>Active proxy (podkop):</b> <code>%s</code>\n<b>Fallback channels:</b>\n<code>%b</code>\n<i>podkop traffic routing may be affected.</i>' \
                             "$_hn" "$E_ERR" "$m_ip" "$m_port" \
                             "$active_px_display" \
-                            "${LAST_ROUTE_NAME:-unknown}" \
                             "$_fb_avail")
                     else
                         # IPC: signal main process to clear recovery mode and rediscover tier1.
                         sleep 3
                         printf 'up' > "$ROUTE_CMD_FILE"
                         last_ok_route="tier1"
-                        logger -t podkop-bot "[Watchdog] SOCKS recovered - wrote route_cmd=up (DNS warmup done)"
+                        logger -t podkop-bot "[Watchdog] SOCKS recovered. Triggering route rediscovery."
                         socks_alert_txt=$(printf \
-                            '<b>[%s]</b> <b>%s Bot SOCKS upstream RECOVERED</b>\n<b>Primary:</b> <code>%s:%s</code>\n<b>Proxy:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: bot control plane — returning to tier1</i>' \
+                            '<b>[%s]</b> %s <b>Primary SOCKS recovered</b>\n\nBot back on primary channel.\n\n<b>Proxy:</b> <code>%s:%s</code>\n<b>Active proxy (podkop):</b> <code>%s</code>' \
                             "$_hn" "$E_OK" "$m_ip" "$m_port" \
-                            "$active_px_display" \
-                            "${LAST_ROUTE_NAME:-unknown}")
+                            "$active_px_display")
                     fi
                     admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$socks_alert_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                     send_health_alert "$admin_payload"
                 fi
-                logger -t podkop-bot "[Watchdog] SOCKS: ${last_socks_state} -> ${effective_socks} (fail=${socks_fail_streak} ok=${socks_ok_streak})"
+                logger -t podkop-bot "[Watchdog] SOCKS state: ${last_socks_state} → ${effective_socks}"
                 last_socks_state="$effective_socks"
             fi
 
             # Baseline on first run
             if [ -z "$last_socks_state" ]; then
                 last_socks_state="$curr_socks_state"
-                logger -t podkop-bot "[Watchdog] SOCKS baseline: ${curr_socks_state} via ${m_ip}:${m_port}"
+                logger -t podkop-bot "[Watchdog] SOCKS baseline: ${curr_socks_state} (${m_ip}:${m_port})"
                 # If baseline is "up" but bot is already on degraded route,
                 # send IPC up immediately — no transition will fire later.
                 if [ "$curr_socks_state" = "up" ]; then
@@ -2934,10 +1974,10 @@ start_health_daemon() {
                     # Use negative match to handle unknown values, typos, stale files.
                     case "${_wd_cur_route:-unknown}" in
                         tier1|tier2_*)
-                            logger -t podkop-bot "[Watchdog] Baseline up + route OK (${_wd_cur_route}) — no nudge needed"
+                            logger -t podkop-bot "[Watchdog] Route OK (${_wd_cur_route}), no action needed."
                             ;;
                         *)
-                            logger -t podkop-bot "[Watchdog] Baseline up + degraded route (${_wd_cur_route}) — nudging IPC up"
+                            logger -t podkop-bot "[Watchdog] Route stuck on ${_wd_cur_route}. SOCKS alive, forcing reconnect..."
                             printf 'up' > "$ROUTE_CMD_FILE"
                             printf '%s' "$(date +%s)" > "/tmp/podkop_bot_last_nudge"
                             ;;
@@ -2973,18 +2013,16 @@ start_health_daemon() {
                         local old_disp new_disp _now_ts
                         old_disp=$(display_proxy_name "$last_leaf")
                         new_disp=$(display_proxy_name "$curr_leaf")
-                        logger -t podkop-bot "[Watchdog] Leaf changed: ${last_leaf} -> ${curr_leaf}"
+                        logger -t podkop-bot "[Watchdog] Active proxy changed: ${last_leaf} → ${curr_leaf}"
                         _now_ts=$(date +%s)
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ] && \
                            [ $((_now_ts - last_leaf_alert_ts)) -ge 60 ]; then
                             last_leaf_alert_ts=$_now_ts
-                            local leaf_txt _mode _bot_route
+                            local leaf_txt _mode
                             _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "unknown")
-                            # Read current bot route from MAIN_ROUTE_FILE (written by main process)
-                            _bot_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null)
-                            [ -z "$_bot_route" ] && _bot_route="unknown"
-                            leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy switched</b>\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n<b>Section:</b> <code>%s</code> | <b>Mode:</b> <code>%s</code>\n<b>Bot route:</b> <code>%s</code>\n<i>Scope: outbound selection only — no service interruption</i>' \
-                                "$_hn" "$E_TGT" "$old_disp" "$new_disp" "$sec" "$_mode" "$_bot_route")
+                            leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy auto-switched</b>\n\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n\n<i>%s selected a faster server. No interruption expected.</i>' \
+                                "$_hn" "$E_TGT" "$old_disp" "$new_disp" \
+                                "$([ "$_mode" = "urltest" ] && echo "URLTest" || echo "Selector")")
                             admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
                                 '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                             send_health_alert "$admin_payload"
@@ -3017,7 +2055,7 @@ start_health_daemon() {
                         _now_nudge=$(date +%s)
                         _last_nudge=$(cat "/tmp/podkop_bot_last_nudge" 2>/dev/null || echo 0)
                         if [ $((_now_nudge - _last_nudge)) -ge 120 ]; then
-                            logger -t podkop-bot "[Watchdog] Degraded route (${_wd_cur_route}) + SOCKS up — nudging IPC up"
+                            logger -t podkop-bot "[Watchdog] Route stuck on ${_wd_cur_route}. SOCKS alive, forcing reconnect..."
                             printf 'up' > "$ROUTE_CMD_FILE"
                             printf '%s' "$_now_nudge" > "/tmp/podkop_bot_last_nudge"
                         fi
@@ -3889,13 +2927,31 @@ EOF
             local current_mode warn_txt kb
             current_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "selector")
             case "$target_mode" in
-                urltest)  warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                urltest)
+                    local _utl_count
+                    _utl_count=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -c "urltest_proxy_links=")
+                    if [ "${_utl_count:-0}" -eq 0 ]; then
+                        warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
+                    else
+                        warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n%s <b>%s</b> URLTest link(s) ready.\n\nSection: <code>%s</code>' "$E_WARN" "$E_OK" "$_utl_count" "$sec")
+                    fi
+                    ;;
                 selector) warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
                 url)      warn_txt=$(printf '%s <b>Switch to URL mode?</b>\n\nURL mode: single proxy connection via <code>proxy_string</code>.\nExisting selector/urltest links will be preserved in UCI but inactive.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
                 outbound) warn_txt=$(printf '%s <b>Switch to Outbound mode?</b>\n\nOutbound mode requires editing raw sing-box JSON via LuCI or console.\nBot cannot edit outbound JSON directly.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
                 *)        warn_txt=$(printf '%s Unknown mode: %s' "$E_ERR" "$target_mode") ;;
             esac
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Switch\",\"callback_data\":\"do_switch_mode_${target_mode}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_mode_menu\"}]]}"
+            # For urltest: add clone button when selector has links but urltest is empty
+            local _kb_extra=""
+            if [ "$target_mode" = "urltest" ]; then
+                local _utl_c _sel_c
+                _utl_c=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -c "urltest_proxy_links=")
+                _sel_c=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | grep -c "selector_proxy_links=")
+                if [ "${_utl_c:-0}" -eq 0 ] && [ "${_sel_c:-0}" -gt 0 ]; then
+                    _kb_extra="[{\"text\":\"${E_RST} Clone ${_sel_c} links from Selector first\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+                fi
+            fi
+            kb="{\"inline_keyboard\":[${_kb_extra}[{\"text\":\"${E_OK} Yes, Switch\",\"callback_data\":\"do_switch_mode_${target_mode}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_mode_menu\"}]]}"
             send_or_edit "$mid" "$warn_txt" "$kb"
             ;;
 
@@ -4074,15 +3130,22 @@ _handle_section_extras() {
     case "$cmd" in
         "urltest_settings")
             rm -f "$STATE_FILE"
-            local ut_url ut_interval ut_tol ut_links_count
+            local ut_url ut_interval ut_tol ut_links_count sel_links_count
             ut_url=$(uci -q get podkop.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
             ut_interval=$(uci -q get podkop.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
             ut_tol=$(uci -q get podkop.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
             ut_links_count=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -c "urltest_proxy_links=")
+            sel_links_count=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | grep -c "selector_proxy_links=")
+            local _clone_btn=""
+            [ "${sel_links_count:-0}" -gt 0 ] && \
+                _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+            local _links_hint=""
+            [ "${ut_links_count:-0}" -eq 0 ] && \
+                _links_hint="\n${E_ERR} <b>Empty — podkop will abort in URLTest mode!</b>"
             send_or_edit "$mid" \
-                "$(printf '%s <b>URLTest Settings</b> [<code>%s</code>]\n\n<b>Testing URL:</b>\n<code>%s</code>\n\n<b>Check Interval:</b> <code>%s</code>\n<i>How often sing-box tests proxies. Format: 3m, 180s, 1h</i>\n\n<b>Tolerance:</b> <code>%s ms</code>\n<i>Max latency diff to switch proxies. Lower = more switching.</i>\n\n<b>Proxy Links:</b> %s entries' \
-                    "$E_TGT" "$sec" "$ut_url" "$ut_interval" "$ut_tol" "$ut_links_count")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_EDIT} Testing URL\",\"callback_data\":\"cmd_set_ut_url\"},{\"text\":\"${E_EDIT} Interval\",\"callback_data\":\"cmd_set_ut_interval\"}],[{\"text\":\"${E_EDIT} Tolerance\",\"callback_data\":\"cmd_set_ut_tolerance\"},{\"text\":\"${E_GLOB} Proxy Links\",\"callback_data\":\"urltest_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
+                "$(printf '%s <b>URLTest Settings</b> [<code>%s</code>]\n\n<b>Testing URL:</b>\n<code>%s</code>\n\n<b>Check Interval:</b> <code>%s</code>\n<i>How often sing-box tests proxies. Format: 3m, 180s, 1h</i>\n\n<b>Tolerance:</b> <code>%s ms</code>\n<i>Max latency diff to switch proxies. Lower = more switching.</i>\n\n<b>Proxy Links:</b> %s entries%b' \
+                    "$E_TGT" "$sec" "$ut_url" "$ut_interval" "$ut_tol" "$ut_links_count" "$_links_hint")" \
+                "{\"inline_keyboard\":[${_clone_btn}[{\"text\":\"${E_EDIT} Testing URL\",\"callback_data\":\"cmd_set_ut_url\"},{\"text\":\"${E_EDIT} Interval\",\"callback_data\":\"cmd_set_ut_interval\"}],[{\"text\":\"${E_EDIT} Tolerance\",\"callback_data\":\"cmd_set_ut_tolerance\"},{\"text\":\"${E_GLOB} Proxy Links\",\"callback_data\":\"urltest_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
             ;;
 
         "cmd_set_ut_url")
@@ -4244,6 +3307,40 @@ EOF
             kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_utl_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"urltest_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
             send_or_edit "$mid" "$(printf '%s <b>URLTest Proxy Links</b> [<code>%s</code>]\n<b>Total:</b> %s\n\n%s\n\n<i>Tap [%s] to remove a link.</i>' \
                 "$E_GLOB" "$sec" "$total" "$list_text" "${E_DEL}")" "$kb"
+            ;;
+
+        "cmd_clone_sel_to_utl")
+            # Clone all selector_proxy_links into urltest_proxy_links.
+            # Appends to existing urltest links (does not overwrite).
+            local _sel_raw _added=0 _skipped=0 _link _existing_utl
+            _sel_raw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+            if [ -z "$_sel_raw" ]; then
+                send_or_edit "$mid" "$(printf '%s Selector Proxy Links is empty — nothing to clone.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
+                return
+            fi
+            eval "set -- $_sel_raw"
+            for _link in "$@"; do
+                [ -z "$_link" ] && continue
+                # Skip duplicates
+                _existing_utl=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null)
+                if printf '%s' "$_existing_utl" | grep -qF "'${_link}'"; then
+                    _skipped=$((_skipped + 1))
+                else
+                    uci add_list podkop.${sec}.urltest_proxy_links="$_link"
+                    _added=$((_added + 1))
+                fi
+            done
+            uci_commit_safe podkop
+            build_tag_name_cache
+            local _result
+            if [ "$_skipped" -gt 0 ]; then
+                _result=$(printf '%s <b>Cloned %s link(s)</b> from Selector.\n<i>%s duplicate(s) skipped.</i>' "$E_OK" "$_added" "$_skipped")
+            else
+                _result=$(printf '%s <b>Cloned %s link(s)</b> from Selector.' "$E_OK" "$_added")
+            fi
+            send_or_edit "$mid" "$_result" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_GLOB} View URLTest Links\",\"callback_data\":\"urltest_links_menu\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
         "cmd_utl_add")
@@ -6172,6 +5269,7 @@ handle_command() {
 
         urltest_settings|cmd_set_ut_url|cmd_set_ut_interval|cmd_set_ut_tolerance|\
         urltest_links_menu|urltest_links_p_*|cmd_utl_add|ask_del_utl_*|do_del_utl_*|\
+        cmd_clone_sel_to_utl|\
         cmd_set_mixed_port|cmd_set_outbound_iface|\
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
         badwan_details|cmd_set_bw_ifaces|cmd_set_bw_delay)
@@ -6232,7 +5330,7 @@ BOT_PID_FILE="/tmp/podkop_bot.pid"
 if [ -f "$BOT_PID_FILE" ]; then
     _old_pid=$(cat "$BOT_PID_FILE" 2>/dev/null)
     if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-        logger -t podkop-bot "[Startup] Killing stale instance PID=${_old_pid}"
+        logger -t podkop-bot "[Startup] Stopping previous instance (PID: ${_old_pid})"
         kill "$_old_pid" 2>/dev/null; sleep 1
         kill -9 "$_old_pid" 2>/dev/null
     fi
