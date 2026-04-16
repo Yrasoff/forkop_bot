@@ -15,27 +15,33 @@
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
 #
 # CHANGELOG v0.13.89:
-# - FIXED: Proxy delete (ask_del_px_*) never worked when UCI_LINKS_CACHE lookup
-#          failed. Fallback path used get_uri_by_tag() which returns a TRUNCATED
-#          URI (uuid@host:port only, no query params / flow / security fields).
-#          uci del_list requires an EXACT string match — truncated URI never
-#          matched the full original link in selector_proxy_links → silent no-op.
-#          New fallback: extract server:port from cached URI, then scan
-#          UCI_LINKS_CACHE and selector_proxy_links directly for the full
-#          original link containing that server:port. Falls back through
-#          3 levels: (1) tag index → cache, (2) server:port grep in cache file,
-#          (3) server:port scan of live uci show output.
-# - FIXED: Test All (cmd_all_delay_test) replaced the proxy card with a loading
-#          message, causing visual jump: card disappears, then reappears.
-#          Now sends a SEPARATE status message below the card (sendMessage, not
-#          edit), deletes it when done, then refreshes the card inline via
-#          proxy_menu_p_${page}. Card stays visible throughout.
-#          Also: page variable now passed to refresh so pagination is preserved.
-#          Also: mktemp failure now handled cleanly (delete status + return).
-# - FIXED: Refresh button (proxy_menu_p_N): clash_request could return empty on
-#          slow sing-box response, immediately showing "Clash API Unavailable"
-#          error. Added one automatic retry with 2s delay. Error message updated
-#          with hint "sing-box may be restarting" and a Retry button.
+# - FIXED: Proxy delete (ask_del_px_*) — root cause identified and fixed.
+#          get_selector_link_by_index(tag_idx) assumed "main-N-out" tag == UCI
+#          list position N-1. This is false: after any add/remove the tag
+#          numbering in sing-box config.json diverges from UCI list order.
+#          Wrong index → wrong link → uci del_list silently deleted a DIFFERENT
+#          proxy or nothing. Tag index step removed entirely.
+#          New approach: always match by server:port from TAG_URI_CACHE
+#          (order-independent, unique per outbound). Two fallback levels:
+#          (1) grep in UCI_LINKS_CACHE, (2) live uci show scan.
+#          Covers all protocol types: vless, hy2, trojan, tuic, ss+auth,
+#          ss-no-auth (no @ in URI). Error message now returns to px_view_N
+#          instead of proxy_menu.
+# - FIXED: extract_server_port_from_uri() failed on ss no-auth format
+#          "ss://host:port" (no @ present). Old regex required @ in URI.
+#          New regex handles both: with-auth scheme://user@host:port and
+#          no-auth scheme://host:port. Affects all server:port matching.
+# - FIXED: test_px_ (Test button in proxy card) replaced the card with
+#          a loading message, causing visual jump: card disappears → reappears.
+#          Now sends a separate status message below the card, keeps card
+#          visible throughout, deletes status message when done.
+# - FIXED: cmd_all_delay_test same jump issue — already fixed in this version,
+#          now also preserves current page number in refresh call.
+# - FIXED: Refresh button (proxy_menu_p_N) appeared frozen for ~10s with no
+#          feedback. Now shows inline loading indicator immediately by editing
+#          the card to "Refreshing..." before the clash_request call.
+#          Also: retry logic on empty response + better error message with
+#          Retry button.
 #
 # CHANGELOG v0.13.88:
 # - FIXED: clash_request() missing --max-time on all curl calls. connect-timeout 3
@@ -2385,8 +2391,8 @@ format_proxy_delay_status() {
     [ -z "$delay" ] || [ "$delay" = "0" ] || [ "$delay" = "N/A" ] && { printf '%s Offline' "$E_RED"; return; }
     case "$delay" in
         ''|*[!0-9]*) printf '%s Unknown' "$E_YLW" ;;
-        *) if   [ "$delay" -lt 150 ]; then printf '%s Healthy'      "$E_ON"
-           elif [ "$delay" -lt 300 ]; then printf '%s Slow'         "$E_YLW"
+        *) if   [ "$delay" -lt 300 ]; then printf '%s Healthy'      "$E_ON"
+           elif [ "$delay" -lt 400 ]; then printf '%s Slow'         "$E_YLW"
            else                            printf '%s High Latency' "$E_RED"; fi ;;
     esac
 }
@@ -2409,8 +2415,8 @@ build_proxy_list_label() {
 
     if [ -n "$delay_raw" ] && [ "$delay_raw" != "0" ]; then
         delay_txt="${delay_raw}ms"
-        if   [ "$delay_raw" -lt 150 ]; then icon="${E_ON}"
-        elif [ "$delay_raw" -lt 300 ]; then icon="${E_YLW}"
+        if   [ "$delay_raw" -lt 300 ]; then icon="${E_ON}"
+        elif [ "$delay_raw" -lt 400 ]; then icon="${E_YLW}"
         else                                icon="${E_RED}"; fi
     else
         delay_txt="N/A"; icon="${E_RED}"
@@ -3100,6 +3106,15 @@ _handle_proxy() {
             page=0
             [ "$cmd" != "proxy_menu" ] && page="${cmd#proxy_menu_p_}"
 
+            # Show inline loading indicator — edit the card in place so user sees
+            # feedback immediately instead of a frozen button for ~10s
+            if [ -n "$mid" ] && [ "$mid" != "0" ]; then
+                edit_message "$mid" \
+                    "$(printf '%s <b>Outbound Selector</b> [<code>%s</code>]\n\n%s <i>Refreshing...</i>' \
+                        "$E_GLOB" "$sec" "$E_TIME")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_TIME} Loading...\",\"callback_data\":\"proxy_menu_p_${page}\"}]]}"
+            fi
+
             proxies=$(clash_request "/proxies")
             # Clash API can be slow on busy routers — retry once before giving up
             if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
@@ -3200,8 +3215,8 @@ _handle_proxy() {
                     ''|0|'0') delay_txt="N/A"; icon="${E_RED}" ;;
                     *)
                         delay_txt="${delay_raw}ms"
-                        if   [ "$delay_raw" -lt 150 ]; then icon="${E_ON}"
-                        elif [ "$delay_raw" -lt 300 ]; then icon="${E_YLW}"
+                        if   [ "$delay_raw" -lt 300 ]; then icon="${E_ON}"
+                        elif [ "$delay_raw" -lt 400 ]; then icon="${E_YLW}"
                         else                                icon="${E_RED}"; fi ;;
                 esac
 
@@ -3342,9 +3357,9 @@ EOF
             case "$p_delay_raw" in
                 ''|0|'0') p_verdict="Offline - no response" ;;
                 *)
-                    if   [ "$p_delay_raw" -lt 100 ]; then p_verdict="${E_ON} Excellent"
-                    elif [ "$p_delay_raw" -lt 200 ]; then p_verdict="${E_ON} Good"
-                    elif [ "$p_delay_raw" -lt 350 ]; then p_verdict="${E_YLW} Acceptable"
+                    if   [ "$p_delay_raw" -lt 150 ]; then p_verdict="${E_ON} Excellent"
+                    elif [ "$p_delay_raw" -lt 300 ]; then p_verdict="${E_ON} Good"
+                    elif [ "$p_delay_raw" -lt 400 ]; then p_verdict="${E_YLW} Acceptable"
                     elif [ "$p_delay_raw" -lt 600 ]; then p_verdict="${E_RED} High latency"
                     else                                  p_verdict="${E_RED} Very high - consider switching"; fi ;;
             esac
@@ -3373,13 +3388,20 @@ EOF
             ;;
 
         "test_px_"*)
-            local p_idx="${cmd#test_px_}" p_name p_name_url proxies selector
+            local p_idx="${cmd#test_px_}" p_name p_name_url proxies selector status_resp status_mid
             proxies=$(clash_request "/proxies"); selector=$(get_selector_tag "$proxies")
             p_name=$(echo "$proxies" | jq -r --arg sel "$selector" --arg idx "$p_idx" \
                 '.proxies[$sel].all[$idx|tonumber] // empty')
-            send_or_edit "$mid" "$(printf '%s Testing %s...' "$E_TIME" "$p_name")" ""
+            # Send separate status message below card — don't replace the card
+            local _tst_payload
+            _tst_payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" \
+                --arg txt "$(printf '%s Testing <b>%s</b>...' "$E_TIME" "$(html_escape "$p_name")")" \
+                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+            status_resp=$(api_request_fast "sendMessage" "$_tst_payload")
+            status_mid=$(printf '%s' "$status_resp" | jq -r '.result.message_id // empty' 2>/dev/null)
             p_name_url=$(echo "$p_name" | jq -rR '@uri')
             clash_request "/proxies/${p_name_url}/delay?timeout=5000&url=http://www.gstatic.com/generate_204" >/dev/null
+            [ -n "$status_mid" ] && delete_message "$status_mid"
             _handle_proxy "px_view_${p_idx}" "$mid" "" ""
             ;;
 
@@ -3411,57 +3433,48 @@ EOF
             ;;
 
         "ask_del_px_"*)
-            local p_idx="${cmd#ask_del_px_}" p_name p_display_name raw_link tag_idx text kb proxies selector
+            local p_idx="${cmd#ask_del_px_}" p_name p_display_name raw_link text kb proxies selector
 
             proxies=$(clash_request "/proxies"); selector=$(get_selector_tag "$proxies")
             p_name=$(echo "$proxies" | jq -r --arg sel "$selector" --arg idx "$p_idx" \
                 '.proxies[$sel].all[$idx|tonumber] // empty')
-            tag_idx=$(get_proxy_index_by_tag "$p_name")
 
-            # Step 1: try direct index lookup in UCI_LINKS_CACHE (most reliable)
-            [ -n "$tag_idx" ] && raw_link=$(get_selector_link_by_index "$tag_idx")
+            # Always find the full original link by server:port matching.
+            # Do NOT use get_selector_link_by_index(tag_idx) — tag format "main-N-out"
+            # assumes sing-box config order == UCI list order, which is false after
+            # any add/remove. Wrong index silently deletes a DIFFERENT proxy.
+            # server:port from TAG_URI_CACHE is unique per outbound and order-independent.
+            local _cached_uri _srv_port _sec
+            _sec=$(get_active_section)
+            _cached_uri=$(get_uri_by_tag "$p_name")
 
-            # Step 2: if cache lookup failed, find by server:port match in selector_proxy_links.
-            # TAG_URI_CACHE builds a truncated URI (uuid@host:port only, no query params/flow).
-            # uci del_list requires an EXACT match — truncated URI never matches.
-            # Instead: extract server:port from the cached URI and find the full original link.
-            if [ -z "$raw_link" ]; then
-                local _cached_uri _srv_port _sec
-                _sec=$(get_active_section)
-                _cached_uri=$(get_uri_by_tag "$p_name")
-                if [ -n "$_cached_uri" ]; then
-                    _srv_port=$(extract_server_port_from_uri "$_cached_uri")
-                    if [ -n "$_srv_port" ] && [ "$_srv_port" != "N/A" ]; then
-                        # Rebuild cache if missing, then search for the full link by server:port.
-                        # Patterns cover:
-                        #   @host:port   — vless, hy2, trojan, tuic, ss+auth
-                        #   ://host:port — ss no-auth (stored without @ in TAG_URI_CACHE)
-                        [ -f "$UCI_LINKS_CACHE" ] || build_uci_links_cache
-                        raw_link=$(grep -m1 \
-                            "@${_srv_port}[/?#]\|@${_srv_port}$\|://${_srv_port}[/?#]\|://${_srv_port}$" \
-                            "$UCI_LINKS_CACHE" 2>/dev/null)
-                        # Also search selector_proxy_links directly if cache still missed
-                        if [ -z "$raw_link" ]; then
-                            local _raw_uci
-                            _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
-                            if [ -n "$_raw_uci" ]; then
-                                eval "set -- $_raw_uci"
-                                for _link in "$@"; do
-                                    case "$_link" in
-                                        *"@${_srv_port}"*|*"@${_srv_port}/"*|*"@${_srv_port}#"*|\
-                                        *"://${_srv_port}"*|*"://${_srv_port}/"*|*"://${_srv_port}#"*)
-                                            raw_link="$_link"; break ;;
-                                    esac
-                                done
-                            fi
+            if [ -n "$_cached_uri" ] && [ "$_cached_uri" != "N/A" ]; then
+                _srv_port=$(extract_server_port_from_uri "$_cached_uri")
+                if [ -n "$_srv_port" ] && [ "$_srv_port" != "N/A" ]; then
+                    [ -f "$UCI_LINKS_CACHE" ] || build_uci_links_cache
+                    raw_link=$(grep -m1 \
+                        "@${_srv_port}[/?#]\|@${_srv_port}$\|://${_srv_port}[/?#]\|://${_srv_port}$" \
+                        "$UCI_LINKS_CACHE" 2>/dev/null)
+                    if [ -z "$raw_link" ]; then
+                        local _raw_uci
+                        _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                        if [ -n "$_raw_uci" ]; then
+                            eval "set -- $_raw_uci"
+                            for _link in "$@"; do
+                                case "$_link" in
+                                    *"@${_srv_port}"*|*"@${_srv_port}/"*|*"@${_srv_port}#"*|\
+                                    *"://${_srv_port}"*|*"://${_srv_port}/"*|*"://${_srv_port}#"*)
+                                        raw_link="$_link"; break ;;
+                                esac
+                            done
                         fi
                     fi
                 fi
             fi
 
             if [ -z "$raw_link" ]; then
-                send_or_edit "$mid" "$(printf '%s Cannot resolve link for deletion.\n<i>Try reloading podkop to rebuild caches.</i>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
+                send_or_edit "$mid" "$(printf '%s <b>Cannot resolve link for deletion.</b>\n<i>Caches may be stale — try Reload Podkop first.</i>' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"px_view_${p_idx}\"}]]}"
                 return
             fi
             printf '%s\n%s\n%s\n' "wait_del_confirm" "$raw_link" "$p_idx" > "$STATE_FILE"
