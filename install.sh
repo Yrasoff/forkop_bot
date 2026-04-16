@@ -9,7 +9,20 @@
 #     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
 #   ash /tmp/install_podkop_bot.sh
 #
-# INSTALLER_VERSION="1.5.0"
+# INSTALLER_VERSION="1.6.0"
+#
+# CHANGELOG v1.6.0:
+# - FIXED: download_file() now uses --connect-timeout 10 --max-time 30 on curl
+#          and -T 15 on wget. BusyBox wget hangs indefinitely without -T when
+#          DNS or network is slow/broken (hit in practice on flaky WAN).
+# - FIXED: cleanup_bot_runtime_files() list now includes /tmp/podkop_bot_active_section,
+#          /tmp/podkop_cl_cache* and /tmp/podkop_pubip_cache.txt — all files the
+#          bot creates on first run that carry section/cache state between versions.
+# - FIXED: validate_socks_url() now rejects port > 65535 (was only checking
+#          digit count, not value). Added awk numeric range check.
+# - IMPROVED: pkg_update() failure is now a warning, not a hard die() — on some
+#             routers with stale feeds the update fails but the package is already
+#             installed. Installer continues with a warning instead of aborting.
 #
 # CHANGELOG v1.5.0:
 # - NEW:  safe_stop_bot now calls cleanup_bot_runtime_files() (Step 5) which
@@ -81,8 +94,10 @@ section() { echo ""; echo "-------------------------------------------"; echo " 
 
 download_file() {
     local url="$1" dest="$2"
-    wget -q -O "$dest" "$url" 2>/dev/null \
-        || curl -s -o "$dest" "$url" 2>/dev/null \
+    # BusyBox wget hangs indefinitely without -T on slow/broken WAN.
+    # curl fallback mirrors the same budget: 10s connect, 30s total.
+    wget -q -T 15 -O "$dest" "$url" 2>/dev/null \
+        || curl -s --connect-timeout 10 --max-time 30 -o "$dest" "$url" 2>/dev/null \
         || die "Failed to download $url — check internet connection."
 }
 
@@ -161,6 +176,9 @@ cleanup_bot_runtime_files() {
         /tmp/podkop_bot_unauth
         /tmp/podkop_bot_last_cmd
         /tmp/podkop_bot_offset
+        /tmp/podkop_bot_active_section
+        /tmp/podkop_bot_last_reload_ts
+        /tmp/podkop_pubip_cache.txt
     "
     local _removed=0
     for _f in $_files; do
@@ -169,14 +187,25 @@ cleanup_bot_runtime_files() {
             _removed=$((_removed + 1))
         fi
     done
+    # Community list cache (TTL-based, must be invalidated on update)
+    rm -f /tmp/podkop_cl_cache.txt /tmp/podkop_cl_cache_ts 2>/dev/null || true
+    # Tag/URI caches (section-specific, may be stale after version change)
+    rm -f /tmp/podkop_tag_uri_cache.txt /tmp/podkop_uci_links_cache.txt 2>/dev/null || true
     # Remove any leftover temp request files
     rm -f /tmp/podkop_req.* /tmp/podkop_bot_update.* /tmp/podkop_updates.* 2>/dev/null || true
+    # Remove pubip refresh lock if somehow stuck
+    rm -rf /tmp/podkop_pubip_refresh.lockdir 2>/dev/null || true
     [ "$_removed" -gt 0 ] && info "Cleaned up ${_removed} runtime files from /tmp."
 }
 
-# Validate socks5[h]://host:port format
+# Validate socks5[h]://host:port — format + port must be 1-65535
 validate_socks_url() {
-    echo "$1" | grep -qE '^socks5h?://[^:]+:[0-9]{1,5}$'
+    local _url="$1"
+    # Basic format check first
+    echo "$_url" | grep -qE '^socks5h?://[^:]+:[0-9]{1,5}$' || return 1
+    # Extract port and validate numeric range
+    local _port; _port=$(echo "$_url" | sed 's|.*:||')
+    awk -v p="$_port" 'BEGIN { exit (p >= 1 && p <= 65535) ? 0 : 1 }'
 }
 
 # ── Check OS ───────────────────────────────────────────────────────────────────
@@ -281,7 +310,10 @@ pkg_install() {
 # ── Install dependencies ───────────────────────────────────────────────────────
 step "Installing dependencies..."
 info "Updating package index..."
-pkg_update
+if ! pkg_update; then
+    warn "Package index update failed — continuing with cached index."
+    warn "If dependency install fails below, run 'opkg update' manually and retry."
+fi
 
 for pkg in curl jq; do
     if pkg_is_installed "$pkg"; then
