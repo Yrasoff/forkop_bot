@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.89
+# Podkop Telegram Bot v0.13.90
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -13,6 +13,25 @@
 # 4. Sub-Function Routing: _handle_proxy / _handle_settings / _handle_lists /
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
+#
+# CHANGELOG v0.13.90:
+# - FIXED: ROOT CAUSE of "tir1" watchdog false-positive nudge loop — diagnosed
+#          via [RouteWrite] + hex dump debug logs added in v0.13.89.
+#          Log showed: route_key_raw='tier1' hex= clean=tir1
+#          Root cause: BusyBox tr on MIPS (AX6000 / MT7986) incorrectly treats
+#          'e' (0x65) as a member of [:space:] character class. This is a known
+#          BusyBox platform bug with POSIX character classes in certain builds.
+#          Effect: tr -d '[:space:]' on "tier1" produced "tir1" (dropped 'e'),
+#          which did not match the case pattern tier1|tier2_* → watchdog fired
+#          IPC nudge every 120s indefinitely, causing continuous RECOVERY_MODE=2
+#          cycles, extra transport resets, and "recover old=unknown" log spam.
+#          Fix: replaced ALL tr -d '[:space:]' with tr -d '\n\r\t ' (explicit
+#          whitespace chars only). Affects 2 watchdog reads + 5 user input
+#          validators + 2 IP fetch cleaners. sed 's/[[:space:]]//g' uses sed's
+#          own regex engine (unaffected) and was left unchanged.
+# - REMOVED: [RouteWrite] debug logger from _write_main_route (was added in
+#          v0.13.89 for diagnosis, now spammed every API call — removed).
+# - REMOVED: [Watchdog] route_key_raw/hex debug logger (same, now resolved).
 #
 # CHANGELOG v0.13.89:
 # - FIXED: Proxy delete (ask_del_px_*) — root cause identified and fixed.
@@ -956,7 +975,7 @@ ${cp_hint}}).
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.89"
+BOT_VERSION="0.13.90"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -1039,8 +1058,6 @@ _write_main_route() {
     local _key="$1" _name="$2"
     printf '%s' "$_name" > "$MAIN_ROUTE_FILE"
     printf '%s' "$_key"  > "$MAIN_ROUTE_KEY_FILE"
-    # DEBUG: log every write to catch tir1 mystery source — remove after diagnosis
-    logger -t podkop-bot "[RouteWrite] key='${_key}' name='${_name}' pid=$$"
 }
 ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
 LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
@@ -2043,12 +2060,12 @@ refresh_public_ip_cache() {
 
     # 1. ipinfo.io — international, plain text IP
     curl -s --connect-timeout 5 --max-time 8 \
-        "https://ipinfo.io/ip" 2>/dev/null | tr -d '[:space:]' > "$f1" &
+        "https://ipinfo.io/ip" 2>/dev/null | tr -d '\n\r\t ' > "$f1" &
     local p1=$!
 
     # 2. ifconfig.me — plain text IP, not blocked in RU
     curl -s --connect-timeout 5 --max-time 8 \
-        "https://ifconfig.me" 2>/dev/null | tr -d '[:space:]' > "$f2" &
+        "https://ifconfig.me" 2>/dev/null | tr -d '\n\r\t ' > "$f2" &
     local p2=$!
 
     # 3. yandex.ru/internet — Russian service, parse IP from JSON in HTML
@@ -2912,7 +2929,7 @@ start_health_daemon() {
                 # If baseline is "up" but bot is already on degraded route,
                 # send IPC up immediately — no transition will fire later.
                 if [ "$curr_socks_state" = "up" ]; then
-                    _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
+                    _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
                     # Nudge if route is NOT a good SOCKS tier (tier1 or tier2_N).
                     # Use negative match to handle unknown values, typos, stale files.
                     case "${_wd_cur_route:-unknown}" in
@@ -2988,10 +3005,7 @@ start_health_daemon() {
             # Throttled to once per 120s to avoid continuous LAST_ROUTE_FAST resets
             # which would cause full discovery every poll cycle (recover old=fail loop).
             if [ "$curr_socks_state" = "up" ] && [ "$curr_sb_state" = "running" ]; then
-                _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '[:space:]')
-                # DEBUG: log hex bytes to catch "tir1" mystery - remove after diagnosis
-                _wd_hex=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-                logger -t podkop-bot "[Watchdog] route_key_raw='$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null)' hex=${_wd_hex} clean=${_wd_cur_route}"
+                _wd_cur_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
                 # Negative match: nudge on anything that is NOT tier1/tier2_*
                 # Handles stale files with typos/old values from previous bot versions.
                 case "${_wd_cur_route:-unknown}" in
@@ -3969,7 +3983,7 @@ _handle_section_extras() {
                 fi ;;
             wait_urltest_interval)
                 delete_message "$mid"
-                local val; val=$(printf '%s' "$text" | tr -d '[:space:]')
+                local val; val=$(printf '%s' "$text" | tr -d '\n\r\t ')
                 if ! echo "$val" | grep -qE '^[0-9]+[smh]$'; then
                     send_message "$(printf '%s Invalid interval. Examples: 3m, 180s, 1h' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
@@ -3980,7 +3994,7 @@ _handle_section_extras() {
                 fi ;;
             wait_urltest_tolerance)
                 delete_message "$mid"
-                local val; val=$(printf '%s' "$text" | tr -d '[:space:]')
+                local val; val=$(printf '%s' "$text" | tr -d '\n\r\t ')
                 if ! echo "$val" | grep -qE '^[0-9]+$'; then
                     send_message "$(printf '%s Invalid value. Enter a number in milliseconds (e.g. 50).' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
@@ -3991,7 +4005,7 @@ _handle_section_extras() {
                 fi ;;
             wait_dr_server)
                 delete_message "$mid"
-                local val; val=$(printf '%s' "$text" | tr -d '\r\n[:space:]')
+                local val; val=$(printf '%s' "$text" | tr -d '\r\n\t ')
                 uci set podkop.${sec}.domain_resolver_dns_server="$val"
                 uci_commit_safe podkop; safe_reload_podkop
                 _handle_section_extras "domain_resolver_settings" "" "" "" ;;
@@ -4003,7 +4017,7 @@ _handle_section_extras() {
                 _handle_section_extras "badwan_details" "" "" "" ;;
             wait_badwan_delay)
                 delete_message "$mid"
-                local val; val=$(printf '%s' "$text" | tr -d '[:space:]')
+                local val; val=$(printf '%s' "$text" | tr -d '\n\r\t ')
                 if ! echo "$val" | grep -qE '^[0-9]+$'; then
                     send_message "$(printf '%s Invalid value. Enter seconds (e.g. 10).' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"badwan_details\"}]]}"
@@ -4014,7 +4028,7 @@ _handle_section_extras() {
                 fi ;;
             wait_mixed_port)
                 delete_message "$mid"
-                local val; val=$(printf '%s' "$text" | tr -d '[:space:]')
+                local val; val=$(printf '%s' "$text" | tr -d '\n\r\t ')
                 if ! echo "$val" | grep -qE '^[0-9]+$' || [ "$val" -lt 1024 ] || [ "$val" -gt 65535 ]; then
                     send_message "$(printf '%s Invalid port. Must be 1024-65535.' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
@@ -4027,7 +4041,7 @@ _handle_section_extras() {
                 fi ;;
             wait_outbound_iface)
                 delete_message "$mid"
-                local val; val=$(printf '%s' "$text" | tr -d '\r\n[:space:]')
+                local val; val=$(printf '%s' "$text" | tr -d '\r\n\t ')
                 if [ -z "$val" ]; then
                     uci delete podkop.${sec}.outbound_interface 2>/dev/null
                 else
@@ -5981,7 +5995,7 @@ EOF
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
             remote_ver=$(curl -s --connect-timeout 5 --max-time 8 \
                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
-                2>/dev/null | tr -d '[:space:]')
+                2>/dev/null | tr -d '\n\r\t ')
             if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")" "$kb"
