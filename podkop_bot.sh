@@ -1053,6 +1053,7 @@ E_RAM=$(printf '\xF0\x9F\x92\xBE')
 E_NET=$(printf '\xF0\x9F\x94\x97')
 E_ON=$(printf '\xF0\x9F\x9F\xA2')
 E_OFF=$(printf '\xE2\x9A\xAA')
+E_SKULL=$(printf '\xF0\x9F\x92\x80')
 E_YLW=$(printf '\xF0\x9F\x9F\xA1')
 E_RED=$(printf '\xF0\x9F\x94\xB4')
 E_PLAY=$(printf '\xE2\x96\xB6')
@@ -5773,7 +5774,7 @@ ${E_INFO} <b>System Information</b>
 <b>YACD:</b> $([ "$y_en" = "1" ] && echo "${E_ON} Enabled - http://${lan_ip}:9090/ui" || echo "${E_OFF} Disabled")
 EOF
 )
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],[{\"text\":\"${E_OFF} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],[{\"text\":\"${E_SKULL} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
