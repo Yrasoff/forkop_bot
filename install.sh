@@ -9,7 +9,14 @@
 #     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
 #   ash /tmp/install_podkop_bot.sh
 #
-# INSTALLER_VERSION="1.6.0"
+# INSTALLER_VERSION="1.7.0"
+#
+# CHANGELOG v1.7.0:
+# - NEW:  Option 4 — full uninstall with double confirmation (type "YES" then
+#         "REMOVE"). Removes: bot binary, init.d script, /etc/config/podkop_bot
+#         (token, chat_id, all settings), all /tmp runtime files.
+#         podkop and sing-box are NOT touched. Useful for clean reinstall or
+#         permanent removal.
 #
 # CHANGELOG v1.6.0:
 # - FIXED: download_file() now uses --connect-timeout 10 --max-time 30 on curl
@@ -348,7 +355,8 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
     echo "  1) Update script from GitHub, keep config  [default]"
     echo "  2) Reinstall with new settings"
     echo "  3) Exit without changes"
-    printf "Enter 1, 2 or 3: "
+    echo "  4) Uninstall bot completely"
+    printf "Enter 1, 2, 3 or 4: "
     read -r CHOICE
     echo ""
     case "$CHOICE" in
@@ -357,6 +365,67 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
             ;;
         3)
             ok "Skipped. Existing config preserved."
+            exit 0
+            ;;
+        4)
+            # ── Uninstall flow ─────────────────────────────────────────────────
+            echo "==========================================="
+            echo "  UNINSTALL podkop_bot"
+            echo "==========================================="
+            echo ""
+            echo "This will remove:"
+            echo "  - Bot binary       : $BOT_PATH"
+            echo "  - Init.d script    : $INIT_PATH"
+            echo "  - UCI config       : /etc/config/${UCI_PKG}"
+            echo "    (bot_token, chat_id, fallback_socks, all settings)"
+            echo "  - All /tmp runtime files"
+            echo ""
+            echo "podkop itself and its config will NOT be touched."
+            echo ""
+            printf "Type YES to confirm uninstall: "
+            read -r UNINSTALL_CONFIRM1
+            if [ "$UNINSTALL_CONFIRM1" != "YES" ]; then
+                ok "Uninstall cancelled."
+                exit 0
+            fi
+            echo ""
+            printf "Are you sure? Type REMOVE to proceed: "
+            read -r UNINSTALL_CONFIRM2
+            if [ "$UNINSTALL_CONFIRM2" != "REMOVE" ]; then
+                ok "Uninstall cancelled."
+                exit 0
+            fi
+            echo ""
+            step "Stopping bot service..."
+            safe_stop_bot
+            if [ -f "$INIT_PATH" ]; then
+                "$INIT_PATH" stop >/dev/null 2>&1
+                "$INIT_PATH" disable >/dev/null 2>&1
+                rm -f "$INIT_PATH"
+                info "Removed $INIT_PATH"
+            fi
+            step "Removing bot binary..."
+            if [ -f "$BOT_PATH" ]; then
+                rm -f "$BOT_PATH"
+                info "Removed $BOT_PATH"
+            fi
+            step "Removing UCI config..."
+            if uci -q get ${UCI_PKG}.settings >/dev/null 2>&1; then
+                uci -q delete ${UCI_PKG} 2>/dev/null || true
+                uci commit ${UCI_PKG} 2>/dev/null || true
+                rm -f /etc/config/${UCI_PKG} 2>/dev/null || true
+                info "Removed /etc/config/${UCI_PKG}"
+            fi
+            step "Cleaning up runtime files..."
+            cleanup_bot_runtime_files
+            echo ""
+            echo "==========================================="
+            echo "  Uninstall complete."
+            echo "==========================================="
+            echo ""
+            echo "podkop and sing-box are untouched and running."
+            echo "To reinstall later, run the installer again."
+            echo ""
             exit 0
             ;;
         1|*)
