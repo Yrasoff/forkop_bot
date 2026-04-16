@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.86
+# Podkop Telegram Bot v0.13.88
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -13,6 +13,59 @@
 # 4. Sub-Function Routing: _handle_proxy / _handle_settings / _handle_lists /
 #    _handle_dns / _handle_bot / _handle_sections
 # 5. Background Health Daemon: TG connectivity + sing-box watchdog
+#
+# CHANGELOG v0.13.88:
+# - FIXED: clash_request() missing --max-time on all curl calls. connect-timeout 3
+#          only covers TCP handshake; if Clash API accepts connection but hangs
+#          on response (sing-box under OOM/high load), watchdog Check D blocked
+#          the entire health cycle indefinitely. Added --max-time 10 to all
+#          4 curl invocations (GET+auth, GET, PUT+auth, PUT).
+# - FIXED: Watchdog probe zombie accumulation at long uptime (30d+).
+#          probe_all_socks_write runs as background & every PROBE_EVERY cycles
+#          (~every 5 min). In BusyBox ash, background subshells stay as zombies
+#          until parent calls wait(). Over a month: ~8640 zombies × (3 curl +
+#          1 ash subshell). Fixed: track _last_probe_pid, call
+#          wait "$_last_probe_pid" before launching the next probe.
+# - FIXED: refresh_public_ip_cache() temp file leaks under RAM pressure.
+#          (a) mktemp for f1/f2/f3 was unchecked — if any failed, lockdir
+#              leaked and curl subshells forked into /dev/null. Now each
+#              mktemp is checked with explicit rollback (rm previous + rm lockdir).
+#          (b) Final mktemp for atomic write also unchecked — same lockdir leak.
+#          (c) mv "$tmp" "$PUBIP_CACHE" could fail (full tmpfs) leaving $tmp
+#              orphaned. Now: mv || { rm -f "$tmp"; ... }.
+# - FIXED: probe_all_socks_write() unchecked mv — temp file leaked if tmpfs
+#          full. Now: mv || rm -f "$_probe_tmp".
+# - FIXED: tier4/tier5 reprobe compound condition bug. Pattern
+#          `_try_socks_tiers || { [...] && _try_curl && ROUTE_KEY=tier3 && ... }`
+#          is ambiguous in some BusyBox ash versions: the && chain inside {...}
+#          after || can fail to assign ROUTE_KEY/ROUTE_NAME before the outer if
+#          tests the result. Replaced with explicit if/elif/else + `[ -n "$ROUTE_KEY" ]`
+#          guard — unambiguous in all POSIX ash implementations.
+# - FIXED: trap missing glob cleanup for orphaned temp files. Added:
+#          /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.*
+#          /tmp/podkop_ip[123].* /tmp/podkop_pubip.*
+#          These files are created mid-cycle and not cleaned if bot receives
+#          SIGKILL (which bypasses trap).
+# - NEW:   Startup stale temp file cleanup: find+stat sweep of /tmp for
+#          all podkop_* temp file patterns older than 60s. Runs once after
+#          singleton guard. Removes orphans from previous SIGKILL'd runs
+#          without racing against a legitimate concurrent process.
+#
+# CHANGELOG v0.13.87:
+# - UX:    Core Settings keyboard redesigned — 2-column layout grouped by theme:
+#          Row 1: Conn type + Proxy mode         (core routing behaviour)
+#          Row 2: Mixed Proxy toggle + Port       (same entity, same row)
+#          Row 3: Outbound iface + DNS            (network routing config)
+#          Row 4: URLTest + Domain Resolver       (per-section extras)
+#          Row 5: YACD + Autostart               (system-level)
+#          Row 6: Disable QUIC + Update interval  (global flags)
+#          Row 7: DL via Proxy + Excl. NTP        (global flags)
+#          Row 8: Bad WAN toggle + Bad WAN Details (same entity, same row)
+#          Row 9: Log level + Back
+#          Card body trimmed: separators instead of verbose multi-line hints,
+#          all state visible at a glance in one compact block.
+#          outbound_iface now read into local var at top of handler (was a
+#          mid-keyboard inline local — inconsistent with other vars).
 #
 # CHANGELOG v0.13.86:
 # - FIXED: Nudge case uses negative match (tier1|tier2_* = good, everything else = nudge).
@@ -874,7 +927,7 @@ ${cp_hint}}).
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.86"
+BOT_VERSION="0.13.88"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -1314,9 +1367,20 @@ _route_request() {
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
                     echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
                     local ROUTE_KEY ROUTE_NAME
-                    # Try tier1+tier2 (SOCKS) first, then tier3 (custom proxy).
-                    # _try_socks_tiers alone misses tier3 (HTTP/SOCKS custom override).
-                    if _try_socks_tiers "$_args" "$_max" "2" ||                        { [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] &&                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2" &&                          ROUTE_KEY="tier3" && ROUTE_NAME="Custom (${_t_custom})"; }; then
+                    # Try SOCKS tiers (tier1+tier2) first.
+                    # Then try tier3 (custom proxy) separately — _try_socks_tiers doesn't cover it.
+                    # NOTE: the compound || {...} pattern is split into sequential if-branches
+                    # to avoid a POSIX ash parsing ambiguity where the inner && chain inside
+                    # {...} can short-circuit in unexpected ways across some BusyBox versions.
+                    if _try_socks_tiers "$_args" "$_max" "2"; then
+                        :
+                    elif [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] && \
+                         _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2"; then
+                        ROUTE_KEY="tier3"; ROUTE_NAME="Custom (${_t_custom})"
+                    else
+                        ROUTE_KEY=""
+                    fi
+                    if [ -n "$ROUTE_KEY" ]; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
@@ -1334,14 +1398,22 @@ _route_request() {
                 ;;
             tier5)
                 # On degraded path (tier5): periodically try SOCKS tiers before using emergency IP.
-                # Without this, bот stays on tier5 forever even after fallback_socks recovers.
+                # Without this, bot stays on tier5 forever even after fallback_socks recovers.
                 local _now _last_reprobe
                 _now=$(date +%s)
                 _last_reprobe=$(cat "$SOCKS_REPROBE_TS_FILE" 2>/dev/null || echo 0)
                 if [ $((_now - _last_reprobe)) -ge 30 ]; then
                     echo "$_now" > "$SOCKS_REPROBE_TS_FILE"
                     local ROUTE_KEY ROUTE_NAME
-                    if _try_socks_tiers "$_args" "$_max" "2" ||                        { [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] &&                          _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2" &&                          ROUTE_KEY="tier3" && ROUTE_NAME="Custom (${_t_custom})"; }; then
+                    if _try_socks_tiers "$_args" "$_max" "2"; then
+                        :
+                    elif [ -n "$_t_custom" ] && [ "$_t_policy" != "direct" ] && \
+                         _try_curl "$_t_ifflag -x $_t_custom" "$_max" "$_args" "2"; then
+                        ROUTE_KEY="tier3"; ROUTE_NAME="Custom (${_t_custom})"
+                    else
+                        ROUTE_KEY=""
+                    fi
+                    if [ -n "$ROUTE_KEY" ]; then
                         LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
                         _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
                         eval "$_rvar=$ROUTE_KEY"
@@ -1349,7 +1421,8 @@ _route_request() {
                         return 0
                     fi
                 fi
-                # Reprobe failed or not yet due — use emergency path
+                # Reprobe failed or not yet due — use emergency path.
+                # Try direct first (may work outside RKN), then hardcoded emergency IPs.
                 [ "$_t_policy" != "socks" ] && \
                 _try_curl "$_t_ifflag" "$_max" "$_args" "3" && {
                     LAST_ROUTE="tier4"; LAST_ROUTE_NAME="Direct"
@@ -1431,7 +1504,6 @@ api_request_fast() {
     fi
     rm -f "$tmp"; return 1
 }
-
 # api_request: alias for api_request_fast (backward compat for non-poll callers)
 api_request() { api_request_fast "$@"; }
 
@@ -1541,9 +1613,9 @@ probe_all_socks_write() {
         logger -t podkop-bot "[SOCKSProbe] tier3 ${_custom} -> ${lat}"
     fi
 
-    local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX)
+    local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
     printf '%b\n' "$out" > "$_probe_tmp"
-    mv "$_probe_tmp" "$SOCKS_PROBE_FILE"
+    mv "$_probe_tmp" "$SOCKS_PROBE_FILE" 2>/dev/null || rm -f "$_probe_tmp"
 }
 
 # api_document: sendDocument — never updates FAST or POLL route state.
@@ -1832,24 +1904,27 @@ delete_message() {
 # ==============================================================================
 
 # Communicate with the local sing-box Clash API (proxy status, delay tests, etc.)
+# --max-time 10: guards against the case where the local Clash API accepts the TCP
+# connection but then hangs on the response (e.g. sing-box under high load, OOM).
+# connect-timeout 3 alone only covers the TCP handshake, not the full transfer.
 clash_request() {
     local endpoint="$1" method="${2:-GET}" data="$3"
     local secret tmp_body
     secret=$(uci -q get podkop.settings.yacd_secret_key)
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
-            curl -s --connect-timeout 3 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
+            curl -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
         else
-            curl -s --connect-timeout 3 "${CLASH_API}${endpoint}"
+            curl -s --connect-timeout 3 --max-time 10 "${CLASH_API}${endpoint}"
         fi
     else
         tmp_body=$(mktemp /tmp/podkop_clash.XXXXXX)
         printf '%s' "$data" > "$tmp_body"
         if [ -n "$secret" ]; then
-            curl -s --connect-timeout 3 -X "$method" -H "Authorization: Bearer ${secret}" \
+            curl -s --connect-timeout 3 --max-time 10 -X "$method" -H "Authorization: Bearer ${secret}" \
                 -H "Content-Type: application/json" -d @"$tmp_body" "${CLASH_API}${endpoint}"
         else
-            curl -s --connect-timeout 3 -X "$method" \
+            curl -s --connect-timeout 3 --max-time 10 -X "$method" \
                 -H "Content-Type: application/json" -d @"$tmp_body" "${CLASH_API}${endpoint}"
         fi
         rm -f "$tmp_body"
@@ -1924,10 +1999,12 @@ refresh_public_ip_cache() {
 
     local t1 t2 t3 f1 f2 f3 winner ts tmp
 
-    # Temp files for parallel fetches
-    f1=$(mktemp /tmp/podkop_ip1.XXXXXX)
-    f2=$(mktemp /tmp/podkop_ip2.XXXXXX)
-    f3=$(mktemp /tmp/podkop_ip3.XXXXXX)
+    # Temp files for parallel fetches.
+    # Create all three before forking — if any mktemp fails, release lock and abort
+    # cleanly instead of leaving a dangling lockdir.
+    f1=$(mktemp /tmp/podkop_ip1.XXXXXX 2>/dev/null) || { rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
+    f2=$(mktemp /tmp/podkop_ip2.XXXXXX 2>/dev/null) || { rm -f "$f1"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
+    f3=$(mktemp /tmp/podkop_ip3.XXXXXX 2>/dev/null) || { rm -f "$f1" "$f2"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
 
     # 1. ipinfo.io — international, plain text IP
     curl -s --connect-timeout 5 --max-time 8 \
@@ -1976,10 +2053,12 @@ refresh_public_ip_cache() {
 
     ts=$(date +%s)
 
-    # Atomic write: write to tmp then rename — prevents torn reads in get_public_ip_display
-    tmp=$(mktemp /tmp/podkop_pubip.XXXXXX)
+    # Atomic write: write to tmp then rename — prevents torn reads in get_public_ip_display.
+    # If mktemp fails here (RAM disk full), release lock and bail — don't corrupt cache.
+    tmp=$(mktemp /tmp/podkop_pubip.XXXXXX 2>/dev/null) || { rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
     printf '%s\n%s\n%s\n' "$ts" "$winner" "$sources" > "$tmp"
-    mv "$tmp" "$PUBIP_CACHE"
+    # mv is atomic on same filesystem (tmpfs→tmpfs). If it fails, rm tmp and release lock.
+    mv "$tmp" "$PUBIP_CACHE" 2>/dev/null || { rm -f "$tmp"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
 
     rm -rf "$PUBIP_REFRESH_LOCK"
     logger -t podkop-bot "[PublicIP] ${winner} (via ${sources})"
@@ -2566,6 +2645,10 @@ start_health_daemon() {
         local sec m_ip m_port admin_payload last_ok_route="tier1"
         # Latency probe runs every PROBE_EVERY cycles (not every cycle — heavier)
         local probe_cycle=0 PROBE_EVERY=5
+        # Track probe background PID to reap it before launching next one.
+        # Without this, probe subshells accumulate as zombies over months of uptime
+        # (one probe every ~5min = ~8640/month, each leaving an ash zombie entry).
+        local _last_probe_pid=""
         # Read hostname once for alert prefixes (multi-router identification)
         local _hn; _hn=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         # Leaf proxy tracking — alert when active proxy changes
@@ -2583,7 +2666,12 @@ start_health_daemon() {
                 # Summary log every PROBE_EVERY cycles instead of per-cycle ok spam
                 _wd_log_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n' || echo "unknown")
                 logger -t podkop-bot "[Watchdog] status: socks=${last_socks_state:-unknown} sb=${last_sb_state:-unknown} route=${_wd_log_route}"
+                # Reap previous probe subshell before launching a new one.
+                # In BusyBox ash, background children become zombies until the parent
+                # calls wait. Over months of uptime these accumulate (one per 5min cycle).
+                [ -n "$_last_probe_pid" ] && wait "$_last_probe_pid" 2>/dev/null
                 probe_all_socks_write &
+                _last_probe_pid=$!
             fi
 
             sec=$(get_active_section)
@@ -3532,7 +3620,7 @@ EOF
         "advanced_settings")
             rm -f "$STATE_FILE"
             local dl quic wan excl_ntp log_lvl interval proxy_mode conn_type mixed_en mixed_port
-            local next_log log_lvl_disp next_int text kb
+            local next_log log_lvl_disp next_int outbound_iface text kb
 
             dl=$(get_uci_bool_emoji "podkop.settings" "download_lists_via_proxy")
             quic=$(get_uci_bool_emoji "podkop.settings" "disable_quic")
@@ -3544,6 +3632,7 @@ EOF
             conn_type=$(uci -q get podkop.${sec}.connection_type || echo "proxy")
             mixed_en=$(get_uci_bool_emoji "podkop.${sec}" "mixed_proxy_enabled")
             mixed_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
+            outbound_iface=$(uci -q get podkop.${sec}.outbound_interface 2>/dev/null || echo "auto")
 
             next_log="info"
             [ "$log_lvl" = "info" ]  && next_log="warn"
@@ -3575,45 +3664,47 @@ EOF
                 *)         conn_hint="" ;;
             esac
 
-            text=$(cat <<EOF
-${E_SET} <b>Core Settings</b> [<code>${sec}</code>]
-
-<b>Connection Type:</b> <code>${conn_type}</code>
-${conn_hint}
-<b>Proxy Mode:</b> <code>${proxy_mode}</code>
-${mode_hint}
-
-<b>Log Level:</b> <code>${log_lvl}</code>
-<b>WAN Monitor:</b> ${wan} <i>restart on WAN change</i>
-<b>Exclude NTP:</b> ${excl_ntp} <i>bypass tunnel for time sync</i>
-<b>Update Freq:</b> ${interval} <i>list auto-update interval</i>
-<b>Mixed Proxy:</b> ${mixed_en} <i>port <code>${mixed_port}</code></i>
-EOF
-)
-            kb="{\"inline_keyboard\":["
-            kb="${kb}[{\"text\":\"Conn: ${conn_type}\",\"callback_data\":\"conn_type_menu\"}],"
-            # Mode button: opens full mode selector (url / selector / urltest / outbound)
-            kb="${kb}[{\"text\":\"${E_TGT} Mode: ${proxy_mode}\",\"callback_data\":\"proxy_mode_menu\"}],"
-            kb="${kb}[{\"text\":\"${dl} DL via Proxy\",\"callback_data\":\"ask_toggle_dl\"}],"
-            kb="${kb}[{\"text\":\"${quic} Disable QUIC\",\"callback_data\":\"ask_toggle_quic\"}],"
-            kb="${kb}[{\"text\":\"${wan} Bad WAN Monitor\",\"callback_data\":\"ask_toggle_wan\"},{\"text\":\"${mixed_en} Mixed Proxy\",\"callback_data\":\"ask_toggle_mixed\"}],"
-            kb="${kb}[{\"text\":\"${E_EDIT} Mixed Port: ${mixed_port}\",\"callback_data\":\"cmd_set_mixed_port\"}],"
-            local outbound_iface; outbound_iface=$(uci -q get podkop.${sec}.outbound_interface 2>/dev/null || echo "auto")
-            kb="${kb}[{\"text\":\"${E_NET} Outbound: ${outbound_iface}\",\"callback_data\":\"cmd_set_outbound_iface\"}],"
-            kb="${kb}[{\"text\":\"${excl_ntp} Exclude NTP\",\"callback_data\":\"ask_toggle_ntp\"}],"
-            kb="${kb}[{\"text\":\"Update: ${interval}\",\"callback_data\":\"set_update_int_${next_int}\"},{\"text\":\"Log: ${log_lvl_disp}\",\"callback_data\":\"set_log_${next_log}\"}],"
-            kb="${kb}[{\"text\":\"${E_NET} DNS\",\"callback_data\":\"dns_settings\"},{\"text\":\"${E_STAT} YACD\",\"callback_data\":\"yacd_settings\"}],"
-            kb="${kb}[{\"text\":\"${E_TGT} URLTest Settings\",\"callback_data\":\"urltest_settings\"}],"
-            kb="${kb}[{\"text\":\"${E_NET} Domain Resolver\",\"callback_data\":\"domain_resolver_settings\"}],"
-            kb="${kb}[{\"text\":\"${E_SCAN} Bad WAN Details\",\"callback_data\":\"badwan_details\"}],"
             local autostart_btn autostart_lbl
             if /etc/init.d/podkop enabled >/dev/null 2>&1; then
                 autostart_btn="${E_ON} Autostart ON"; autostart_lbl="ask_toggle_autostart_off"
             else
                 autostart_btn="${E_OFF} Autostart OFF"; autostart_lbl="ask_toggle_autostart_on"
             fi
-            kb="${kb}[{\"text\":\"${autostart_btn}\",\"callback_data\":\"${autostart_lbl}\"}],"
-            kb="${kb}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
+
+            text=$(cat <<EOF
+${E_SET} <b>Core Settings</b> [<code>${sec}</code>]
+<code>────────────────────</code>
+<b>Connection:</b> <code>${conn_type}</code>  ${conn_hint}
+<b>Mode:</b> <code>${proxy_mode}</code>  ${mode_hint}
+<code>────────────────────</code>
+<b>Mixed Proxy:</b> ${mixed_en} port <code>${mixed_port}</code>
+<b>Outbound iface:</b> <code>${outbound_iface}</code>
+<code>────────────────────</code>
+<b>Log:</b> <code>${log_lvl}</code> | <b>Update:</b> ${interval}
+<b>Bad WAN:</b> ${wan} | <b>Excl. NTP:</b> ${excl_ntp}
+<b>DL via Proxy:</b> ${dl} | <b>Disable QUIC:</b> ${quic}
+EOF
+)
+            # ── Keyboard: 2-column, grouped by theme ────────────────────────────
+            # Row 1: Connection type + Proxy mode  (core routing behaviour)
+            kb="{\"inline_keyboard\":["
+            kb="${kb}[{\"text\":\"Conn: ${conn_type}\",\"callback_data\":\"conn_type_menu\"},{\"text\":\"${E_TGT} Mode: ${proxy_mode}\",\"callback_data\":\"proxy_mode_menu\"}],"
+            # Row 2: Mixed proxy toggle + port editor  (same entity, same row)
+            kb="${kb}[{\"text\":\"${mixed_en} Mixed Proxy\",\"callback_data\":\"ask_toggle_mixed\"},{\"text\":\"${E_EDIT} Port: ${mixed_port}\",\"callback_data\":\"cmd_set_mixed_port\"}],"
+            # Row 3: Outbound interface + DNS  (network routing config)
+            kb="${kb}[{\"text\":\"${E_NET} Outbound: ${outbound_iface}\",\"callback_data\":\"cmd_set_outbound_iface\"},{\"text\":\"${E_NET} DNS\",\"callback_data\":\"dns_settings\"}],"
+            # Row 4: URLTest settings + Domain Resolver  (per-section extras)
+            kb="${kb}[{\"text\":\"${E_TGT} URLTest\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_NET} Resolver\",\"callback_data\":\"domain_resolver_settings\"}],"
+            # Row 5: YACD dashboard + Autostart  (system-level)
+            kb="${kb}[{\"text\":\"${E_STAT} YACD\",\"callback_data\":\"yacd_settings\"},{\"text\":\"${autostart_btn}\",\"callback_data\":\"${autostart_lbl}\"}],"
+            # Row 6: Disable QUIC + Update interval  (global flags, both fire-and-forget toggles)
+            kb="${kb}[{\"text\":\"${quic} Disable QUIC\",\"callback_data\":\"ask_toggle_quic\"},{\"text\":\"Update: ${interval}\",\"callback_data\":\"set_update_int_${next_int}\"}],"
+            # Row 7: Download via proxy + Exclude NTP  (global flags pair 2)
+            kb="${kb}[{\"text\":\"${dl} DL via Proxy\",\"callback_data\":\"ask_toggle_dl\"},{\"text\":\"${excl_ntp} Excl. NTP\",\"callback_data\":\"ask_toggle_ntp\"}],"
+            # Row 8: Bad WAN toggle + Bad WAN Details  (same entity — monitor config)
+            kb="${kb}[{\"text\":\"${wan} Bad WAN\",\"callback_data\":\"ask_toggle_wan\"},{\"text\":\"${E_SCAN} Bad WAN Details\",\"callback_data\":\"badwan_details\"}],"
+            # Row 9: Log level + Back
+            kb="${kb}[{\"text\":\"Log: ${log_lvl_disp}\",\"callback_data\":\"set_log_${next_log}\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5614,7 +5705,7 @@ EOF
                 echo "=== Recent Podkop Syslog (last 80 lines) ==="
                 logread 2>/dev/null | grep -iE 'podkop|sing-box' | tail -80 || echo "logread failed"
             } > "$bf" 2>&1
-            api_document "$bf" "Support Bundle [${hostname}]"
+            api_document "$bf" "Support Bundle [$(html_escape "$hostname")]"
             rm -f "$bf"
             delete_message "$mid"
             _handle_bot "cmd_diagnostics" "" "" ""
@@ -5993,6 +6084,19 @@ printf '%s' "$$" > "$BOT_PID_FILE"
 # Also kill any leftover watchdog subshells by BOT_PATH pattern
 kill $(pgrep -f "$BOT_PATH" 2>/dev/null | grep -v "^$$\$" | grep -v "^$(cat $BOT_PID_FILE 2>/dev/null)\$") 2>/dev/null || true
 
+# Clean up orphaned temp files from a previous run that was killed mid-cycle
+# (SIGKILL bypasses trap — these files are never rm'd by the dying process).
+# Only remove files older than 60s to avoid racing with a concurrent startup.
+find /tmp -maxdepth 1 -name 'podkop_req.*' -o -name 'podkop_updates.*' \
+    -o -name 'podkop_clash.*' -o -name 'podkop_ip[123].*' \
+    -o -name 'podkop_pubip.*' -o -name 'podkop_socks_probe.*' \
+    2>/dev/null | while IFS= read -r _stale; do
+    # mtime check: skip files touched in the last 60s
+    _st_mtime=$(stat -c %Y "$_stale" 2>/dev/null || echo 0)
+    _st_now=$(date +%s)
+    [ $((_st_now - _st_mtime)) -gt 60 ] && rm -f "$_stale"
+done
+
 logger -t podkop-bot "=== Podkop Bot v${BOT_VERSION} Starting ==="
 # Pre-initialize route key file so watchdog nudge logic works from first cycle.
 # Without this, MAIN_ROUTE_KEY_FILE is empty until first api_request_fast succeeds,
@@ -6045,7 +6149,7 @@ EOF
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE" "/tmp/podkop_bot_last_nudge"; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE" "/tmp/podkop_bot_last_nudge"; rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
