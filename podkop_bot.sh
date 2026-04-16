@@ -1039,6 +1039,8 @@ _write_main_route() {
     local _key="$1" _name="$2"
     printf '%s' "$_name" > "$MAIN_ROUTE_FILE"
     printf '%s' "$_key"  > "$MAIN_ROUTE_KEY_FILE"
+    # DEBUG: log every write to catch tir1 mystery source — remove after diagnosis
+    logger -t podkop-bot "[RouteWrite] key='${_key}' name='${_name}' pid=$$"
 }
 ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
 LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
@@ -1110,6 +1112,9 @@ LAST_ROUTE_DOC="unknown"
 RECOVERY_MODE=0
 API_RESPONSE=""
 HEALTH_PID=""
+# Optional toast text for answerCallbackQuery — handlers set this to show a brief
+# popup notification to the user without modifying the card. Cleared after each use.
+CB_ANSWER_TEXT=""
 
 # ==============================================================================
 # SECTION 1: Input Validation & Escaping Helpers
@@ -3109,14 +3114,10 @@ _handle_proxy() {
             page=0
             [ "$cmd" != "proxy_menu" ] && page="${cmd#proxy_menu_p_}"
 
-            # Show inline loading indicator — edit the card in place so user sees
-            # feedback immediately instead of a frozen button for ~10s
-            if [ -n "$mid" ] && [ "$mid" != "0" ]; then
-                edit_message "$mid" \
-                    "$(printf '%s <b>Outbound Selector</b> [<code>%s</code>]\n\n%s <i>Refreshing...</i>' \
-                        "$E_GLOB" "$sec" "$E_TIME")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_TIME} Loading...\",\"callback_data\":\"proxy_menu_p_${page}\"}]]}"
-            fi
+            # Show toast notification via answerCallbackQuery (set in CB_ANSWER_TEXT,
+            # consumed by main loop). Card stays completely unchanged during the request —
+            # no flash, no content replacement, just a brief popup at top of screen.
+            [ "$cmd" != "proxy_menu" ] && CB_ANSWER_TEXT="$(printf '%s Refreshing...' "$E_TIME")"
 
             proxies=$(clash_request "/proxies")
             # Clash API can be slow on busy routers — retry once before giving up
@@ -3315,8 +3316,10 @@ EOF
             for p in $pids; do wait "$p" 2>/dev/null; done
 
             sleep 1; rm -f "$names_file"
-            # Delete the status message, then refresh the card inline
+            # Delete the status message, then refresh the card inline.
+            # Clear CB_ANSWER_TEXT so the internal proxy_menu call doesn't fire another toast.
             [ -n "$status_mid" ] && delete_message "$status_mid"
+            CB_ANSWER_TEXT=""
             _handle_proxy "proxy_menu_p_${page}" "$mid" "" ""
             ;;
 
@@ -6411,8 +6414,10 @@ EOF
             logger -t podkop-bot "Audit: ${audit_str} -> ${text}"
 
             if [ -n "$callback_id" ]; then
+                CB_ANSWER_TEXT=""
                 handle_command "$text" "$CALLBACK_MSG_ID" "$callback_id"
-                answer_callback "$callback_id" ""
+                answer_callback "$callback_id" "$CB_ANSWER_TEXT"
+                CB_ANSWER_TEXT=""
             else
                 # Plain text: pass empty mid so send_or_edit always sends new message
                 # (cannot editMessageText on user's own message, only on bot messages)
