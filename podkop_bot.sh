@@ -620,6 +620,7 @@ api_poll_long() {
             local _prev="$LAST_ROUTE_POLL"
             LAST_ROUTE="$ROUTE_KEY"; LAST_ROUTE_NAME="$ROUTE_NAME"
             LAST_ROUTE_POLL="$ROUTE_KEY"
+            _write_main_route "$ROUTE_KEY" "$ROUTE_NAME"
             [ "$_prev" = "fail" ] && \
                 logger -t podkop-bot "[Transport] Connection recovered. Active route: ${ROUTE_NAME}"
             return 0
@@ -1450,7 +1451,7 @@ extract_server_port_from_uri() {
     # Handles both formats:
     #   with auth:    scheme://user[:pass]@host:port  (vless, hy2, trojan, tuic, ss+auth)
     #   without auth: scheme://host:port              (ss no-auth as stored in TAG_URI_CACHE)
-    sp=$(printf '%s\n' "$clean" | sed -nE 's|^[^:]+://([^@/?]+@)?([^/?#]+).*|\2|p')
+    sp=$(printf '%s\n' "$clean" | sed -n 's|^[^:]*://\([^@/?]*@\)\?\([^/?#]*\).*|\2|p')
     [ -n "$sp" ] && printf '%s' "$sp" || printf 'N/A'
 }
 
@@ -2211,19 +2212,12 @@ _handle_proxy() {
             proxy_mode_cur=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
             auto_hint=""
             if [ "$proxy_mode_cur" = "urltest" ]; then
-                # The URLTest group is a member of the selector — find it
+                # Find the URLTest group that belongs to THIS selector — not globally.
+                # Search only within .proxies[$selector].all[] to avoid cross-section bleed.
                 urltest_group=$(echo "$proxies" | jq -r \
                     --arg sel "$selector" \
-                    '.proxies[$sel].all[]? | select(. as $n | $ENV.proxies | (. // "") | if . != "" then true else false end) | empty' \
-                    2>/dev/null || echo "")
-                # Simpler: find the URLTest-type member of selector's all list
-                urltest_group=$(echo "$proxies" | jq -r \
-                    --arg sel "$selector" \
-                    '[.proxies[$sel].all[]? | select(.? as $n | (.proxies[$n].type? // "") == "URLTest")] | .[0] // empty' \
-                    2>/dev/null || echo "")
-                # Even simpler direct approach
-                urltest_group=$(echo "$proxies" | jq -r \
-                    '.proxies | to_entries[] | select(.value.type == "URLTest") | .key' \
+                    '.proxies[$sel].all[]? as $n |
+                     select(.proxies[$n].type == "URLTest") | $n' \
                     2>/dev/null | head -1)
                 urltest_now=$(echo "$proxies" | jq -r \
                     --arg g "$urltest_group" '.proxies[$g].now // empty' 2>/dev/null)
@@ -2233,15 +2227,18 @@ _handle_proxy() {
                     --arg sel "$selector" '.proxies[$sel].now // empty' 2>/dev/null)
                 if [ "$selector_now" = "$urltest_group" ] || [ -z "$urltest_group" ]; then
                     is_auto_mode="1"
-                    auto_hint=" | <i>Auto: best ping</i>"
+                    auto_hint=" | <i>URLTest: auto-selecting</i>"
                 else
                     is_auto_mode="0"
-                    auto_hint=" | <i>Manual: fixed</i>"
+                    auto_hint=" | <i>Pinned manually</i>"
                 fi
             fi
 
             total=$(echo "$proxies" | jq -r --arg sel "$selector" \
-                '.proxies[$sel].all | length // 0' 2>/dev/null)
+                '[.proxies[$sel].all[]? |
+                  select((.proxies[.].type // "") |
+                    (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance"))
+                ] | length // 0' 2>/dev/null)
 
             total_pages=$(( (total + per_page - 1) / per_page ))
             [ "$total_pages" -eq 0 ] && total_pages=1
@@ -2251,16 +2248,25 @@ _handle_proxy() {
             end_idx=$(( start_idx + per_page ))
             [ "$end_idx" -gt "$total" ] && end_idx="$total"
 
-            # ONE jq call for the entire page: returns TSV name\ttype\tdelay_raw
+            # ONE jq call for the entire page: returns TSV orig_idx\tname\ttype\tdelay_raw
             # Resolves leaf proxy for type/delay (follows Selector->URLTest chains).
             # This replaces 4 jq forks per proxy with a single call — ~10x faster on MIPS.
             # depth counter prevents infinite recursion on cyclic A->B->A proxy references.
+            # Group nodes (URLTest/Selector/Fallback/LoadBalance) are filtered out —
+            # they are internal sing-box routing nodes, not real outbounds to display.
+            # orig_idx is the position in .all[] — used for px_view_N / ask_del_px_N callbacks.
             page_tsv=$(echo "$proxies" | jq -r \
                 --arg sel "$selector" \
-                --argjson s "$start_idx" \
-                --argjson e "$end_idx" \
+                --argjson s 0 \
+                --argjson e 9999 \
                 '
-                .proxies[$sel].all[$s:$e][] as $name |
+                .proxies[$sel].all | to_entries[$s:$e][] |
+                .key as $orig_idx | .value as $name |
+                # Skip internal group nodes — not real proxies
+                select(
+                    (.proxies[$name].type // "") |
+                    (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance")
+                ) |
                 # Walk chain with depth limit (max 5 hops) to guard against cycles
                 def leaf(n; depth):
                     if depth <= 0 then n
@@ -2273,6 +2279,7 @@ _handle_proxy() {
                     end;
                 leaf($name; 5) as $lf |
                 [
+                    ($orig_idx | tostring),
                     $name,
                     (.proxies[$lf].type // .proxies[$lf].adapterType // "Unknown"),
                     ((.proxies[$name].history[-1].delay //
@@ -2280,10 +2287,14 @@ _handle_proxy() {
                 ] | @tsv
                 ' 2>/dev/null)
 
-            rows=""; list_text=""; abs_idx="$start_idx"
+            rows=""; list_text=""; local disp_count=0 disp_idx=0
 
-            while IFS=$(printf '\t') read -r name ptype delay_raw; do
-                [ -z "$name" ] && { abs_idx=$((abs_idx + 1)); continue; }
+            while IFS=$(printf '\t') read -r orig_idx name ptype delay_raw; do
+                [ -z "$name" ] && continue
+                # Paginate by display position (not .all[] index)
+                if [ "$disp_idx" -lt "$start_idx" ]; then disp_idx=$((disp_idx+1)); continue; fi
+                if [ "$disp_idx" -ge "$end_idx" ];   then disp_idx=$((disp_idx+1)); continue; fi
+                local abs_idx="$orig_idx"
 
                 # Delay icon and label
                 case "$delay_raw" in
@@ -2313,7 +2324,7 @@ _handle_proxy() {
                         "$safe_name" "$ptype" "$delay_txt")
                 fi
                 rows="${rows}[{\"text\":\"${short_name}\",\"callback_data\":\"px_view_${abs_idx}\"}],"
-                abs_idx=$((abs_idx + 1))
+                disp_idx=$((disp_idx + 1))
             done <<EOF
 $page_tsv
 EOF
@@ -2334,9 +2345,9 @@ EOF
             # URLTest mode: prepend Auto (best ping) button on its own row
             if [ "$proxy_mode_cur" = "urltest" ] && [ -n "$urltest_group" ]; then
                 if [ "${is_auto_mode:-0}" = "1" ]; then
-                    kb="${kb}[{\"text\":\"${E_SCAN} Auto: best ping  ✓\",\"callback_data\":\"proxy_menu\"}],"
+                    kb="${kb}[{\"text\":\"${E_SCAN} URLTest auto  ✓\",\"callback_data\":\"proxy_menu\"}],"
                 else
-                    kb="${kb}[{\"text\":\"${E_SCAN} Auto: best ping\",\"callback_data\":\"do_px_auto_urltest\"}],"
+                    kb="${kb}[{\"text\":\"${E_SCAN} Switch to URLTest auto\",\"callback_data\":\"do_px_auto_urltest\"}],"
                 fi
             fi
             kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
@@ -5088,10 +5099,13 @@ EOF
             sleep 1
             _bot_basename=$(basename "$BOT_PATH")
             if [ -f "/etc/init.d/podkop_bot" ]; then
+                # Kill current instance by PID before init.d restart to avoid
+                # killall -9 racing with the new instance spawned by procd.
+                local _old_pid=$$
                 /etc/init.d/podkop_bot restart
-                killall -9 "$_bot_basename" 2>/dev/null || true
+                kill -9 "$_old_pid" 2>/dev/null || true
             else
-                killall -9 "$_bot_basename" 2>/dev/null || true
+                kill -9 $$ 2>/dev/null || true
                 sleep 1
                 exec "$BOT_PATH"
             fi
@@ -5245,15 +5259,16 @@ EOF
             _bot_basename=$(basename "$BOT_PATH")
 
             if [ -f "/etc/init.d/podkop_bot" ]; then
-                # procd path: tell procd to restart BEFORE killall.
+                # procd path: tell procd to restart BEFORE kill.
                 # init.d restart communicates with procd via ubus synchronously —
                 # procd queues the restart independently of this process.
-                # Only after ubus call completes do we killall zombies + exit.
+                # Kill by own PID to avoid racing with the new instance.
+                local _upd_pid=$$
                 /etc/init.d/podkop_bot restart
-                killall -9 "$_bot_basename" 2>/dev/null || true
+                kill -9 "$_upd_pid" 2>/dev/null || true
             else
                 # No init.d: kill zombies first, then exec (replaces this process)
-                killall -9 "$_bot_basename" 2>/dev/null || true
+                kill -9 $$ 2>/dev/null || true
                 sleep 1
                 exec "$BOT_PATH"
             fi
