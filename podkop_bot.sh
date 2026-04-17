@@ -1759,6 +1759,11 @@ start_health_daemon() {
         local last_raw_choice="" curr_raw_choice=""
         # Debounce: don't send leaf-change alerts more often than once per 60s
         local last_leaf_alert_ts=0
+        # Track tier1 SOCKS state separately from effective transport state.
+        # Allows alerting when tier1 goes down even if tier2 keeps bot reachable.
+        local last_tier1_state="up"
+        # Track bot route degradation (tier4/tier5) for alert on degrade/recover.
+        local last_bot_route_degraded=0
 
         while true; do
             interval=$(uci -q get podkop_bot.settings.health_interval || echo "60")
@@ -1875,15 +1880,31 @@ start_health_daemon() {
                 if probe_socks_upstream "$m_ip" "$m_port"; then
                     curr_socks_state="up"
                     # Log ok only on state change — suppress per-cycle spam
-                    [ "$last_socks_state" != "up" ] && \
+                    if [ "$last_socks_state" != "up" ] || [ "$last_tier1_state" = "down" ]; then
                         logger -t podkop-bot "[Watchdog] SOCKS proxy reachable (${m_ip}:${m_port})"
+                    fi
+                    # If tier1 was down (bot was on tier2), send recovery alert
+                    if [ "$last_tier1_state" = "down" ]; then
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                            local _rec_txt
+                            _rec_txt=$(printf '<b>[%s]</b> %s <b>Primary SOCKS recovered</b>\n\nBot returning to primary channel.\n\n<b>Back online:</b> <code>%s:%s</code>' \
+                                "$_hn" "$E_OK" "$m_ip" "$m_port")
+                            local _rec_payload
+                            _rec_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_rec_txt" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_rec_payload"
+                        fi
+                    fi
+                    # Reset tier1 tracking so next outage fires a fresh alert
+                    last_tier1_state="up"
                 else
                     # tier1 down — check if any tier2 fallback_socks is reachable.
                     # If so, mark socks=up so IPC "up" fires and bot uses tier2
                     # instead of staying on Direct indefinitely.
                     curr_socks_state="down"
+                    local _tier1_was_up=1  # tier1 specifically down — used for alert
                     logger -t podkop-bot "[Watchdog] SOCKS proxy unreachable (${m_ip}:${m_port})"
-                    local _fb_raw _fb _fb_ok=0
+                    local _fb_raw _fb _fb_ok=0 _fb_alive=""
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
                         eval "set -- $_fb_raw"
@@ -1894,10 +1915,27 @@ start_health_daemon() {
                             if probe_socks_upstream "$_fb_ip" "$_fb_port"; then
                                 curr_socks_state="up"
                                 _fb_ok=1
+                                _fb_alive="$_fb"
                                 logger -t podkop-bot "[Watchdog] Primary SOCKS down, fallback ${_fb} is alive."
                                 break
                             fi
                         done
+                    fi
+                    # If tier2 is keeping transport alive, still fire a degraded alert
+                    # so user knows tier1 is down — even though bot itself is still reachable.
+                    if [ "$_fb_ok" = "1" ] && [ "${last_tier1_state:-up}" = "up" ]; then
+                        last_tier1_state="down"
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                            local _deg_txt
+                            _deg_txt=$(printf '<b>[%s]</b> %s <b>Primary SOCKS unavailable</b>\n\nBot switched to fallback channel.\n\n<b>Down:</b> <code>%s:%s</code>\n<b>Fallback:</b> <code>%s</code>\n\n<i>podkop traffic routing may be affected.</i>' \
+                                "$_hn" "$E_WARN" "$m_ip" "$m_port" "$_fb_alive")
+                            local _deg_payload
+                            _deg_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_deg_txt" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_deg_payload"
+                        fi
+                    elif [ "$_fb_ok" = "0" ]; then
+                        last_tier1_state="down"
                     fi
                 fi
             fi
@@ -2048,6 +2086,54 @@ start_health_daemon() {
                     [ -n "$curr_leaf" ] && last_leaf="$curr_leaf"
                 fi
             fi
+
+            # ------------------------------------------------------------------
+            # Check E: Bot transport route degradation / recovery alert
+            # Fires when bot route drops to tier4 (Direct) or tier5 (Emergency IP)
+            # and when it recovers back to tier1/tier2.
+            # ------------------------------------------------------------------
+            local _wd_bot_route
+            _wd_bot_route=$(cat "$MAIN_ROUTE_KEY_FILE" 2>/dev/null | tr -d '\n\r\t ')
+            case "${_wd_bot_route:-unknown}" in
+                tier1|tier2_*)
+                    # Good route — if previously degraded, send recovery alert
+                    if [ "${last_bot_route_degraded:-0}" = "1" ]; then
+                        last_bot_route_degraded=0
+                        logger -t podkop-bot "[Watchdog] Bot route recovered: ${_wd_bot_route}"
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                            local _route_name
+                            _route_name=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
+                            local _rec_route_txt
+                            _rec_route_txt=$(printf '<b>[%s]</b> %s <b>Bot connection restored</b>\n\n<b>Active route:</b> <code>%s</code>' \
+                                "$_hn" "$E_OK" "$_route_name")
+                            local _rec_route_pl
+                            _rec_route_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_rec_route_txt" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_rec_route_pl"
+                        fi
+                    fi
+                    ;;
+                tier4|tier5)
+                    # Degraded route — alert once per degradation event
+                    if [ "${last_bot_route_degraded:-0}" = "0" ]; then
+                        last_bot_route_degraded=1
+                        logger -t podkop-bot "[Watchdog] Bot route degraded: ${_wd_bot_route}"
+                        if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                            local _route_name _deg_route_txt _deg_route_pl
+                            _route_name=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null || echo "$_wd_bot_route")
+                            case "$_wd_bot_route" in
+                                tier4) _deg_route_txt=$(printf '<b>[%s]</b> %s <b>Bot on Direct connection</b>\n\nAll SOCKS proxies are unreachable.\nBot is connecting to Telegram without a tunnel.\n\n<b>Route:</b> <code>%s</code>\n\n<i>If Telegram is blocked by your ISP, bot may become unavailable.</i>' \
+                                    "$_hn" "$E_ERR" "$_route_name") ;;
+                                tier5) _deg_route_txt=$(printf '<b>[%s]</b> %s <b>Bot on Emergency IPs</b>\n\nAll normal routes failed. Using hardcoded Telegram IPs.\n\n<b>Route:</b> <code>%s</code>' \
+                                    "$_hn" "$E_ERR" "$_route_name") ;;
+                            esac
+                            _deg_route_pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_deg_route_txt" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$_deg_route_pl"
+                        fi
+                    fi
+                    ;;
+            esac
 
             # Per-cycle: if SOCKS is up but bot route is degraded (tier4/tier5/fail),
             # send IPC up every cycle to nudge main loop back to SOCKS discovery.
