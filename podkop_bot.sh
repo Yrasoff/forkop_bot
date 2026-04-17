@@ -141,6 +141,7 @@ E_DEL=$(printf '\xF0\x9F\x97\x91')
 E_KEY=$(printf '\xF0\x9F\x94\x91')
 E_CPU=$(printf '\xF0\x9F\xA7\xA0')
 E_RAM=$(printf '\xF0\x9F\x92\xBE')
+E_PENGUIN=$(printf '\xF0\x9F\x90\xA7')
 E_NET=$(printf '\xF0\x9F\x94\x97')
 E_ON=$(printf '\xF0\x9F\x9F\xA2')
 E_OFF=$(printf '\xE2\x9A\xAA')
@@ -4498,14 +4499,14 @@ EOF
 "
 
             if /etc/init.d/podkop status 2>&1 | grep -qi "running"; then
-                podkop_init_status="${E_OK} RUNNING"
+                podkop_init_status="${E_OK}"
             else
-                podkop_init_status="${E_OK} OK (one-shot)"
+                podkop_init_status="${E_OK} (one-shot)"
             fi
             if /etc/init.d/podkop enabled >/dev/null 2>&1; then
                 podkop_autostart="${E_OK} ENABLED"
             else
-                podkop_autostart="${E_OFF} DISABLED"
+                podkop_autostart="${E_ERR} DISABLED"
             fi
 
             sec=$(get_active_section)
@@ -4550,27 +4551,19 @@ EOF
 ${E_STAT} <b>System & Podkop Status</b>
 <code>────────────────────</code>
 ${E_RTR} <b>${hostname}</b> | ${E_TIME} ${uptime_sys}
-<b>OS:</b> ${os_ver}
-${E_GLOB} WAN iface: <code>${wan_ip}</code>
-${E_GLOB} Public IP: <code>${pub_ip_display}</code>
+${E_PENGUIN} <b>OS:</b> ${os_ver}
+${E_GLOB} WAN: <code>${wan_ip}</code>$([ "$pub_ip_display" != "$wan_ip" ] && printf '  Public: <code>%s</code>' "$pub_ip_display")
 ${E_NET} LAN: <code>${lan_ip}</code>
-${extra_ifs}${E_CPU} Load: <code>${loadavg}</code>
-${E_RAM} Free RAM: <code>${mem_free} MB</code>
+${extra_ifs}${E_CPU} Load: <code>${loadavg}</code>  RAM free: <code>${mem_free} MB</code>
 <code>────────────────────</code>
-${E_SET} <b>Podkop:</b> ${podkop_init_status}
-${E_ON} <b>Autostart:</b> ${podkop_autostart}
-${E_SET} <b>Mode:</b> <code>${podkop_mode_lbl}</code>
-${E_PRX} <b>Sing-box:</b> ${sb_state}
-EOF
-)
-            [ "$sb_ram" != "0" ] && text=$(printf '%s\n%s <b>Sing-box RAM:</b> %s MB' "$text" "$E_RAM" "$sb_ram")
-            text=$(cat <<EOF
-${text}
+${E_SET} Podkop: ${podkop_init_status}  Mode: <code>${podkop_mode_lbl}</code>
+${E_ON} Autostart: ${podkop_autostart}
+${E_PRX} Sing-box: ${sb_state}$([ "$sb_ram" != "0" ] && printf '  RAM: %s MB' "$sb_ram")
 <code>────────────────────</code>
 ${E_GLOB} <b>Active Proxy:</b> <code>${active_proxy_display}</code>
-${E_SCAN} <b>Health:</b> ${health_st}
-${E_NET} <b>DNS:</b> ${strategy} | <b>YACD:</b> $([ "$yacd_en" = "1" ] && echo "${E_ON} ON" || echo "${E_OFF} OFF")
 ${E_SHLD} <b>Bot Route:</b> ${LAST_ROUTE_NAME} (${E_TIME} ${tg_lat})
+${E_SCAN} Telegram: direct ${_h_tgd_icon} | tunnel ${_h_tgt_icon} | SOCKS proxy ${_h_socks_icon}
+${E_NET} DNS: <code>${strategy}</code> | YACD: $([ "$yacd_en" = "1" ] && echo "${E_ON}" || echo "${E_OFF}")
 EOF
 )
             kb="{\"inline_keyboard\":[
