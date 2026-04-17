@@ -1549,6 +1549,23 @@ safe_reload_podkop() {
     logger -t podkop-bot "[Reload] Success"; return 0
 }
 
+# Check podkop tunnel health via fakeip DNS test.
+# Borrowed from podkop_autoupdater (VizzleTF).
+# Returns 0 and sets PODKOP_DNS_OK=1 if tunnel working, PODKOP_DNS_OK=0 if not.
+# Usage: podkop_dns_check [delay_seconds]
+podkop_dns_check() {
+    local delay="${1:-15}" result
+    sleep "$delay"
+    result=$(nslookup -timeout=3 fakeip.podkop.fyi 127.0.0.42 2>&1)
+    if printf '%s' "$result" | grep -q 'Address:.*198\.18\.'; then
+        PODKOP_DNS_OK=1
+        logger -t podkop-bot "[Reload] DNS check passed (fakeip → 198.18.x.x)"
+    else
+        PODKOP_DNS_OK=0
+        logger -t podkop-bot "[Reload] DNS check failed (tunnel may not be routing)"
+    fi
+}
+
 # Stop podkop via init.d with SIGTERM -> SIGKILL escalation for orphaned sing-box
 do_podkop_stop() {
     local rc pid_list
@@ -5232,8 +5249,23 @@ EOF
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
                 return
             fi
-            if [ "$p_ver" != "$latest" ] && \
-               [ "$(printf '%s\n' "$p_ver" "$latest" | sort -V | tail -n1)" = "$latest" ]; then
+            # Compare versions without sort -V (not guaranteed on BusyBox).
+            # Split x.y.z into parts and compare numerically.
+            local _upd=0
+            if [ "$p_ver" != "$latest" ]; then
+                local _p1 _p2 _p3 _l1 _l2 _l3
+                _p1=$(printf '%s' "$p_ver" | cut -d. -f1)
+                _p2=$(printf '%s' "$p_ver" | cut -d. -f2)
+                _p3=$(printf '%s' "$p_ver" | cut -d. -f3)
+                _l1=$(printf '%s' "$latest" | cut -d. -f1)
+                _l2=$(printf '%s' "$latest" | cut -d. -f2)
+                _l3=$(printf '%s' "$latest" | cut -d. -f3)
+                if   [ "${_l1:-0}" -gt "${_p1:-0}" ]; then _upd=1
+                elif [ "${_l1:-0}" -eq "${_p1:-0}" ] && [ "${_l2:-0}" -gt "${_p2:-0}" ]; then _upd=1
+                elif [ "${_l1:-0}" -eq "${_p1:-0}" ] && [ "${_l2:-0}" -eq "${_p2:-0}" ] && [ "${_l3:-0}" -gt "${_p3:-0}" ]; then _upd=1
+                fi
+            fi
+            if [ "$_upd" = "1" ]; then
                 text=$(cat <<EOF
 ${E_NEW} <b>Update Available!</b>
 
@@ -5387,8 +5419,17 @@ EOF
             send_or_edit "$mid" "$(printf '%s Reloading...' "$E_RST")" ""
             safe_reload_podkop; rc=$?
             case "$rc" in
-                0) sleep 1; send_or_edit "$mid" "$(printf '%s Reloaded!' "$E_OK")" \
-                       "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                0)
+                    send_or_edit "$mid" "$(printf '%s Reloaded. Checking tunnel...' "$E_RST")" ""
+                    podkop_dns_check 15
+                    if [ "${PODKOP_DNS_OK:-0}" = "1" ]; then
+                        send_or_edit "$mid" "$(printf '%s Reloaded.\n%s Tunnel OK — traffic is routing.' "$E_OK" "$E_OK")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                    else
+                        send_or_edit "$mid" "$(printf '%s Reloaded.\n%s Tunnel check failed — podkop may not be routing traffic.' "$E_OK" "$E_WARN")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                    fi
+                    ;;
                 1) send_or_edit "$mid" "$(printf '%s Cooldown active (10s).' "$E_WARN")" \
                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
                 *) send_or_edit "$mid" "$(printf '%s Reload failed!' "$E_ERR")" \
