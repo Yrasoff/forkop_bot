@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.90
+# Podkop Telegram Bot v0.13.92
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -18,7 +18,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.90"
+BOT_VERSION="0.13.92"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -1348,22 +1348,25 @@ get_selector_tag() {
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
     tag=$(printf '%s' "$proxies" | jq -r --arg s "$sec" \
         'if .proxies[$s] then $s
-         else (.proxies | to_entries | map(select(.value.type=="Selector" and .key!="GLOBAL"))
-               | sort_by(.value.all|length) | last | .key // ($s+"-out"))
+         elif .proxies[$s + "-out"] then ($s + "-out")
+         else (.proxies | to_entries
+               | map(select(
+                   (.value.type == "Selector" or .value.type == "URLTest")
+                   and (.key | startswith($s))
+                 ))
+               | sort_by(.value.all | length) | last | .key // ($s + "-out"))
          end' 2>/dev/null)
     echo "${tag:-${sec}-out}"
 }
 
 get_active_proxy_name() {
-    local proxies="$1" sel
+    local proxies="$1" sel now
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
     sel=$(get_selector_tag "$proxies")
-    printf '%s' "$proxies" | jq -r --arg sel "$sel" '
-        .proxies[$sel].now as $n1 |
-        if .proxies[$n1].type == "Selector" then
-            .proxies[$n1].now as $n2 |
-            if .proxies[$n2].type == "Selector" then .proxies[$n2].now else $n2 end
-        else $n1 end // "Unknown"' 2>/dev/null || echo "Unknown"
+    now=$(printf '%s' "$proxies" | jq -r --arg sel "$sel" '.proxies[$sel].now // empty' 2>/dev/null)
+    [ -z "$now" ] && { echo "Unknown"; return 0; }
+    # Resolve through any chain of Selector/URLTest/Fallback groups
+    _resolve_leaf "$now" "$proxies"
 }
 
 _resolve_leaf() {
@@ -1751,6 +1754,8 @@ start_health_daemon() {
         local _hn; _hn=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
         # Leaf proxy tracking — alert when active proxy changes
         local last_leaf="" curr_leaf=""
+        # raw_choice = Clash API .now field — changes only on manual selection
+        local last_raw_choice="" curr_raw_choice=""
         # Debounce: don't send leaf-change alerts more often than once per 60s
         local last_leaf_alert_ts=0
 
@@ -1987,8 +1992,8 @@ start_health_daemon() {
 
             # ------------------------------------------------------------------
             # Check D: Active proxy leaf change (selector/urltest switch)
-            # Fires alert when sing-box auto-switches to a different proxy.
-            # Only runs when sing-box is running and Clash API is available.
+            # Distinguishes manual switch (user action) from auto-switch (URLTest).
+            # Tracks curr_raw_choice (.now field) — changes only on manual action.
             # ------------------------------------------------------------------
             if [ "$curr_sb_state" = "running" ]; then
                 local _wd_proxies _wd_sel _wd_leaf_raw _wd_leaf_type
@@ -1998,14 +2003,15 @@ start_health_daemon() {
                     _wd_leaf_raw=$(echo "$_wd_proxies" | jq -r --arg s "$_wd_sel" \
                         '.proxies[$s].now // empty' 2>/dev/null)
                     if [ -n "$_wd_leaf_raw" ]; then
+                        curr_raw_choice="$_wd_leaf_raw"
                         curr_leaf=$(_resolve_leaf "$_wd_leaf_raw" "$_wd_proxies")
-                        # Only accept fully-resolved leaf (not a group/URLTest node)
                         _wd_leaf_type=$(echo "$_wd_proxies" | jq -r \
                             --arg n "$curr_leaf" '.proxies[$n].type // empty' 2>/dev/null)
                         case "$_wd_leaf_type" in
                             Selector|URLTest|Fallback|LoadBalance) curr_leaf="" ;;
                         esac
                     else
+                        curr_raw_choice=""
                         curr_leaf=""
                     fi
                     if [ -n "$curr_leaf" ] && [ -n "$last_leaf" ] && \
@@ -2013,22 +2019,31 @@ start_health_daemon() {
                         local old_disp new_disp _now_ts
                         old_disp=$(display_proxy_name "$last_leaf")
                         new_disp=$(display_proxy_name "$curr_leaf")
-                        logger -t podkop-bot "[Watchdog] Active proxy changed: ${last_leaf} → ${curr_leaf}"
                         _now_ts=$(date +%s)
                         if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ] && \
                            [ $((_now_ts - last_leaf_alert_ts)) -ge 60 ]; then
                             last_leaf_alert_ts=$_now_ts
-                            local leaf_txt _mode
-                            _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "unknown")
-                            leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy auto-switched</b>\n\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n\n<i>%s selected a faster server. No interruption expected.</i>' \
-                                "$_hn" "$E_TGT" "$old_disp" "$new_disp" \
-                                "$([ "$_mode" = "urltest" ] && echo "URLTest" || echo "Selector")")
+                            local leaf_txt
+                            if [ "$curr_raw_choice" != "$last_raw_choice" ]; then
+                                # .now changed → manual selection (bot button or LuCI)
+                                logger -t podkop-bot "[Watchdog] Active proxy changed manually: ${last_leaf} → ${curr_leaf}"
+                                leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy manually switched</b>\n\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n\n<i>Active outbound was changed manually.</i>' \
+                                    "$_hn" "$E_TGT" "$old_disp" "$new_disp")
+                            else
+                                # .now unchanged → URLTest picked a faster server
+                                local _mode
+                                _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "unknown")
+                                logger -t podkop-bot "[Watchdog] Active proxy auto-switched: ${last_leaf} → ${curr_leaf}"
+                                leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy auto-switched</b>\n\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n\n<i>%s selected a faster server. No interruption expected.</i>' \
+                                    "$_hn" "$E_TGT" "$old_disp" "$new_disp" \
+                                    "$([ "$_mode" = "urltest" ] && echo "URLTest" || echo "Selector")")
+                            fi
                             admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
                                 '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                             send_health_alert "$admin_payload"
                         fi
                     fi
-                    # Only store fully-resolved leaf to avoid group tags as baseline
+                    [ -n "$curr_raw_choice" ] && last_raw_choice="$curr_raw_choice"
                     [ -n "$curr_leaf" ] && last_leaf="$curr_leaf"
                 fi
             fi
@@ -2166,10 +2181,14 @@ _handle_proxy() {
             page=0
             [ "$cmd" != "proxy_menu" ] && page="${cmd#proxy_menu_p_}"
 
-            # Show toast notification via answerCallbackQuery (set in CB_ANSWER_TEXT,
-            # consumed by main loop). Card stays completely unchanged during the request —
-            # no flash, no content replacement, just a brief popup at top of screen.
-            [ "$cmd" != "proxy_menu" ] && CB_ANSWER_TEXT="$(printf '%s Refreshing...' "$E_TIME")"
+            # Answer callback immediately — before clash_request which can take 2-3s.
+            # Telegram times out callback queries in ~5s; answering early removes the
+            # spinner from the button and shows the toast before any heavy work starts.
+            # Sets CB_ANSWER_TEXT="__ANSWERED__" to signal main loop not to answer again.
+            if [ -n "$cb_id" ] && [ "$cmd" != "proxy_menu" ]; then
+                answer_callback "$cb_id" "$(printf '%s Refreshing...' "$E_TIME")"
+                CB_ANSWER_TEXT="__ANSWERED__"
+            fi
 
             proxies=$(clash_request "/proxies")
             # Clash API can be slow on busy routers — retry once before giving up
@@ -2321,8 +2340,13 @@ EOF
                 fi
             fi
             kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
+            local _card_title
+            case "$proxy_mode_cur" in
+                urltest) _card_title="${E_TGT} <b>URLTest Outbounds</b>" ;;
+                *)       _card_title="${E_GLOB} <b>Outbound Selector</b>" ;;
+            esac
             text=$(cat <<EOF
-${E_GLOB} <b>Outbound Selector</b> [<code>${sec}</code>]
+${_card_title} [<code>${sec}</code>]
 <b>Active:</b> <code>${current_proxy_display}</code>${auto_hint}
 
 ${list_text}
@@ -2709,15 +2733,13 @@ EOF
                 nav_row="[{\"text\":\"< Prev\",\"callback_data\":\"${prev_cb}\"},{\"text\":\"$((page+1))/${total_pages}\",\"callback_data\":\"url_links_p_${page}\"},{\"text\":\"Next >\",\"callback_data\":\"${next_cb}\"}],"
             fi
 
-            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Add Link\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             text=$(cat <<EOF
-${E_GLOB} <b>URL Links</b> [<code>${sec}</code>]
-<b>Total:</b> ${total} link(s)
-${E_IDEA} <i>Stored in <code>proxy_string</code> — one URL per line.</i>
+${E_GLOB} <b>Single URL Proxy</b> [<code>${sec}</code>]
 
 ${list_text}
 
-<i>Tap [${E_DEL}] next to a link to remove it.</i>
+<i>Tap [${E_DEL}] to remove the current URL. Use Set URL to replace it.</i>
 EOF
 )
             send_or_edit "$mid" "$text" "$kb"
@@ -2726,7 +2748,7 @@ EOF
         "cmd_url_link_add")
             echo "wait_url_link" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Send outbound link.</b>\n<i>(vless, hy2, hysteria2, ss, trojan, vmess, tuic)</i>\n\nOne link per message.' "$E_EDIT")" \
+                "$(printf '%s <b>Set Single URL Proxy</b>\n\nSend the proxy link:\n<i>(vless://, hy2://, ss://, trojan://, vmess://, tuic://)</i>\n\nThis replaces any existing URL.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"url_links_menu\"}]]}"
             ;;
 
@@ -2937,7 +2959,14 @@ EOF
                     fi
                     ;;
                 selector) warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
-                url)      warn_txt=$(printf '%s <b>Switch to URL mode?</b>\n\nURL mode: single proxy connection via <code>proxy_string</code>.\nExisting selector/urltest links will be preserved in UCI but inactive.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                url)
+                    local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+                    if [ -z "$_ps" ]; then
+                        warn_txt=$(printf '%s <b>Switch to URL mode?</b>\n\n%s <b>No proxy URL configured!</b>\nIf you switch without setting a URL first, podkop will crash on reload.\n\n<b>You will be prompted to enter the URL immediately after confirming.</b>\n\nSection: <code>%s</code>' "$E_WARN" "$E_ERR" "$sec")
+                    else
+                        warn_txt=$(printf '%s <b>Switch to URL mode?</b>\n\nURL mode: single proxy via <code>proxy_string</code>.\nExisting selector/urltest links are preserved but inactive.\n\nCurrent URL: <code>%s</code>\n\nSection: <code>%s</code>' "$E_WARN" "$_ps" "$sec")
+                    fi
+                    ;;
                 outbound) warn_txt=$(printf '%s <b>Switch to Outbound mode?</b>\n\nOutbound mode requires editing raw sing-box JSON via LuCI or console.\nBot cannot edit outbound JSON directly.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
                 *)        warn_txt=$(printf '%s Unknown mode: %s' "$E_ERR" "$target_mode") ;;
             esac
@@ -2959,6 +2988,21 @@ EOF
 
         "do_switch_mode_"*)
             local target_mode="${cmd#do_switch_mode_}"
+            # Safety: switching to URL mode without a proxy_string kills podkop.
+            # Delay reload — save the mode, ask for the URL first.
+            if [ "$target_mode" = "url" ]; then
+                local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+                if [ -z "$_ps" ]; then
+                    uci set podkop.${sec}.proxy_config_type="url"
+                    uci_commit_safe podkop
+                    echo "wait_url_link" > "$STATE_FILE"
+                    send_or_edit "$mid" \
+                        "$(printf '%s <b>URL mode set.</b>\n\n%s <b>Reload is held</b> until you send a proxy URL.\nSend the link now (vless://, hy2://, trojan://, ss://, ...).\n\nTo cancel and revert to Selector, tap the button below.' \
+                            "$E_WARN" "$E_ERR")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel — revert to Selector\",\"callback_data\":\"do_switch_mode_selector\"}]]}"
+                    return
+                fi
+            fi
             uci set podkop.${sec}.proxy_config_type="$target_mode"
             uci_commit_safe podkop
             send_or_edit "$mid" "$(printf '%s Applying mode switch to <code>%s</code>...' "$E_RST" "$target_mode")" ""
@@ -4279,7 +4323,7 @@ _handle_bot() {
                 _stop_start="{\"text\":\"${E_ON} Start Podkop\",\"callback_data\":\"cmd_start\"}"
 
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
             # Pass cached proxies to avoid extra clash_request
             local proxies; proxies=$(clash_request "/proxies")
@@ -4309,7 +4353,7 @@ EOF
             local proxy_btn_lbl proxy_btn_cb
             case "$cur_pct" in
                 urltest)  proxy_btn_lbl="${E_GLOB} Outbounds";      proxy_btn_cb="proxy_menu" ;;
-                url)      proxy_btn_lbl="${E_GLOB} URL Links";      proxy_btn_cb="url_links_menu" ;;
+                url)      proxy_btn_lbl="${E_GLOB} Single URL";      proxy_btn_cb="url_links_menu" ;;
                 outbound) proxy_btn_lbl="${E_GLOB} Outbound";       proxy_btn_cb="outbound_info" ;;
                 *)        proxy_btn_lbl="${E_GLOB} Outbounds"; proxy_btn_cb="proxy_menu" ;;
             esac
@@ -4947,7 +4991,7 @@ EOF
             send_or_edit "$mid" "$(printf '%s Collecting support bundle...' "$E_TIME")" ""
             local sec; sec=$(get_active_section)
             local hostname; hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            local p_ver; p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            local p_ver; p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
             local sb_ver; sb_ver=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
             {
@@ -5058,7 +5102,7 @@ EOF
             local hostname lan_ip p_ver y_en sb_ver text kb
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             lan_ip=$(uci -q get network.lan.ipaddr || echo "Unknown")
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
             sb_ver=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
             y_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
@@ -5080,7 +5124,7 @@ EOF
         "cmd_check_update")
             local p_ver latest text kb
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2 | cut -d'-' -f1)
+            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | cut -d'-' -f1)
             latest=$(curl -s --connect-timeout 5 --max-time 10 \
                 "https://api.github.com/repos/itdoginfo/podkop/releases/latest" \
@@ -5422,7 +5466,7 @@ send_startup_notification_async() {
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
                 logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-                p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | cut -d' ' -f2)
+                p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
                 active_proxy=$(display_proxy_name_with_tag "$(get_active_proxy_name "")")
                 tg_lat=$(get_tg_latency)
@@ -5574,7 +5618,10 @@ EOF
             if [ -n "$callback_id" ]; then
                 CB_ANSWER_TEXT=""
                 handle_command "$text" "$CALLBACK_MSG_ID" "$callback_id"
-                answer_callback "$callback_id" "$CB_ANSWER_TEXT"
+                # If handler answered the callback early (e.g. Refresh toast),
+                # CB_ANSWER_TEXT is set to __ANSWERED__ — skip to avoid double-answer error.
+                [ "$CB_ANSWER_TEXT" != "__ANSWERED__" ] && \
+                    answer_callback "$callback_id" "$CB_ANSWER_TEXT"
                 CB_ANSWER_TEXT=""
             else
                 # Plain text: pass empty mid so send_or_edit always sends new message
