@@ -2,6 +2,19 @@
 
 ## v0.13.92
 
+- **FIXED:** api_poll_long() recovery path did not call _write_main_route() after successful SOCKS rediscovery. MAIN_ROUTE_FILE and MAIN_ROUTE_KEY_FILE remained stale, causing watchdog to read the old tier and potentially fire false "route degraded" nudges.
+- **FIXED:** urltest_group detection in _handle_proxy() used a global jq search across all Clash API proxies, picking the first URLTest node found anywhere — could steal data from a different section (e.g. main) when active section was antiz. Now searches only within .proxies[$selector].all[] members scoped to the active section.
+- **FIXED:** sed -nE replaced with POSIX BRE sed -n (no -E flag) in extract_server_port_from_uri(). BusyBox sed on some OpenWrt builds supports -r but not -E.
+- **FIXED:** do_restart_bot and do_update_bot used killall -9 $basename after init.d restart, risking killing the newly spawned instance. Replaced with kill -9 $$ (own PID) — only the current process is terminated, new instance is safe.
+- **NEW:** Check E in watchdog — bot transport route degradation alerts. Fires when bot route drops to tier4 (Direct) or tier5 (Emergency IPs), with a clear message explaining the situation. Recovery alert fires when route returns to tier1/tier2. Separate from SOCKS alerts.
+- **NEW:** Tier1 SOCKS down alert even when tier2 keeps bot reachable. Previously if tier2 fallback was alive, curr_socks_state was reset to "up" and no alert fired — user saw nothing while primary SOCKS was down. Now tracks last_tier1_state separately: fires "Primary SOCKS unavailable, switched to fallback" alert, and "Primary SOCKS recovered" when tier1 comes back.
+- **FIXED:** Group nodes (URLTest/Selector/Fallback/LoadBalance) were included in the Outbounds proxy list. sing-box internal routing nodes like main-urltest-out appeared as selectable entries with VLESS type. Now filtered out from display and total count; pagination adjusted accordingly; orig_idx preserved for correct px_view_N callbacks.
+- **UX:** Status card (cmd_status) redesigned for mobile readability — each item on its own line, no forced line merges. Changes: 🐧 added before OS, 🐶 replaces ⚙️ for Podkop line, 📦 replaces 🔌 for Sing-box, 📨 replaces 🔍 for Telegram health, ✅ for one-shot done status, 🟢 for sing-box RUNNING. RAM shown inline with | separator.
+- **UX:** WAN and Public IP merged — Public IP only shown when different from WAN (NAT). Saves one line when ISP gives white IP.
+- **UX:** Clock emoji 🕐 removed from uptime and bot route latency — context makes units clear.
+- **UX:** Telegram health line reworded from "TG direct / via SOCKS / SOCKS" to "direct / tunnel / SOCKS" — more intuitive for new users.
+- **UX:** URLTest outbounds card title changed to "URLTest Outbounds" (was "Outbound Selector"). Mode hint changed from "Manual: fixed" / "Auto: best ping" to "Pinned manually" / "URLTest: auto-selecting". Auto button renamed "URLTest auto ✓" / "Switch to URLTest auto".
+
 - **FIXED:** Refresh toast (answerCallbackQuery) could silently fail on slow routers. CB_ANSWER_TEXT was set before clash_request but answer_callback was only called after handle_command returned — by then Telegram's ~5s callback query timeout could have already expired, causing a "Bad Request: query is too old" error and no toast shown. Fix: proxy_menu Refresh now calls answer_callback immediately (before clash_request), then sets CB_ANSWER_TEXT="__ANSWERED__" to signal the main loop to skip the second answer call. Toast now reliably appears within milliseconds of the button press.
 
 ---
