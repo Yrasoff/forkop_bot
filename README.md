@@ -4,6 +4,8 @@ Telegram-бот для удалённого управления [podkop](https:
 
 Позволяет управлять службой podkop на роутере и осуществлять мониторинг прямо из Telegram — без доступа к LuCI и SSH.
 
+> 📋 История изменений — [CHANGELOG.md](CHANGELOG.md)
+
 ---
 
 ## 🚀 Быстрая установка
@@ -12,6 +14,12 @@ Telegram-бот для удалённого управления [podkop](https:
 wget -O /tmp/install_podkop_bot.sh https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
 ash /tmp/install_podkop_bot.sh
 ```
+
+Установщик поддерживает 4 режима:
+1. **Update** — обновить скрипт, сохранить конфиг
+2. **Reinstall** — переустановить с новыми настройками
+3. **Exit** — выйти без изменений
+4. **Uninstall** — полное удаление бота (двойное подтверждение: `YES` → `REMOVE`)
 
 ---
 
@@ -33,19 +41,25 @@ ash /tmp/install_podkop_bot.sh
 - Включение/выключение автозапуска
 - Обновление podkop до последней версии
 - **Обновление самого бота** прямо из меню Info (без SSH)
+- **Перезагрузка роутера** с двойным подтверждением (кнопка + ввод `YES`)
 
-### 🌐 Outbound Selector
+### 🌐 Outbound Selector / URLTest
 - Просмотр списка outbound'ов с задержкой и типом протокола
 - Переключение активного outbound (vless, hy2, hysteria2, ss, trojan, vmess, tuic)
 - Активный outbound выделен жирным и маркером ▶
-- Тест задержки всех outbound'ов одной кнопкой
-- Добавление и удаление ссылок на outbound'ы
-- URLTest, URL Links и Outbound режимы работы
+- Тест задержки всех outbound'ов одной кнопкой (статус появляется отдельно, карточка не прыгает)
+- Добавление и удаление ссылок; удаление по `server:port` — надёжно для всех протоколов
+- Заголовок карточки отражает режим: **Outbound Selector** или **URLTest Outbounds**
+- **Клонирование ссылок из Selector в URLTest** одной кнопкой (читает из Clash API, не только UCI)
+- Предупреждение при переключении в URLTest если список ссылок пуст
+- **Single URL Proxy** — отдельный режим для одной ссылки с корректными подсказками
 
 ### ⚙️ Настройки секций podkop
-- Переключение между секциями
+- Переключение между секциями (main, antiz и любые другие)
+- **Корректная работа с несколькими секциями** — данные всегда читаются из активной секции, не из main
 - Тип подключения (proxy / vpn / block / exclusion)
 - Режим прокси (selector / urltest / url / outbound) — переключение через меню
+- **Защита при переключении в URL режим** — бот удерживает reload до получения ссылки, туннель не падает
 - URLTest: testing URL, интервал проверки, допуск задержки, список ссылок
 - Domain Resolver: включение, тип DNS, сервер — для каждой секции отдельно
 - Mixed Proxy: включение/выключение, порт (с валидацией 1024–65535)
@@ -83,22 +97,21 @@ ash /tmp/install_podkop_bot.sh
 - **Support Bundle**: одна кнопка — архив диагностики (UCI конфиг, маршруты, nft, syslog)
 
 ### 🔔 Watchdog и алерты
-- Мониторинг sing-box (алерт при остановке и восстановлении с контекстом)
+- Мониторинг sing-box (алерт при остановке и восстановлении)
 - Мониторинг SOCKS upstream с гистерезисом 2/2
-- Алерт при смене активного outbound (URLTest/Selector автопереключение)
+- **Умный алерт смены прокси**: различает ручное переключение ("Proxy manually switched") и автоматическое URLTest ("Proxy auto-switched")
 - TG connectivity мониторинг (direct + via SOCKS раздельно)
 - Периодическая проверка задержки всех SOCKS tier'ов (~каждые 5 мин)
-- Все алерты содержат имя роутера, активный outbound, маршрут бота, **scope события**
-  - Scope показывает затронут ли только control plane бота или весь трафик podkop
+- Все алерты на английском, читаемые — без технических констант
 
 ### 📡 Транспортная цепочка бота
 Бот сам работает через многоуровневый fallback при блокировках:
 ```
-tier1  → Podkop SOCKS5 (основной туннель)
+tier1   → Podkop SOCKS5 (основной туннель)
 tier2_N → Fallback SOCKS list (socks5:// / socks5h://)
-tier3  → Custom Proxy
-tier4  → Direct
-tier5  → Emergency hardcoded Telegram IPs
+tier3   → Custom Proxy
+tier4   → Direct
+tier5   → Emergency hardcoded Telegram IPs
 ```
 Sticky-роутинг, Recovery Mode, IPC между watchdog и main loop.
 После восстановления podkop бот возвращается на tier1 в течение одного health interval (≤60 сек).
@@ -109,7 +122,7 @@ Sticky-роутинг, Recovery Mode, IPC между watchdog и main loop.
 
 Поддерживается схема с несколькими ботами в одном Telegram supergroup:
 - Каждый роутер — отдельный bot token
-- Несколько `admin_ids` через пробел в UCI
+- Несколько `admin_ids` (добавляются через `uci add_list`)
 - Все алерты содержат `[hostname]` префикс для идентификации роутера
 - Anonymous admins в группах через `ALLOW_ANON_ADMINS`
 
@@ -150,7 +163,7 @@ uci commit podkop_bot
 └── settings.startup_notify  — 1/0 уведомление при старте
 ```
 
-> **Важно:** `admin_ids` добавляются через `uci add_list`, а не `uci set` — иначе пробелы в значении сломают UCI.
+> **Важно:** `admin_ids` добавляются через `uci add_list`, а не `uci set` — иначе несколько ID не сохранятся корректно.
 
 ```sh
 uci add_list podkop_bot.settings.admin_ids="123456789"
@@ -160,19 +173,30 @@ uci commit podkop_bot
 
 ---
 
+## ⚠️ Известные особенности
+
+**OpenWrt 24.10.x — баг в BusyBox `tr`:**
+Символьный класс `[:space:]` обрабатывается некорректно и удаляет букву `e` (0x65). Исправлено в v0.13.90 заменой на явное перечисление символов `\n\r\t `. Затрагивает все сборки OpenWrt 24.10.x вне зависимости от архитектуры. Подробнее — в [CHANGELOG.md](CHANGELOG.md#v01390).
+
+**URLTest режим** требует заполненного `urltest_proxy_links` перед переключением — иначе podkop не запустится. Бот предупреждает и предлагает клонировать ссылки из Selector одной кнопкой.
+
+**Single URL режим** — бот удерживает перезапуск podkop до получения ссылки, чтобы не уронить туннель на пустом `proxy_string`.
+
+---
+
 ## 📄 Лицензия
 
 MIT
 
 ---
 
-## 🙏 Благодарности и вдохновение
+## 🙏 Благодарности
 
 - [itdoginfo/podkop](https://github.com/itdoginfo/podkop) — за сам сервис
-- [VizzleTF/podkop_autoupdater](https://github.com/VizzleTF/podkop_autoupdater) — за шаблон установщика и код Podkop_autoupdater
+- [VizzleTF/podkop_autoupdater](https://github.com/VizzleTF/podkop_autoupdater) — за шаблон установщика
 
 ---
 
 ## 🇬🇧 Summary
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box based traffic routing service for OpenWrt routers. It provides full control over podkop without SSH or LuCI access: start/stop/reload, outbound proxy switching with latency display, routing lists editor, DNS and YACD settings, and a multi-tier watchdog that keeps the bot reachable through Telegram even when the main tunnel is down. The bot operates via a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box based traffic routing service for OpenWrt routers. It provides full control over podkop without SSH or LuCI access: start/stop/reload, outbound proxy switching with latency display, correct multi-section support (each section scoped independently), routing lists editor, DNS and YACD settings, and a multi-tier watchdog that keeps the bot reachable through Telegram even when the main tunnel is down. The bot operates via a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. Full [changelog](CHANGELOG.md) available.
