@@ -4,7 +4,7 @@ Telegram-бот для удалённого управления [podkop](https:
 
 Позволяет управлять службой podkop на роутере и осуществлять мониторинг прямо из Telegram — без доступа к LuCI и SSH.
 
-> 📋 История изменений — [CHANGELOG.md](CHANGELOG.md)
+> 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md)
 
 ---
 
@@ -199,4 +199,4 @@ MIT
 
 ## 🇬🇧 Summary
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box based traffic routing service for OpenWrt routers. It provides full control over podkop without SSH or LuCI access: start/stop/reload, outbound proxy switching with latency display, correct multi-section support (each section scoped independently), routing lists editor, DNS and YACD settings, and a multi-tier watchdog that keeps the bot reachable through Telegram even when the main tunnel is down. The bot operates via a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. Full [changelog](CHANGELOG.md) available.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box based traffic routing service for OpenWrt routers. It provides full control over podkop without SSH or LuCI access: start/stop/reload, outbound proxy switching with latency display, correct multi-section support (each section scoped independently), routing lists editor, DNS and YACD settings, and a multi-tier watchdog that keeps the bot reachable through Telegram even when the main tunnel is down. The bot operates via a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. Full [changelog](CHANGELOG.md) available. 
