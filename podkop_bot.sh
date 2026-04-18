@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.92
+# Podkop Telegram Bot v0.13.93
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -18,7 +18,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.92"
+BOT_VERSION="0.13.93"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -2341,9 +2341,10 @@ _handle_proxy() {
                 fi
             fi
 
-            total=$(echo "$proxies" | jq -r --arg sel "$selector" \
-                '[.proxies[$sel].all[]? |
-                  select((.proxies[.].type // "") |
+            total=$(echo "$proxies" | jq -r --arg sel "$selector" '
+                . as $root |
+                [$root.proxies[$sel].all[]? |
+                  select(($root.proxies[.].type // "") |
                     (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance"))
                 ] | length // 0' 2>/dev/null)
 
@@ -2367,20 +2368,21 @@ _handle_proxy() {
                 --argjson s 0 \
                 --argjson e 9999 \
                 '
-                .proxies[$sel].all | to_entries[$s:$e][] |
+                . as $root |
+                $root.proxies[$sel].all | to_entries[$s:$e][] |
                 .key as $orig_idx | .value as $name |
                 # Skip internal group nodes — not real proxies
                 select(
-                    (.proxies[$name].type // "") |
+                    ($root.proxies[$name].type // "") |
                     (. != "Selector" and . != "URLTest" and . != "Fallback" and . != "LoadBalance")
                 ) |
                 # Walk chain with depth limit (max 5 hops) to guard against cycles
                 def leaf(n; depth):
                     if depth <= 0 then n
                     else
-                        .proxies[n].type as $t |
+                        ($root.proxies[n].type // "") as $t |
                         if ($t == "Selector" or $t == "URLTest" or $t == "Fallback") then
-                            (.proxies[n].now // n) as $next |
+                            ($root.proxies[n].now // n) as $next |
                             if $next != n then leaf($next; depth - 1) else n end
                         else n end
                     end;
@@ -2388,9 +2390,9 @@ _handle_proxy() {
                 [
                     ($orig_idx | tostring),
                     $name,
-                    (.proxies[$lf].type // .proxies[$lf].adapterType // "Unknown"),
-                    ((.proxies[$name].history[-1].delay //
-                      .proxies[$lf].history[-1].delay // 0) | tostring)
+                    ($root.proxies[$lf].type // $root.proxies[$lf].adapterType // "Unknown"),
+                    (($root.proxies[$name].history[-1].delay //
+                      $root.proxies[$lf].history[-1].delay // 0) | tostring)
                 ] | @tsv
                 ' 2>/dev/null)
 
@@ -2610,8 +2612,11 @@ EOF
             local proxies selector urltest_grp payload
             proxies=$(clash_request "/proxies")
             selector=$(get_selector_tag "$proxies")
+            # Search URLTest only within current selector's all[] — not globally
             urltest_grp=$(echo "$proxies" | jq -r \
-                '.proxies | to_entries[] | select(.value.type == "URLTest") | .key' \
+                --arg sel "$selector" \
+                '. as $root | $root.proxies[$sel].all[]? |
+                 select($root.proxies[.].type == "URLTest")' \
                 2>/dev/null | head -1)
             if [ -n "$urltest_grp" ]; then
                 payload=$(jq -n -c --arg name "$urltest_grp" '{name:$name}')
@@ -2776,15 +2781,8 @@ _handle_url_links() {
                 send_message "$(printf '%s <b>Duplicate!</b>\nThis link is already in the list.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"url_links_menu\"}]]}"
             else
-                # Append new URL to proxy_string (one per line)
-                local existing new_val
-                existing=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
-                if [ -z "$existing" ]; then
-                    new_val="$safe_link"
-                else
-                    new_val=$(printf '%s\n%s' "$existing" "$safe_link")
-                fi
-                uci set podkop.${sec}.proxy_string="$new_val"
+                # Replace proxy_string entirely — Single URL mode means one URL only
+                uci set podkop.${sec}.proxy_string="$safe_link"
                 uci_commit_safe podkop
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
@@ -2921,7 +2919,7 @@ EOF
             local luci_ip
             luci_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
             send_or_edit "$mid" \
-                "$(printf '%s <b>Outbound Config mode</b>\n\nThis mode requires editing raw sing-box JSON.\nEditing JSON via Telegram is error-prone and not supported by the bot.\n\n<b>Please use LuCI or console instead:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set podkop.MAIN.outbound_json=...</code>\n\n<i>After editing in LuCI/console, use Reload Podkop in the bot to apply.</i>' "$E_WARN" "$luci_ip")" \
+                "$(printf '%s <b>Outbound Config mode</b>\n\nThis mode requires editing raw sing-box JSON.\nEditing JSON via Telegram is error-prone and not supported by the bot.\n\n<b>Please use LuCI or console instead:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set podkop.%s.outbound_json=...</code>\n\n<i>After editing in LuCI/console, use Reload Podkop in the bot to apply.</i>' "$E_WARN" "$luci_ip" "$sec")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
             ;;
     esac
