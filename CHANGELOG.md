@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.13.93
+
+- **FIXED:** Outbounds list regression — all proxies showed "Unknown | N/A" and internal group nodes (main-urltest-out) leaked into the list. Root cause: jq pipeline used `.proxies[$sel].all | to_entries[]` which shifts the context away from the JSON root, making subsequent `.proxies[name]` lookups read from the entry object instead of the root. Fixed by adding `. as $root` at the start of both `total` and `page_tsv` jq expressions, then using `$root.proxies[...]` throughout. Affected Selector and URLTest modes; px_view cards were unaffected as they use separate direct queries.
+- **FIXED:** do_px_auto_urltest ("Switch to URLTest auto" button) searched for URLTest group globally across all Clash API proxies, picking the first one found anywhere. In multi-section configs this could activate a URLTest group from a different section (e.g. main instead of antiz). Now scoped to `$root.proxies[$sel].all[]` — only searches within the current selector's members.
+- **FIXED:** Single URL mode (proxy_config_type=url) appended new URLs to proxy_string instead of replacing. The UI said "This replaces any existing URL" but the code did `printf '%s\n%s' "$existing" "$safe_link"`. Fixed to `uci set proxy_string="$safe_link"` — strict single-link semantics now match the UI.
+- **FIXED:** Outbound Config mode SSH hint had hardcoded `podkop.MAIN.outbound_json=...`. Replaced with `podkop.${sec}.outbound_json=...` so the hint reflects the actual active section name.
+- **NEW:** podkop_dns_check() function — tests tunnel health after reload via fakeip DNS probe (nslookup fakeip.podkop.fyi 127.0.0.42, expects 198.18.x.x). Borrowed from podkop_autoupdater (VizzleTF). Now used in do_reload_podkop: after reload shows "✅ Tunnel OK" or "⚠️ Tunnel check failed" instead of just "Reloaded!".
+- **FIXED:** cmd_check_update version comparison used sort -V which is not guaranteed on BusyBox. Replaced with numeric field-by-field comparison (split x.y.z, compare each part with -gt/-eq).
+- **UX:** Status card (cmd_status) — 🐶 emoji for Podkop line, 📦 for Sing-box, 📨 for Telegram health row, 🐧 before OS. Clock emoji 🕐 removed from uptime and bot route latency. WAN and Public IP merged into one line (Public IP shown only when different from WAN). Telegram health reworded from "TG direct / via SOCKS / SOCKS" to "direct / tunnel / SOCKS".
+
+---
+
 ## v0.13.92
 
 - **FIXED:** api_poll_long() recovery path did not call _write_main_route() after successful SOCKS rediscovery. MAIN_ROUTE_FILE and MAIN_ROUTE_KEY_FILE remained stale, causing watchdog to read the old tier and potentially fire false "route degraded" nudges.
