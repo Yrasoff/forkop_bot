@@ -4376,7 +4376,7 @@ _handle_fallback_socks() {
         "cmd_fb_socks_add")
             echo "wait_fb_socks_add" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Add Fallback SOCKS</b>\n\nFormat: <code>socks5://IP:PORT</code> or <code>socks5h://IP:PORT</code>\n<code>socks5h://</code> resolves DNS remotely (recommended under RKN).\n\nExample: <code>socks5h://192.168.2.238:18080</code>' "$E_EDIT")" \
+                "$(printf '%s <b>Add Fallback SOCKS</b>\n\n<code>socks5h://IP:PORT</code> — recommended (remote DNS)\n<code>socks5://IP:PORT</code> — local DNS\n<code>socks5h://hostname:PORT</code> — domain also works\n\nExample: <code>socks5h://192.168.2.238:18080</code>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"fallback_socks_menu\"}]]}"
             ;;
     esac
@@ -4448,8 +4448,9 @@ _handle_bot() {
             sec=$(get_active_section)
             sec_count=$(uci -q show podkop 2>/dev/null | grep -cE '^podkop\.[^.=]+=section$')
 
+            # Show section name always when >1 section, on its own line before Active Route
             sec_str=""
-            [ "$sec_count" -gt 1 ] && sec_str=$(printf '<b>Section:</b> <code>%s</code>\n' "$sec")
+            [ "$sec_count" -gt 1 ] && sec_str="<b>Section:</b> <code>${sec}</code>"
 
             # NOTE: get_tg_latency intentionally removed from main_menu (was 3s delay per open)
             # Latency is still available in Status and Bot Settings screens.
@@ -4458,7 +4459,7 @@ _handle_bot() {
 <code>────────────────────</code>
 <b>Host:</b> ${hostname}
 <b>Podkop:</b> ${p_ver:-Unknown} | <b>Bot:</b> v${BOT_VERSION}
-${sec_str}<b>Active Route:</b> <code>${active_proxy_display}</code>
+$([ -n "$sec_str" ] && printf '%s\n' "$sec_str")<b>Active Route:</b> <code>${active_proxy_display}</code>
 <b>Transport:</b> ${LAST_ROUTE_NAME}
 <code>────────────────────</code>
 EOF
@@ -4997,7 +4998,7 @@ EOF
 
         "cmd_custom_proxy")
             echo "wait_custom_proxy" > "$STATE_FILE"
-            send_or_edit "$mid" "$(printf '%s <b>Set Custom Proxy</b>\n\nFormat: <code>http://IP:PORT</code> or <code>socks5://IP:PORT</code>' "$E_EDIT")" \
+            send_or_edit "$mid" "$(printf '%s <b>Set Custom Proxy</b>\n\nUsed as <b>tier3</b> — fallback after Podkop SOCKS and fallback_socks list.\n\n<b>Supported formats:</b>\n<code>socks5://IP:PORT</code>\n<code>socks5h://IP:PORT</code> (remote DNS)\n<code>socks5h://hostname:PORT</code>\n<code>http://IP:PORT</code>\n<code>https://IP:PORT</code>\n<code>IP:PORT</code> (treated as HTTP)\n\n<i>socks5h is recommended — DNS resolves through the proxy.</i>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"bot_settings\"}]]}"
             ;;
         "cmd_clear_custom_proxy")
@@ -5615,7 +5616,7 @@ ${E_BOT} <b>Bot Online</b> v${BOT_VERSION}
 <b>Host:</b> ${hostname}
 <b>Podkop:</b> ${p_ver:-Unknown}
 <b>Active Route:</b> <code>${active_proxy}</code>
-<b>Bot Path:</b> ${LAST_ROUTE_NAME} (${E_TIME} ${tg_lat})
+<b>Bot Path:</b> ${LAST_ROUTE_NAME} (${tg_lat})
 <b>Section:</b> <code>${sec}</code>
 EOF
 )
