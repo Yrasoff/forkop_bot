@@ -1645,16 +1645,29 @@ probe_services() {
     PROBE_SVC_RESULTS=""
     PROBE_TG_BLOCKED=0
 
-    local _name _url _expected _parse _code _icon _detail _tab
+    local _name _url _expected _parse _flags _header _code _icon _detail _tab _curl_extra
     _tab=$(printf '\t')
 
-    # Feed service list via heredoc — loop runs in current shell (not subshell),
-    # so PROBE_TG_BLOCKED and PROBE_SVC_RESULTS are visible after the loop.
-    # || [ -n "$_name" ] guards against last line without trailing newline.
-    while IFS='|' read -r _name _url _expected _parse || [ -n "$_name" ]; do
+    # Statsig key for ChatGPT geo check — public client key from ipregion.sh (vernette)
+    local _statsig_key="client-zUdXdSTygXJdzoE0sWTkP8GKTVsUMF2IRM7ShVO2JAG"
+
+    # Service list format: name|url|expected_code|jq_parse|flags|header
+    # flags: follow = -L (follow redirects)
+    # jq_parse: jq expression to extract detail from response JSON (optional)
+    # header: HTTP header to add (optional)
+    # Feed via heredoc — loop runs in current shell, variables survive after loop.
+    # || [ -n "$_name" ] guards last line without trailing newline.
+    while IFS='|' read -r _name _url _expected _parse _flags _header || [ -n "$_name" ]; do
         [ -z "$_name" ] && continue
 
-        _code=$(curl -s -k \
+        _curl_extra=""
+        [ "$_flags" = "follow" ] && _curl_extra="-L"
+
+        local _header_arg=""
+        [ -n "$_header" ] && _header_arg="-H $_header"
+
+        # shellcheck disable=SC2086
+        _code=$(curl -s -k $_curl_extra $_header_arg \
             -x "socks5h://${m_ip}:${m_port}" \
             --connect-timeout 6 --max-time 10 \
             -o /tmp/podkop_probe_svc.tmp \
@@ -1682,10 +1695,11 @@ probe_services() {
         PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
     done <<EOF
-YouTube|https://www.youtube.com/generate_204|204|
-Telegram API|https://api.telegram.org|200|
-ChatGPT|https://ab.chatgpt.com/v1/initialize|200|.derived_fields.country
-Discord|https://discord.com/api/v9/gateway|200|
+YouTube|https://www.youtube.com/generate_204|204||
+Telegram API|https://api.telegram.org|200||follow|
+ChatGPT|https://ab.chatgpt.com/v1/initialize|200|.derived_fields.country||Statsig-Api-Key: ${_statsig_key}
+Claude.ai|https://claude.ai|200||follow|
+Discord|https://discord.com/api/v9/gateway|200|||
 EOF
 }
 
@@ -2757,12 +2771,17 @@ EOF
             text=$(printf '%s\n<code>────────────────────</code>\n<b>Share Link:</b>\n<code>%s</code>' "$text" "$(html_escape "$share_uri")")
             kb=$(jq -n -c --arg i "$p_idx" --arg p "$ret_page" \
                 --arg ok "${E_OK} Switch" --arg test "${E_RST} Test" \
-                --arg del "${E_DEL} Delete" --arg back "${E_BACK} Back" '{
+                --arg del "${E_DEL} Delete" --arg back "${E_BACK} Back" \
+                --arg probe "${E_MICRO} Probe" \
+                --arg is_active "$( [ "$p_name" = "$(get_active_proxy_name "$proxies")" ] && echo 1 || echo 0 )" \
+                '{
                 inline_keyboard: [
                     [{"text":$ok,  "callback_data":("do_px_"+$i)},   {"text":$test,"callback_data":("test_px_"+$i)}],
                     [{"text":$del, "callback_data":("ask_del_px_"+$i)},{"text":$back,"callback_data":("proxy_menu_p_"+$p)}],
+                    (if $is_active == "1" then [{"text":$probe,"callback_data":"ask_probe_outbound"}] else [] end),
                     [{"text":"Menu","callback_data":"/menu"}]
-                ]}')
+                ] | map(select(length > 0))
+                }')
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5243,7 +5262,7 @@ EOF
             active_px=$(get_active_proxy_name "$proxies")
             active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
             local mode_note=""
-            [ "$proxy_mode" = "urltest" ] && mode_note="\n<i>URLTest mode: testing current auto-selected proxy.</i>"
+            [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
             text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Discord)\n• Download throughput — detects ISP throttle and 16 KB block\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 15–30 sec. Traffic ~250 KB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
@@ -5308,15 +5327,15 @@ EOF
                     ;;
                 throttled)
                     speed_line="${E_RED} ${PROBE_SPEED_MBPS} Mbps"
-                    speed_verdict="\n${E_WARN} <b>ISP throttle suspected</b> — speed below 0.8 Mbps threshold."
+                    speed_verdict=$(printf '\n%s <b>ISP throttle suspected</b> — speed below 0.8 Mbps threshold.' "$E_WARN")
                     ;;
                 block16k)
                     speed_line="${E_RED} —"
-                    speed_verdict="\n${E_WARN} <b>16 KB block suspected</b> — connection dropped after ~16 KB.\nThis is a known RKN pattern: first packets pass, then traffic is cut."
+                    speed_verdict=$(printf '\n%s <b>16 KB block suspected</b> — connection dropped after ~16 KB.\nThis is a known RKN pattern: first packets pass, then traffic is cut.' "$E_WARN")
                     ;;
                 blocked)
                     speed_line="${E_RED} —"
-                    speed_verdict="\n${E_WARN} <b>Connection blocked</b> — almost no data received."
+                    speed_verdict=$(printf '\n%s <b>Connection blocked</b> — almost no data received.' "$E_WARN")
                     ;;
             esac
 
@@ -5341,10 +5360,10 @@ EOF
 
             # Org line
             local org_line=""
-            [ -n "$PROBE_ORG" ] && org_line="\n${E_CPU} <code>${PROBE_ORG}</code>"
+            [ -n "$PROBE_ORG" ] && org_line=$(printf '\n%s <code>%s</code>' "$E_CPU" "$PROBE_ORG")
 
             local result_text
-            result_text=$(printf '%s <b>Active Outbound Probe</b>
+            result_text=$(printf '%b <b>Active Outbound Probe</b>
 <code>────────────────────</code>
 %s <b>%s</b>%s | <code>%s</code>
 <code>────────────────────</code>
@@ -5356,7 +5375,7 @@ EOF
 <code>%s</code>
 <code>────────────────────</code>
 %s <b>Throughput:</b> %s
-%s <b>Downloaded:</b> %s KB in %ss%s' \
+%s <b>Downloaded:</b> %s KB in %ss%b' \
                 "$E_MICRO" \
                 "$E_GLOB" "$active_px_display" "$mode_hint" "$px_type" \
                 "$E_MAP" "$PROBE_EXIT_IP" \
