@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.13.94
+
+- **NEW:** Probe Active Outbound — new Diagnostics feature. Tests the currently active proxy through `mixed_proxy` SOCKS without switching selector or interrupting traffic. Four sequential checks: (1) Geo — exit IP, country, ASN via ipapi.co; (2) Google hint — parses `MgUcDb` field from google.com, shows how Google sees the exit country; (3) Service reachability — YouTube, Telegram API, ChatGPT, Discord through the proxy, each with HTTP status classification (OK / Redirect / Blocked / Timeout); (4) Throughput — 200 KB Range download via speed.cloudflare.com with ISP throttle and 16 KB block detection. Result card shows all findings in one message with context-aware action buttons.
+- **NEW:** RKN throttle/block detection in throughput probe. Three classified states: `ok` (≥0.8 Mbps), `throttled` (<0.8 Mbps but data flows), `block16k` (received ~14–20 KB then connection dropped — known RKN pattern of cutting traffic after first 16 KB), `blocked` (no data received). Each state shows appropriate warning text explaining the pattern.
+- **NEW:** Telegram API reachability check through active outbound. Detects when a proxy (especially Russian VDS) passes general traffic but blocks `api.telegram.org` — explains why the proxy cannot be used as bot fallback tier2. If blocked, result card shows Bot Settings button to remove it from fallback list.
+- **NEW:** Context-aware action buttons on probe result. If throttled/blocked in Selector mode → "Switch Proxy" button (opens Outbounds). If throttled in URLTest mode → "Test All Proxies" button (triggers URLTest re-evaluation). If Telegram API blocked → "Bot Settings" button. No action button when all OK.
+- **NEW:** Probe cooldown — 2 minute lockout between runs via `/tmp/podkop_probe_ts` timestamp file, consistent with safe_reload pattern.
+- **UX:** Diagnostics menu — "Probe Active Outbound" (🔬) added as first item, above Upstream Health.
+- **UX:** Main menu — Section name no longer merges with Active Route line when multiple sections configured. Fixed heredoc trailing-newline stripping by using conditional `printf` instead of variable interpolation.
+- **UX:** Startup notification — clock emoji 🕐 removed from latency display in Bot Path line.
+- **UX:** Custom Proxy input prompt expanded — now shows all supported formats: `socks5://`, `socks5h://`, `socks5h://hostname:port`, `http://`, `https://`, bare `IP:PORT`. Explains that `socks5h` is recommended (remote DNS). Notes tier3 role in transport chain.
+- **UX:** Fallback SOCKS input prompt updated — mentions hostname support, shortened and restructured for clarity.
+
+---
+
 ## v0.13.93
 
 - **FIXED:** Outbounds list regression — all proxies showed "Unknown | N/A" and internal group nodes (main-urltest-out) leaked into the list. Root cause: jq pipeline used `.proxies[$sel].all | to_entries[]` which shifts the context away from the JSON root, making subsequent `.proxies[name]` lookups read from the entry object instead of the root. Fixed by adding `. as $root` at the start of both `total` and `page_tsv` jq expressions, then using `$root.proxies[...]` throughout. Affected Selector and URLTest modes; px_view cards were unaffected as they use separate direct queries.
