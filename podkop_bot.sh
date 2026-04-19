@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.93
+# Podkop Telegram Bot v0.13.94
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -18,7 +18,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.93"
+BOT_VERSION="0.13.94"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -160,6 +160,9 @@ E_TIME=$(printf '\xE2\x8F\xB1')
 E_NEW=$(printf '\xF0\x9F\x86\x95')
 E_CLIP=$(printf '\xF0\x9F\x93\x8E')
 E_TEST=$(printf '\xF0\x9F\xA7\xAA')
+E_MICRO=$(printf '\xF0\x9F\x94\xAC')
+E_BOLT=$(printf '\xE2\x9A\xA1')
+E_MAP=$(printf '\xF0\x9F\x97\xBA')
 E_HEALTH=$(printf '\xF0\x9F\xA9\xBA')
 E_IDEA=$(printf '\xF0\x9F\x92\xA1')   # [bulb] light bulb — hints/tips
 E_TGT=$(printf '\xF0\x9F\x8E\xAF')    # [target] target — protocol selector
@@ -215,6 +218,19 @@ html_escape() {
 
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'
+}
+
+# uci_list_clean: strip UCI single-quote wrapping from a list string.
+# UCI show outputs list values as: 'item1' 'item2' 'item3'
+# This strips the quotes so the result can be safely word-split by the caller.
+# Usage:
+#   _clean=$(uci_list_clean "$raw")
+#   set -f; set -- $_clean; set +f   ← set -f prevents glob expansion
+#   for item in "$@"; do ...; done
+# IMPORTANT: set -- must happen in the caller's scope, not inside a function,
+# because set -- only affects positional params of the current shell context.
+uci_list_clean() {
+    printf '%s\n' "$1" | tr -d "'"
 }
 
 url_decode() {
@@ -311,12 +327,12 @@ _load_transport_ctx() {
     _t_custom=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null || echo "")
     _t_biface=$(uci -q get podkop_bot.settings.bind_interface 2>/dev/null || echo "")
     _t_ifflag=""; [ -n "$_t_biface" ] && _t_ifflag="--interface $_t_biface"
-    # Load fallback_socks list via eval set -- (same pattern as url_proxy_links)
+    # Load fallback_socks list via safe_set_args (glob-safe replacement for eval set --)
     local _fb_raw
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     _t_fb_socks=""
     if [ -n "$_fb_raw" ]; then
-        eval "set -- $_fb_raw"
+        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
         _t_fb_socks="$*"
     fi
 }
@@ -395,10 +411,12 @@ _route_request() {
     # Watchdog cannot modify parent variables directly (subshell isolation).
     # It writes "down" or "up" to ROUTE_CMD_FILE; we act on it here at the
     # top of every transport call (both api_request_fast and api_poll_long).
-    if [ -f "$ROUTE_CMD_FILE" ]; then
+    # Atomic read: mv to a lock file first — if two processes race, only one
+    # gets a successful mv (rename is atomic on Linux tmpfs), eliminating TOCTOU.
+    if mv "$ROUTE_CMD_FILE" "${ROUTE_CMD_FILE}.lock" 2>/dev/null; then
         local _wd_cmd
-        _wd_cmd=$(cat "$ROUTE_CMD_FILE" 2>/dev/null)
-        rm -f "$ROUTE_CMD_FILE"
+        _wd_cmd=$(cat "${ROUTE_CMD_FILE}.lock" 2>/dev/null)
+        rm -f "${ROUTE_CMD_FILE}.lock"
         LAST_ROUTE_FAST="unknown"
         LAST_ROUTE_POLL="unknown"
         LAST_ROUTE="unknown"
@@ -696,7 +714,7 @@ probe_all_socks_write() {
     local _fb_raw _n=0 _item _fb=""
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     if [ -n "$_fb_raw" ]; then
-        eval "set -- $_fb_raw"
+        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
         for _item in "$@"; do
             _n=$((_n + 1))
             lat=$(probe_socks_latency "$_item")
@@ -760,7 +778,7 @@ api_document() {
         local _fb_raw _n=0 _fb
         _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
         if [ -n "$_fb_raw" ]; then
-            eval "set -- $_fb_raw"
+            set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
             for _fb in "$@"; do
                 _n=$((_n + 1))
                 res=$(_do_curl_doc "-x $_fb")
@@ -818,7 +836,7 @@ get_tg_latency() {
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             _fb_url=""
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $_fb_raw"
+                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                 for _fb_url in "$@"; do
                     _i=$((_i + 1))
                     [ "$_i" -eq "$_n" ] && break
@@ -1200,7 +1218,7 @@ is_list_enabled() {
     local sec="$1" tag="$2" item raw_list
     raw_list=$(uci -q show podkop.${sec}.community_lists 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 1
-    eval "set -- $raw_list"
+    set -f; set -- $(uci_list_clean "$raw_list"); set +f
     for item in "$@"; do [ "$item" = "$tag" ] && return 0; done
     return 1
 }
@@ -1231,7 +1249,7 @@ build_uci_links_cache() {
     tmp=$(mktemp /tmp/podkop_uci_links.XXXXXX)
     raw_list=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
     if [ -n "$raw_list" ]; then
-        eval "set -- $raw_list"
+        set -f; set -- $(uci_list_clean "$raw_list"); set +f
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
     fi
     mv "$tmp" "$UCI_LINKS_CACHE"
@@ -1251,7 +1269,7 @@ build_tag_name_cache() {
     for uci_key in selector_proxy_links urltest_proxy_links; do
         raw_list=$(uci -q show podkop.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
         [ -z "$raw_list" ] && continue
-        eval "set -- $raw_list"
+        set -f; set -- $(uci_list_clean "$raw_list"); set +f
         for link in "$@"; do
             # Extract #fragment
             case "$link" in *#?*) frag="${link##*#}" ;; *) continue ;; esac
@@ -1311,7 +1329,7 @@ get_urltest_proxy_links() {
     local sec="$1" raw_list
     raw_list=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 0
-    eval "set -- $raw_list"
+    set -f; set -- $(uci_list_clean "$raw_list"); set +f
     for link in "$@"; do printf '%s\n' "$link"; done
 }
 
@@ -1566,7 +1584,166 @@ podkop_dns_check() {
     fi
 }
 
-# Stop podkop via init.d with SIGTERM -> SIGKILL escalation for orphaned sing-box
+# ==============================================================================
+# Active Outbound Probe functions
+# All tests run through current mixed_proxy SOCKS (socks5h://IP:PORT).
+# This means they test the ACTIVE outbound, not the router's direct connection.
+# ==============================================================================
+
+# probe_geo: get exit IP, country, ASN through active outbound
+# Sets: PROBE_EXIT_IP, PROBE_COUNTRY, PROBE_ORG
+probe_geo() {
+    local m_ip m_port sec resp
+    sec=$(get_active_section)
+    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_ip=$(get_proxy_ip)
+
+    resp=$(curl -s -k \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 10 \
+        "https://ipapi.co/json" 2>/dev/null)
+
+    if [ -n "$resp" ]; then
+        PROBE_EXIT_IP=$(printf '%s' "$resp" | jq -r '.ip // empty' 2>/dev/null)
+        PROBE_COUNTRY=$(printf '%s' "$resp" | jq -r '(.country_code // "") + " " + (.country_name // "")' 2>/dev/null | sed 's/^ *//;s/ *$//')
+        PROBE_ORG=$(printf '%s' "$resp" | jq -r '.org // empty' 2>/dev/null)
+    fi
+    [ -z "$PROBE_EXIT_IP" ] && PROBE_EXIT_IP="N/A"
+    [ -z "$PROBE_COUNTRY" ] && PROBE_COUNTRY="N/A"
+    [ -z "$PROBE_ORG" ] && PROBE_ORG=""
+}
+
+# probe_google: get Google's geo hint through active outbound
+# Parses MgUcDb field from google.com response
+# Sets: PROBE_GOOGLE_COUNTRY
+probe_google() {
+    local m_ip m_port sec resp
+    sec=$(get_active_section)
+    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_ip=$(get_proxy_ip)
+
+    resp=$(curl -s -k \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 10 \
+        -A "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0" \
+        "https://www.google.com" 2>/dev/null)
+
+    # Extract Google internal geo hint — used by Google to determine user country
+    PROBE_GOOGLE_COUNTRY=$(printf '%s' "$resp" | \
+        grep -o '"MgUcDb":"[^"]*"' | \
+        sed 's/"MgUcDb":"//;s/"//' | head -1)
+    [ -z "$PROBE_GOOGLE_COUNTRY" ] && PROBE_GOOGLE_COUNTRY="N/A"
+}
+
+# probe_services: check reachability of key services through active outbound
+# Sets: PROBE_SVC_RESULTS (TAB-separated lines: "name<TAB>icon<TAB>detail")
+probe_services() {
+    local m_ip m_port sec
+    sec=$(get_active_section)
+    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_ip=$(get_proxy_ip)
+    PROBE_SVC_RESULTS=""
+    PROBE_TG_BLOCKED=0
+
+    local _name _url _expected _parse _code _icon _detail _tab
+    _tab=$(printf '\t')
+
+    # Feed service list via heredoc — loop runs in current shell (not subshell),
+    # so PROBE_TG_BLOCKED and PROBE_SVC_RESULTS are visible after the loop.
+    # || [ -n "$_name" ] guards against last line without trailing newline.
+    while IFS='|' read -r _name _url _expected _parse || [ -n "$_name" ]; do
+        [ -z "$_name" ] && continue
+
+        _code=$(curl -s -k \
+            -x "socks5h://${m_ip}:${m_port}" \
+            --connect-timeout 6 --max-time 10 \
+            -o /tmp/podkop_probe_svc.tmp \
+            -w "%{http_code}" \
+            "$_url" 2>/dev/null)
+
+        _detail=""
+        if [ -n "$_parse" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
+            _detail=$(jq -r "$_parse // empty" /tmp/podkop_probe_svc.tmp 2>/dev/null || echo "")
+            [ -n "$_detail" ] && _detail=" ($_detail)"
+        fi
+        rm -f /tmp/podkop_probe_svc.tmp
+
+        case "$_code" in
+            "$_expected")        _icon="${E_OK}" ;;
+            ''|000)              _icon="${E_RED}"; _detail=" (timeout)" ;;
+            301|302|303|307|308) _icon="${E_YLW}"; _detail=" (redirect $_code)" ;;
+            403|451)             _icon="${E_RED}"; _detail=" (blocked $_code)" ;;
+            *)                   _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+        esac
+
+        # Track Telegram API block — variable set directly, no tmpfs needed
+        [ "$_name" = "Telegram API" ] && [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
+
+        PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+"
+    done <<EOF
+YouTube|https://www.youtube.com/generate_204|204|
+Telegram API|https://api.telegram.org|200|
+ChatGPT|https://ab.chatgpt.com/v1/initialize|200|.derived_fields.country
+Discord|https://discord.com/api/v9/gateway|200|
+EOF
+}
+
+# probe_throughput: measure download speed through active outbound
+# Requests 200 KB via Range header to detect ISP throttle/16KB block
+# Sets: PROBE_SPEED_MBPS, PROBE_SPEED_BYTES, PROBE_SPEED_SECS, PROBE_SPEED_STATUS
+probe_throughput() {
+    local m_ip m_port sec raw speed_bps size_bytes time_secs
+    sec=$(get_active_section)
+    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_ip=$(get_proxy_ip)
+
+    # 200 KB range test — enough to detect 16 KB block and measure throttle
+    # speed_download in bytes/sec, size_download in bytes, time_total in seconds
+    # curl writes -w fields even on connection reset (RST) — values may be 0
+    # but the colon-separated format is always emitted if curl starts at all.
+    raw=$(curl -s -k \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 30 \
+        -H "Range: bytes=0-204799" \
+        -o /dev/null \
+        -w "%{speed_download}:%{size_download}:%{time_total}" \
+        "https://speed.cloudflare.com/__down?bytes=204800" 2>/dev/null)
+
+    # Sanitize each field: keep only digits and dot, default to 0 if empty/malformed
+    speed_bps=$(printf '%s' "${raw%%:*}"              | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
+    size_bytes=$(printf '%s' "$raw" | cut -d: -f2     | grep -oE '^[0-9]+'            || echo "0")
+    time_secs=$(printf '%s' "$raw"  | cut -d: -f3     | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
+    # Ensure non-empty after sanitization
+    speed_bps="${speed_bps:-0}"
+    size_bytes="${size_bytes:-0}"
+    time_secs="${time_secs:-0}"
+
+    # Convert speed bytes/sec → Mbps (×8 / 1000000), keep 2 decimal places
+    PROBE_SPEED_MBPS=$(awk "BEGIN{printf \"%.2f\", ${speed_bps:-0} * 8 / 1000000}")
+    PROBE_SPEED_BYTES="${size_bytes:-0}"
+    PROBE_SPEED_SECS=$(awk "BEGIN{printf \"%.1f\", ${time_secs:-0}}")
+
+    # Classify result
+    # Thresholds: <100 KB/s (0.8 Mbps) = throttled, <20 KB received = full block
+    local size_kb
+    size_kb=$(awk "BEGIN{printf \"%d\", ${size_bytes:-0} / 1024}")
+
+    if [ "${size_kb:-0}" -lt 20 ]; then
+        PROBE_SPEED_STATUS="blocked"       # received almost nothing
+    elif [ "$(awk "BEGIN{print (${speed_bps:-0} < 100000) ? 1 : 0}")" = "1" ]; then
+        PROBE_SPEED_STATUS="throttled"     # received data but very slow
+    else
+        PROBE_SPEED_STATUS="ok"
+    fi
+
+    # Detect 16 KB block specifically: received ~16 KB but not more
+    if [ "$size_kb" -ge 14 ] && [ "$size_kb" -le 20 ] && [ "$PROBE_SPEED_STATUS" = "blocked" ]; then
+        PROBE_SPEED_STATUS="block16k"
+    fi
+}
+
+
 do_podkop_stop() {
     local rc pid_list
     /etc/init.d/podkop stop 2>/dev/null; rc=$?
@@ -1928,7 +2105,7 @@ start_health_daemon() {
                     local _fb_raw _fb _fb_ok=0 _fb_alive=""
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
-                        eval "set -- $_fb_raw"
+                        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                         for _fb in "$@"; do
                             local _fb_ip _fb_port
                             _fb_ip=$(echo "$_fb" | sed 's|socks5h\?://||' | cut -d: -f1)
@@ -2664,7 +2841,7 @@ EOF
                         local _raw_uci
                         _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                         if [ -n "$_raw_uci" ]; then
-                            eval "set -- $_raw_uci"
+                            set -f; set -- $(uci_list_clean "$_raw_uci"); set +f
                             for _link in "$@"; do
                                 case "$_link" in
                                     *"@${_srv_port}"*|*"@${_srv_port}/"*|*"@${_srv_port}#"*|\
@@ -2719,7 +2896,7 @@ EOF
                             local _raw_uci
                             _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                             if [ -n "$_raw_uci" ]; then
-                                eval "set -- $_raw_uci"
+                                set -f; set -- $(uci_list_clean "$_raw_uci"); set +f
                                 for _link in "$@"; do
                                     case "$_link" in
                                         *"@${_srv_port}"*|*"://${_srv_port}"*)
@@ -3067,7 +3244,7 @@ EOF
             case "$target_mode" in
                 urltest)
                     local _utl_count
-                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { eval "set -- $_utl_raw"; _utl_count=$#; }
+                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { set -f; set -- $(uci_list_clean "$_utl_raw"); set +f; _utl_count=$#; }
                     if [ "${_utl_count:-0}" -eq 0 ]; then
                         warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
                     else
@@ -3090,7 +3267,7 @@ EOF
             local _kb_extra=""
             if [ "$target_mode" = "urltest" ]; then
                 local _utl_c _sel_c
-                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { eval "set -- $_utl_raw2"; _utl_c=$#; }
+                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { set -f; set -- $(uci_list_clean "$_utl_raw2"); set +f; _utl_c=$#; }
                 # Use Clash API count — captures ALL proxies, not just those added via bot
                 _sel_c=$(clash_request "/proxies" 2>/dev/null | \
                     jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
@@ -3296,8 +3473,8 @@ _handle_section_extras() {
             ut_url=$(uci -q get podkop.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
             ut_interval=$(uci -q get podkop.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
             ut_tol=$(uci -q get podkop.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
-            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { eval "set -- $_utl_lraw"; ut_links_count=$#; }
-            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { eval "set -- $_sel_lraw"; sel_links_count=$#; }
+            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { set -f; set -- $(uci_list_clean "$_utl_lraw"); set +f; ut_links_count=$#; }
+            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { set -f; set -- $(uci_list_clean "$_sel_lraw"); set +f; sel_links_count=$#; }
             local _clone_btn=""
             if [ "${sel_links_count:-0}" -gt 0 ]; then
                 _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
@@ -3517,7 +3694,7 @@ EOF
                     local _raw_uci
                     _raw_uci=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_raw_uci" ]; then
-                        eval "set -- $_raw_uci"
+                        set -f; set -- $(uci_list_clean "$_raw_uci"); set +f
                         for _l in "$@"; do
                             case "$_l" in *"@${_srv_port}"*|*"://${_srv_port}"*)
                                 _full_link="$_l"; break ;;
@@ -3867,11 +4044,11 @@ EOF
             r_sub_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.remote_subnet_lists=")
             excl_count=$(uci -q show podkop.settings 2>/dev/null | grep -c "^podkop\.settings\.routing_excluded_ips=")
 
-            # FIXED: use eval "set --" for list parsing (uci get N broken on BusyBox)
+            # Use safe_set_args for list parsing (glob-safe; uci get N broken on BusyBox)
             r_dom_text=""
             if [ "$r_dom_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && eval "set -- $raw" && for list_url in "$@"; do
+                [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_dom_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_dom_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
                 done
@@ -3882,7 +4059,7 @@ EOF
             r_sub_text=""
             if [ "$r_sub_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.remote_subnet_lists 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && eval "set -- $raw" && for list_url in "$@"; do
+                [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_sub_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_sub_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
                 done
@@ -3893,7 +4070,7 @@ EOF
             fr_ips_text=""
             if [ "$fr_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && eval "set -- $raw" && for ip in "$@"; do
+                [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for ip in "$@"; do
                     fr_ips_text=$(printf '%s\n• <code>%s</code>' "$fr_ips_text" "$ip")
                 done
             else
@@ -3985,7 +4162,7 @@ EOF
             text=$(printf '%s <b>Manage %s</b> [<code>%s</code>]\n\n' "$E_FILE" "$human_type" "$sec")
             raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
-                eval "set -- $raw"
+                set -f; set -- $(uci_list_clean "$raw"); set +f
                 for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     text=$(printf '%s<b>[%d]</b> <a href="%s">%s</a>\n' "$text" "$i" "$(html_escape "$list_url")" "$(html_escape "$filename")")
@@ -4009,7 +4186,7 @@ EOF
             fi
             raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
-                eval "set -- $raw"
+                set -f; set -- $(uci_list_clean "$raw"); set +f
                 for url in "$@"; do
                     if [ "$i" -eq "$idx" ]; then list_url="$url"; break; fi
                     i=$((i + 1))
@@ -4027,11 +4204,11 @@ EOF
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb
             raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
-            [ -n "$raw" ] && eval "set -- $raw" && for ip in "$@"; do
+            [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_frip_${ip}\"}],"
             done
             local fr_count=0
-            [ -n "$raw" ] && { eval "set -- $raw"; fr_count=$#; }
+            [ -n "$raw" ] && { set -f; set -- $(uci_list_clean "$raw"); set +f; fr_count=$#; }
             text=$(cat <<EOF
 ${E_FILE} <b>Fully Routed IPs</b> [<code>${sec}</code>]
 ${fr_count} entries
@@ -4059,10 +4236,10 @@ EOF
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb excl_count=0
             raw=$(uci -q show podkop.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
-            [ -n "$raw" ] && eval "set -- $raw" && for ip in "$@"; do
+            [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_excl_${ip}\"}],"
             done
-            [ -n "$raw" ] && { eval "set -- $raw"; excl_count=$#; }
+            [ -n "$raw" ] && { set -f; set -- $(uci_list_clean "$raw"); set +f; excl_count=$#; }
             text=$(cat <<EOF
 ${E_FILE} <b>Routing Excluded IPs</b> [<code>global</code>]
 ${excl_count} entries
@@ -4234,7 +4411,7 @@ _handle_fallback_socks() {
                 # Normalize to host:port for duplicate check (socks5:// and socks5h:// same endpoint)
                 local _new_hp; _new_hp=$(echo "$safe_fb" | sed 's|^socks5h\?://||')
                 if [ -n "$_existing" ]; then
-                    eval "set -- $_existing"
+                    set -f; set -- $(uci_list_clean "$_existing"); set +f
                     for _e in "$@"; do
                         local _e_hp; _e_hp=$(echo "$_e" | sed 's|^socks5h\?://||')
                         [ "$_e_hp" = "$_new_hp" ] && _dup=1 && break
@@ -4261,7 +4438,7 @@ _handle_fallback_socks() {
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             rows=""; list_text=""
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $_fb_raw"
+                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                 for _fb in "$@"; do
                     list_text=$(printf '%s\n<code>[%s]</code> %s' "$list_text" "$n" "$_fb")
                     rows="${rows}[{\"text\":\"${E_DEL} [${n}] ${_fb}\",\"callback_data\":\"ask_del_fb_${n}\"}],"
@@ -4281,7 +4458,7 @@ _handle_fallback_socks() {
             local _fb_raw
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $_fb_raw"
+                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                 for _fb in "$@"; do
                     [ "$n" -eq "$idx" ] && fb_to_del="$_fb" && break
                     n=$((n + 1))
@@ -4302,7 +4479,7 @@ _handle_fallback_socks() {
             local _fb_raw
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $_fb_raw"
+                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                 # Find value by index, delete by value (most reliable on all OpenWrt builds)
                 local _del_val=""
                 for _fb in "$@"; do
@@ -4356,7 +4533,7 @@ _handle_fallback_socks() {
                 *) result_text="${result_text}${E_ON} tier1 Podkop: <code>$lat</code>\n" ;; esac
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $_fb_raw"
+                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                 for _fb in "$@"; do
                     n=$((n + 1))
                     lat=$(_probe_fast "$_fb")
@@ -4844,7 +5021,7 @@ EOF
                 _tier=$((_tier + 1))
                 _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_fb_raw" ]; then
-                    eval "set -- $_fb_raw"
+                    set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
                     local _fn=1
                     for _fb in "$@"; do
                         _fb_esc=$(html_escape "$_fb")
@@ -5021,6 +5198,7 @@ EOF
             local text kb
             text=$(printf '%s <b>Diagnostics</b>\n\nAll actions below run active tests.\nOn slow routers they may take 10\xe2\x80\x9330 seconds.' "$E_TEST")
             kb="{\"inline_keyboard\":[
+                [{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound\"}],
                 [{\"text\":\"${E_SCAN} Upstream Health\",\"callback_data\":\"ask_upstream_health\"}],
                 [{\"text\":\"${E_GLOB} Global Check\",\"callback_data\":\"ask_run_podkop_tests\"},{\"text\":\"${E_CPU} Internal Diag\",\"callback_data\":\"ask_run_internal_diag\"}],
                 [{\"text\":\"${E_LOG} Support Bundle\",\"callback_data\":\"ask_support_bundle\"}],
@@ -5055,6 +5233,161 @@ EOF
             text=$(printf '%s <b>Support Bundle</b>\n\nCollects everything: versions, UCI config (token redacted), routes, nft, interfaces, bot transport state, last 80 syslog lines.\nSends as a single text file.\n\n<i>~5 sec. Share with maintainer when reporting bugs.</i>' "$E_WARN")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Collect & Send\",\"callback_data\":\"cmd_support_bundle\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "ask_probe_outbound")
+            local sec proxy_mode active_px active_px_display text kb
+            sec=$(get_active_section)
+            proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            local proxies; proxies=$(clash_request "/proxies")
+            active_px=$(get_active_proxy_name "$proxies")
+            active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
+            local mode_note=""
+            [ "$proxy_mode" = "urltest" ] && mode_note="\n<i>URLTest mode: testing current auto-selected proxy.</i>"
+            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Discord)\n• Download throughput — detects ISP throttle and 16 KB block\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 15–30 sec. Traffic ~250 KB.</i>' \
+                "$E_MICRO" "$active_px_display" "$mode_note")
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "cmd_probe_outbound")
+            # Cooldown: not more than once per 2 minutes
+            local _probe_ts_file="/tmp/podkop_probe_ts"
+            local _now; _now=$(date +%s)
+            local _last; _last=$(cat "$_probe_ts_file" 2>/dev/null || echo 0)
+            if [ $((_now - _last)) -lt 120 ]; then
+                local _wait=$(( 120 - (_now - _last) ))
+                send_or_edit "$mid" "$(printf '%s Cooldown active. Try again in %ds.' "$E_WARN" "$_wait")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_diagnostics\"}]]}"
+                return
+            fi
+            printf '%s' "$_now" > "$_probe_ts_file"
+
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 1/4: Geo location...' "$E_MICRO")" ""
+
+            # Collect context
+            local sec proxy_mode proxies active_px active_px_display px_type
+            sec=$(get_active_section)
+            proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            proxies=$(clash_request "/proxies")
+            active_px=$(get_active_proxy_name "$proxies")
+            active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
+            px_type=$(echo "$proxies" | jq -r \
+                --arg n "$(echo "$proxies" | jq -r --arg sel "$(get_selector_tag "$proxies")" \
+                    '. as $r | $r.proxies[$sel].now // empty' 2>/dev/null)" \
+                '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
+
+            # Step 1: Geo
+            PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""
+            probe_geo
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 2/4: Google hint...' "$E_MICRO")" ""
+
+            # Step 2: Google
+            PROBE_GOOGLE_COUNTRY=""
+            probe_google
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 3/4: Services...' "$E_MICRO")" ""
+
+            # Step 3: Services
+            PROBE_SVC_RESULTS=""; PROBE_TG_BLOCKED=0
+            probe_services
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 4/4: Throughput (200 KB)...' "$E_MICRO")" ""
+
+            # Step 4: Throughput
+            PROBE_SPEED_MBPS=""; PROBE_SPEED_BYTES=0; PROBE_SPEED_SECS=""; PROBE_SPEED_STATUS=""
+            probe_throughput
+
+            # ── Build result card ──────────────────────────────────────────
+            local size_kb_disp
+            size_kb_disp=$(awk "BEGIN{printf \"%d\", ${PROBE_SPEED_BYTES:-0} / 1024}")
+
+            local speed_line speed_verdict
+            case "${PROBE_SPEED_STATUS:-ok}" in
+                ok)
+                    speed_line="${E_OK} ${PROBE_SPEED_MBPS} Mbps"
+                    speed_verdict=""
+                    ;;
+                throttled)
+                    speed_line="${E_RED} ${PROBE_SPEED_MBPS} Mbps"
+                    speed_verdict="\n${E_WARN} <b>ISP throttle suspected</b> — speed below 0.8 Mbps threshold."
+                    ;;
+                block16k)
+                    speed_line="${E_RED} —"
+                    speed_verdict="\n${E_WARN} <b>16 KB block suspected</b> — connection dropped after ~16 KB.\nThis is a known RKN pattern: first packets pass, then traffic is cut."
+                    ;;
+                blocked)
+                    speed_line="${E_RED} —"
+                    speed_verdict="\n${E_WARN} <b>Connection blocked</b> — almost no data received."
+                    ;;
+            esac
+
+            # Services block — heredoc feeds PROBE_SVC_RESULTS in current shell.
+            # || [ -n "$_sname" ] guards last line if $() stripped trailing newline.
+            local svc_block=""
+            local _tab; _tab=$(printf '\t')
+            while IFS="$_tab" read -r _sname _sicon _sdetail || [ -n "$_sname" ]; do
+                [ -z "$_sname" ] && continue
+                svc_block=$(printf '%s\n%-15s %s%s' "$svc_block" "$_sname" "$_sicon" "$_sdetail")
+            done <<EOF
+${PROBE_SVC_RESULTS}
+EOF
+            svc_block="${svc_block#?}"  # strip leading newline
+
+            # Mode hint
+            local mode_hint=""
+            case "$proxy_mode" in
+                urltest)  mode_hint=" <i>(URLTest auto)</i>" ;;
+                selector) mode_hint="" ;;
+            esac
+
+            # Org line
+            local org_line=""
+            [ -n "$PROBE_ORG" ] && org_line="\n${E_CPU} <code>${PROBE_ORG}</code>"
+
+            local result_text
+            result_text=$(printf '%s <b>Active Outbound Probe</b>
+<code>────────────────────</code>
+%s <b>%s</b>%s | <code>%s</code>
+<code>────────────────────</code>
+%s <b>Exit IP:</b> <code>%s</code>
+%s <b>GeoIP:</b> %s%s
+%s <b>Google:</b> %s
+<code>────────────────────</code>
+%s <b>Services:</b>
+<code>%s</code>
+<code>────────────────────</code>
+%s <b>Throughput:</b> %s
+%s <b>Downloaded:</b> %s KB in %ss%s' \
+                "$E_MICRO" \
+                "$E_GLOB" "$active_px_display" "$mode_hint" "$px_type" \
+                "$E_MAP" "$PROBE_EXIT_IP" \
+                "$E_MAP" "$PROBE_COUNTRY" "$org_line" \
+                "$E_MAP" "$PROBE_GOOGLE_COUNTRY" \
+                "$E_ENVELOPE" \
+                "$svc_block" \
+                "$E_BOLT" "$speed_line" \
+                "$E_BOLT" "$size_kb_disp" "$PROBE_SPEED_SECS" \
+                "$speed_verdict")
+
+            # Action buttons — context-aware
+            local action_btn=""
+            if [ "${PROBE_TG_BLOCKED:-0}" = "1" ]; then
+                action_btn="[{\"text\":\"${E_BOT} Bot Settings\",\"callback_data\":\"bot_settings\"}],"
+            elif [ "$PROBE_SPEED_STATUS" = "throttled" ] || [ "$PROBE_SPEED_STATUS" = "block16k" ] || [ "$PROBE_SPEED_STATUS" = "blocked" ]; then
+                case "$proxy_mode" in
+                    urltest)
+                        action_btn="[{\"text\":\"${E_TEST} Test All Proxies\",\"callback_data\":\"cmd_all_delay_test\"}],"
+                        ;;
+                    *)
+                        action_btn="[{\"text\":\"${E_GLOB} Switch Proxy\",\"callback_data\":\"proxy_menu\"}],"
+                        ;;
+                esac
+            fi
+
+            local result_kb
+            result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+
+            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
+            send_or_edit "$mid" "$result_text" "$result_kb"
             ;;
 
         "cmd_upstream_health")
@@ -5523,6 +5856,7 @@ handle_command() {
         do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
+        ask_probe_outbound|cmd_probe_outbound|\
         cmd_check_update_bot|ask_update_bot_*|do_update_bot_*|\
         ask_restart_bot|do_restart_bot|\
         ask_restart_router_1|ask_restart_router_2)
