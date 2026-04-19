@@ -99,8 +99,12 @@ MAIN_ROUTE_KEY_FILE="/tmp/podkop_bot_main_route_key"
 # Called at every successful tier resolution so watchdog always reads fresh data.
 _write_main_route() {
     local _key="$1" _name="$2"
-    printf '%s' "$_name" > "$MAIN_ROUTE_FILE"
-    printf '%s' "$_key"  > "$MAIN_ROUTE_KEY_FILE"
+    # Atomic write via tmp+mv — prevents watchdog reading a truncated (empty) file
+    # between O_TRUNC and the actual write (TOCTOU on tmpfs).
+    printf '%s' "$_name" > "${MAIN_ROUTE_FILE}.tmp"  && \
+        mv "${MAIN_ROUTE_FILE}.tmp"     "$MAIN_ROUTE_FILE"     2>/dev/null
+    printf '%s' "$_key"  > "${MAIN_ROUTE_KEY_FILE}.tmp" && \
+        mv "${MAIN_ROUTE_KEY_FILE}.tmp" "$MAIN_ROUTE_KEY_FILE" 2>/dev/null
 }
 ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
 LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
@@ -990,7 +994,10 @@ send_or_edit() {
         local alert_mid menu_mid
         alert_mid=$(cat "$LAST_ALERT_MSG_FILE" 2>/dev/null)
         menu_mid=$(cat "$LAST_MENU_MSG_FILE" 2>/dev/null)
-        if [ -n "$alert_mid" ] && [ -n "$menu_mid" ] && [ "$alert_mid" -gt "$menu_mid" ] 2>/dev/null; then
+        # Validate as integers — empty or non-numeric values crash ash with -gt
+        case "$alert_mid" in ''|*[!0-9]*) alert_mid=0 ;; esac
+        case "$menu_mid"  in ''|*[!0-9]*) menu_mid=0  ;; esac
+        if [ "$alert_mid" -gt 0 ] && [ "$menu_mid" -gt 0 ] && [ "$alert_mid" -gt "$menu_mid" ]; then
             # Alert is newer than menu — re-float: delete buried menu, send fresh
             api_request "deleteMessage" \
                 "$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg m "$mid" \
@@ -1703,10 +1710,10 @@ probe_services() {
     [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # ChatGPT — Statsig endpoint, must be POST (GET returns 403)
-    # Returns country in .derived_fields.country
+    # ChatGPT — Statsig endpoint, POST with --compressed (Accept-Encoding: gzip)
+    # ipregion.sh uses curl_wrapper which always adds --compressed
     _name="ChatGPT"
-    _code=$(curl -s -k -X POST \
+    _code=$(curl -s -k -X POST --compressed \
         -H "Statsig-Api-Key: ${_statsig_key}" \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 10 \
@@ -1729,22 +1736,31 @@ probe_services() {
     rm -f /tmp/podkop_probe_svc.tmp
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # Claude.ai — /api/auth/session returns 401 when not logged in but service is reachable
-    # 401 = accessible (auth required), 403/timeout = geo-blocked or unreachable
+    # Claude / Anthropic — status.anthropic.com is public, not CF-protected
+    # Returns JSON with status indicator — accessible from any region if not blocked
     _name="Claude.ai"
-    _code=$(curl -s -k -L \
-        -A "$_ua" \
+    _code=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 10 \
-        -o /dev/null \
+        -o /tmp/podkop_probe_svc.tmp \
         -w "%{http_code}" \
-        "https://claude.ai/api/auth/session" 2>/dev/null)
-    case "$_code" in
-        200|401) _icon="${E_OK}";  _detail="" ;;
-        ''|000)  _icon="${E_RED}"; _detail=" (timeout)" ;;
-        403|451) _icon="${E_RED}"; _detail=" (geo-blocked)" ;;
-        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
-    esac
+        "https://status.anthropic.com/api/v2/status.json" 2>/dev/null)
+    _detail=""
+    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
+        local _claude_status
+        _claude_status=$(jq -r '.status.indicator // empty' /tmp/podkop_probe_svc.tmp 2>/dev/null)
+        case "$_claude_status" in
+            none)       _icon="${E_OK}"; _detail="" ;;
+            minor)      _icon="${E_YLW}"; _detail=" (minor issues)" ;;
+            major|critical) _icon="${E_RED}"; _detail=" (outage)" ;;
+            *)          _icon="${E_OK}"; _detail="" ;;
+        esac
+    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
+        _icon="${E_RED}"; _detail=" (timeout)"
+    else
+        _icon="${E_RED}"; _detail=" (HTTP $_code)"
+    fi
+    rm -f /tmp/podkop_probe_svc.tmp
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
     # Discord
@@ -1806,6 +1822,65 @@ probe_throughput() {
     if [ "$size_kb" -ge 14 ] && [ "$size_kb" -le 20 ] && [ "$PROBE_SPEED_STATUS" = "blocked" ]; then
         PROBE_SPEED_STATUS="block16k"
     fi
+}
+
+# probe_dns_hijacking: detect ISP DNS substitution by comparing regular DNS vs DoH.
+# Ported from dpicheck.sh (doc index 12). Runs WITHOUT proxy — tests ISP directly.
+# Both nslookup and DoH curl go direct (no SOCKS) — this tests the ISP, not the proxy.
+# Sets: DNS_HIJACK_DOMAIN, DNS_HIJACK_IP, DNS_HIJACK_STATUS (ok|hijacked|inconclusive)
+# inconclusive = DoH servers unreachable (ISP may be blocking DoH itself)
+probe_dns_hijacking() {
+    DNS_HIJACK_STATUS="ok"
+    DNS_HIJACK_DOMAIN=""
+    DNS_HIJACK_IP=""
+
+    # Test domains — known blocked in RU, stable IPs elsewhere
+    local _test_domains="rutracker.org linkedin.com flibusta.is"
+    # DoH servers — try both, no proxy
+    local _doh_servers="https://cloudflare-dns.com/dns-query https://dns.google/dns-query"
+
+    local _domain _dns_ip _doh_ip _doh_url _doh_resp _doh_ok=0
+
+    for _domain in $_test_domains; do
+        # Step 1: regular DNS (router's ISP DNS — potentially hijacked)
+        # BusyBox nslookup outputs "Address 1: x.x.x.x" not "Address: x.x.x.x"
+        # Use /^Address( [0-9]+)?:/ and $NF to handle both formats
+        _dns_ip=$(nslookup -type=A "$_domain" 2>/dev/null | \
+            awk '/^Address( [0-9]+)?:/ && !/#/ {print $NF; exit}')
+        [ -z "$_dns_ip" ] && continue
+
+        # Step 2: DoH — direct HTTPS, bypasses ISP DNS
+        _doh_ip=""
+        for _doh_url in $_doh_servers; do
+            _doh_resp=$(curl -s -k \
+                --connect-timeout 5 --max-time 8 \
+                -H "accept: application/dns-json" \
+                "${_doh_url}?name=${_domain}&type=A" 2>/dev/null)
+            _doh_ip=$(printf '%s' "$_doh_resp" | \
+                jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null | \
+                head -1)
+            [ -n "$_doh_ip" ] && { _doh_ok=1; break; }
+        done
+
+        # DoH unreachable for this domain — ISP may be blocking DoH
+        if [ -z "$_doh_ip" ]; then
+            DNS_HIJACK_STATUS="inconclusive"
+            continue
+        fi
+
+        # Step 3: compare
+        if [ "$_dns_ip" != "$_doh_ip" ]; then
+            DNS_HIJACK_STATUS="hijacked"
+            DNS_HIJACK_DOMAIN="$_domain"
+            DNS_HIJACK_IP="$_dns_ip"
+            logger -t podkop-bot "[Probe] DNS hijacking: ${_domain} → ${_dns_ip} (DoH: ${_doh_ip})"
+            return
+        fi
+    done
+
+    # If we never reached a DoH server at all — inconclusive
+    [ "$_doh_ok" = "0" ] && DNS_HIJACK_STATUS="inconclusive"
+    logger -t podkop-bot "[Probe] DNS hijacking check: ${DNS_HIJACK_STATUS}"
 }
 
 
@@ -5314,7 +5389,7 @@ EOF
             active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
             local mode_note=""
             [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
-            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Discord)\n• Download throughput — detects ISP throttle and 16 KB block\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 15–30 sec. Traffic ~250 KB.</i>' \
+            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Discord)\n• Download throughput — detects ISP throttle and 16 KB block\n• DNS hijacking check (ISP DNS vs DoH)\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~250 KB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -5350,21 +5425,26 @@ EOF
             # Step 1: Geo
             PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""
             probe_geo
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 2/4: Google hint...' "$E_MICRO")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 2/5: Google hint...' "$E_MICRO")" ""
 
             # Step 2: Google
             PROBE_GOOGLE_COUNTRY=""
             probe_google
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 3/4: Services...' "$E_MICRO")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 3/5: Services...' "$E_MICRO")" ""
 
             # Step 3: Services
             PROBE_SVC_RESULTS=""; PROBE_TG_BLOCKED=0
             probe_services
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 4/4: Throughput (200 KB)...' "$E_MICRO")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 4/5: Throughput (200 KB)...' "$E_MICRO")" ""
 
             # Step 4: Throughput
             PROBE_SPEED_MBPS=""; PROBE_SPEED_BYTES=0; PROBE_SPEED_SECS=""; PROBE_SPEED_STATUS=""
             probe_throughput
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 5/5: DNS hijacking check...' "$E_MICRO")" ""
+
+            # Step 5: DNS hijacking (tests ISP directly, no proxy)
+            DNS_HIJACK_STATUS=""; DNS_HIJACK_DOMAIN=""; DNS_HIJACK_IP=""
+            probe_dns_hijacking
 
             # ── Build result card ──────────────────────────────────────────
             local size_kb_disp
@@ -5413,6 +5493,21 @@ EOF
             local org_line=""
             [ -n "$PROBE_ORG" ] && org_line=$(printf '\n%s <code>%s</code>' "$E_ORG" "$PROBE_ORG")
 
+            # DNS hijacking block
+            local dns_line
+            case "${DNS_HIJACK_STATUS:-ok}" in
+                hijacked)
+                    dns_line=$(printf '%s <b>DNS hijacked!</b> ISP redirects <code>%s</code> → <code>%s</code>' \
+                        "$E_WARN" "$DNS_HIJACK_DOMAIN" "$DNS_HIJACK_IP")
+                    ;;
+                ok)
+                    dns_line="${E_OK} No DNS hijacking detected"
+                    ;;
+                inconclusive)
+                    dns_line="${E_YLW} DNS check inconclusive — DoH servers unreachable (ISP may block DoH)"
+                    ;;
+            esac
+
             local result_text
             result_text=$(printf '%b <b>Active Outbound Probe</b>
 <code>────────────────────</code>
@@ -5426,7 +5521,9 @@ EOF
 <code>%s</code>
 <code>────────────────────</code>
 %s <b>Throughput:</b> %s
-%s <b>Downloaded:</b> %s KB in %ss%b' \
+%s <b>Downloaded:</b> %s KB in %ss%b
+<code>────────────────────</code>
+%s' \
                 "$E_MICRO" \
                 "$E_GLOB" "$active_px_display" "$mode_hint" "$px_type" \
                 "$E_MAP" "$PROBE_EXIT_IP" \
@@ -5436,7 +5533,8 @@ EOF
                 "$svc_block" \
                 "$E_BOLT" "$speed_line" \
                 "$E_BOLT" "$size_kb_disp" "$PROBE_SPEED_SECS" \
-                "$speed_verdict")
+                "$speed_verdict" \
+                "$dns_line")
 
             # Action buttons — context-aware
             local action_btn=""
@@ -5456,7 +5554,7 @@ EOF
             local result_kb
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
 
-            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
+            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS} dns=${DNS_HIJACK_STATUS:-ok}${DNS_HIJACK_DOMAIN:+/}${DNS_HIJACK_DOMAIN}"
             send_or_edit "$mid" "$result_text" "$result_kb"
             ;;
 
