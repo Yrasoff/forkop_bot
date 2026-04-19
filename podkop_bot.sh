@@ -145,6 +145,7 @@ E_PENGUIN=$(printf '\xF0\x9F\x90\xA7')
 E_DOG=$(printf '\xF0\x9F\x90\xB6')
 E_BOX=$(printf '\xF0\x9F\x93\xA6')
 E_ENVELOPE=$(printf '\xF0\x9F\x93\xA8')
+E_ORG=$(printf '\xF0\x9F\x8F\xA2')
 E_NET=$(printf '\xF0\x9F\x94\x97')
 E_ON=$(printf '\xF0\x9F\x9F\xA2')
 E_OFF=$(printf '\xE2\x9A\xAA')
@@ -1645,62 +1646,79 @@ probe_services() {
     PROBE_SVC_RESULTS=""
     PROBE_TG_BLOCKED=0
 
-    local _name _url _expected _parse _flags _header _code _icon _detail _tab _curl_extra
+    local _name _url _expected _parse _code _icon _detail _tab
     _tab=$(printf '\t')
-
-    # Statsig key for ChatGPT geo check — public client key from ipregion.sh (vernette)
     local _statsig_key="client-zUdXdSTygXJdzoE0sWTkP8GKTVsUMF2IRM7ShVO2JAG"
+    local _ua="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+    local _proxy="-x socks5h://${m_ip}:${m_port}"
+    local _curl_base="curl -s -k --connect-timeout 6 --max-time 10"
 
-    # Service list format: name|url|expected_code|jq_parse|flags|header
-    # flags: follow = -L (follow redirects)
-    # jq_parse: jq expression to extract detail from response JSON (optional)
-    # header: HTTP header to add (optional)
-    # Feed via heredoc — loop runs in current shell, variables survive after loop.
-    # || [ -n "$_name" ] guards last line without trailing newline.
-    while IFS='|' read -r _name _url _expected _parse _flags _header || [ -n "$_name" ]; do
-        [ -z "$_name" ] && continue
-
-        _curl_extra=""
-        [ "$_flags" = "follow" ] && _curl_extra="-L"
-
-        local _header_arg=""
-        [ -n "$_header" ] && _header_arg="-H $_header"
-
-        # shellcheck disable=SC2086
-        _code=$(curl -s -k $_curl_extra $_header_arg \
-            -x "socks5h://${m_ip}:${m_port}" \
-            --connect-timeout 6 --max-time 10 \
-            -o /tmp/podkop_probe_svc.tmp \
-            -w "%{http_code}" \
-            "$_url" 2>/dev/null)
-
+    # Helper: run probe, set _code and optionally parse JSON for _detail
+    _probe() {
+        local __url="$1" __expected="$2" __parse="$3"
+        shift 3
+        _code=$($_curl_base $_proxy -o /tmp/podkop_probe_svc.tmp -w "%{http_code}" "$@" "$__url" 2>/dev/null)
         _detail=""
-        if [ -n "$_parse" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-            _detail=$(jq -r "$_parse // empty" /tmp/podkop_probe_svc.tmp 2>/dev/null || echo "")
+        if [ -n "$__parse" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
+            _detail=$(jq -r "$__parse // empty" /tmp/podkop_probe_svc.tmp 2>/dev/null || echo "")
             [ -n "$_detail" ] && _detail=" ($_detail)"
         fi
         rm -f /tmp/podkop_probe_svc.tmp
-
         case "$_code" in
-            "$_expected")        _icon="${E_OK}" ;;
+            "$__expected")       _icon="${E_OK}" ;;
             ''|000)              _icon="${E_RED}"; _detail=" (timeout)" ;;
             301|302|303|307|308) _icon="${E_YLW}"; _detail=" (redirect $_code)" ;;
             403|451)             _icon="${E_RED}"; _detail=" (blocked $_code)" ;;
             *)                   _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
         esac
+    }
 
-        # Track Telegram API block — variable set directly, no tmpfs needed
-        [ "$_name" = "Telegram API" ] && [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
-
-        PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+    # YouTube — sw.js_data endpoint returns country as ipregion.sh approach
+    # tail -n +3 skips first 2 lines (non-JSON prefix), then parse country field
+    _name="YouTube"
+    _code=$(curl -s -k \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 10 \
+        -o /tmp/podkop_probe_svc.tmp \
+        -w "%{http_code}" \
+        "https://www.youtube.com/sw.js_data" 2>/dev/null)
+    _detail=""
+    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
+        local _yt_country
+        _yt_country=$(tail -n +3 /tmp/podkop_probe_svc.tmp 2>/dev/null | \
+            jq -r '.[0][2][0][0][1] // empty' 2>/dev/null)
+        [ -n "$_yt_country" ] && _detail=" ($_yt_country)"
+        _icon="${E_OK}"
+    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
+        _icon="${E_RED}"; _detail=" (timeout)"
+    else
+        _icon="${E_RED}"; _detail=" (HTTP $_code)"
+    fi
+    rm -f /tmp/podkop_probe_svc.tmp
+    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    done <<EOF
-YouTube|https://www.youtube.com/generate_204|204||
-Telegram API|https://api.telegram.org|200||follow|
-ChatGPT|https://ab.chatgpt.com/v1/initialize|200|.derived_fields.country||Statsig-Api-Key: ${_statsig_key}
-Claude.ai|https://claude.ai|200||follow|
-Discord|https://discord.com/api/v9/gateway|200|||
-EOF
+    # Telegram API
+    _name="Telegram API"
+    _probe "https://api.telegram.org" "200" "" -L
+    [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
+    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+"
+    # ChatGPT — Statsig endpoint returns geo country
+    _name="ChatGPT"
+    _probe "https://ab.chatgpt.com/v1/initialize" "200" ".derived_fields.country" \
+        -H "Statsig-Api-Key: ${_statsig_key}"
+    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+"
+    # Claude.ai — reachability check with browser UA
+    _name="Claude.ai"
+    _probe "https://claude.ai" "200" "" -L -A "$_ua"
+    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+"
+    # Discord
+    _name="Discord"
+    _probe "https://discord.com/api/v9/gateway" "200" ""
+    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+"
 }
 
 # probe_throughput: measure download speed through active outbound
@@ -5277,7 +5295,7 @@ EOF
             if [ $((_now - _last)) -lt 120 ]; then
                 local _wait=$(( 120 - (_now - _last) ))
                 send_or_edit "$mid" "$(printf '%s Cooldown active. Try again in %ds.' "$E_WARN" "$_wait")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_diagnostics\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"ask_probe_outbound\"}]]}"
                 return
             fi
             printf '%s' "$_now" > "$_probe_ts_file"
@@ -5360,7 +5378,7 @@ EOF
 
             # Org line
             local org_line=""
-            [ -n "$PROBE_ORG" ] && org_line=$(printf '\n%s <code>%s</code>' "$E_CPU" "$PROBE_ORG")
+            [ -n "$PROBE_ORG" ] && org_line=$(printf '\n%s <code>%s</code>' "$E_ORG" "$PROBE_ORG")
 
             local result_text
             result_text=$(printf '%b <b>Active Outbound Probe</b>
