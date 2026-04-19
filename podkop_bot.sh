@@ -1703,15 +1703,48 @@ probe_services() {
     [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # ChatGPT — Statsig endpoint returns geo country
+    # ChatGPT — Statsig endpoint, must be POST (GET returns 403)
+    # Returns country in .derived_fields.country
     _name="ChatGPT"
-    _probe "https://ab.chatgpt.com/v1/initialize" "200" ".derived_fields.country" \
-        -H "Statsig-Api-Key: ${_statsig_key}"
+    _code=$(curl -s -k -X POST \
+        -H "Statsig-Api-Key: ${_statsig_key}" \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 10 \
+        -o /tmp/podkop_probe_svc.tmp \
+        -w "%{http_code}" \
+        "https://ab.chatgpt.com/v1/initialize" 2>/dev/null)
+    _detail=""
+    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
+        local _gpt_country
+        _gpt_country=$(jq -r '.derived_fields.country // empty' /tmp/podkop_probe_svc.tmp 2>/dev/null)
+        [ -n "$_gpt_country" ] && _detail=" ($_gpt_country)"
+        _icon="${E_OK}"
+    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
+        _icon="${E_RED}"; _detail=" (timeout)"
+    elif [ "$_code" = "403" ] || [ "$_code" = "451" ]; then
+        _icon="${E_RED}"; _detail=" (geo-blocked)"
+    else
+        _icon="${E_YLW}"; _detail=" (HTTP $_code)"
+    fi
+    rm -f /tmp/podkop_probe_svc.tmp
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # Claude.ai — reachability check with browser UA
+    # Claude.ai — /api/auth/session returns 401 when not logged in but service is reachable
+    # 401 = accessible (auth required), 403/timeout = geo-blocked or unreachable
     _name="Claude.ai"
-    _probe "https://claude.ai" "200" "" -L -A "$_ua"
+    _code=$(curl -s -k -L \
+        -A "$_ua" \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 10 \
+        -o /dev/null \
+        -w "%{http_code}" \
+        "https://claude.ai/api/auth/session" 2>/dev/null)
+    case "$_code" in
+        200|401) _icon="${E_OK}";  _detail="" ;;
+        ''|000)  _icon="${E_RED}"; _detail=" (timeout)" ;;
+        403|451) _icon="${E_RED}"; _detail=" (geo-blocked)" ;;
+        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+    esac
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
     # Discord
