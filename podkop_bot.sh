@@ -1716,7 +1716,7 @@ probe_services() {
     _code=$(curl -s -k -X POST --compressed \
         -H "Statsig-Api-Key: ${_statsig_key}" \
         -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 10 \
+        --connect-timeout 8 --max-time 15 \
         -o /tmp/podkop_probe_svc.tmp \
         -w "%{http_code}" \
         "https://ab.chatgpt.com/v1/initialize" 2>/dev/null)
@@ -1739,7 +1739,7 @@ probe_services() {
     # Claude / Anthropic — status.anthropic.com is public, not CF-protected
     # Returns JSON with status indicator — accessible from any region if not blocked
     _name="Claude.ai"
-    _code=$(curl -s -k \
+    _code=$(curl -s -k -L \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 10 \
         -o /tmp/podkop_probe_svc.tmp \
@@ -1848,6 +1848,12 @@ probe_dns_hijacking() {
         _dns_ip=$(nslookup -type=A "$_domain" 2>/dev/null | \
             awk '/^Address( [0-9]+)?:/ && !/#/ {print $NF; exit}')
         [ -z "$_dns_ip" ] && continue
+
+        # Skip local resolver addresses — these indicate a local DNS (stubby, FakeTLS,
+        # podkop fake-IP, etc.) and are not ISP hijacking
+        case "$_dns_ip" in
+            127.*|0.0.0.0|::1|"") continue ;;
+        esac
 
         # Step 2: DoH — direct HTTPS, bypasses ISP DNS
         _doh_ip=""
