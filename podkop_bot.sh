@@ -18,7 +18,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.95"
+BOT_VERSION="0.13.96"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -1606,6 +1606,7 @@ probe_geo() {
     m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
 
+    # Primary: ipapi.co — IP, country, ASN/org
     resp=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 10 \
@@ -1619,6 +1620,16 @@ probe_geo() {
     [ -z "$PROBE_EXIT_IP" ] && PROBE_EXIT_IP="N/A"
     [ -z "$PROBE_COUNTRY" ] && PROBE_COUNTRY="N/A"
     [ -z "$PROBE_ORG" ] && PROBE_ORG=""
+
+    # Secondary: Cloudflare cdn-cgi/trace — independent geo source, plain text, no rate limit
+    # Returns: loc=NL, colo=AMS — how Cloudflare sees the exit IP
+    local cf_resp
+    cf_resp=$(curl -s -k \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 8 \
+        "https://cloudflare.com/cdn-cgi/trace" 2>/dev/null)
+    PROBE_CF_COUNTRY=$(printf '%s' "$cf_resp" | grep '^loc=' | cut -d= -f2 | tr -d '\r')
+    [ -z "$PROBE_CF_COUNTRY" ] && PROBE_CF_COUNTRY="N/A"
 }
 
 # probe_google: get Google's geo hint through active outbound
@@ -1710,44 +1721,34 @@ probe_services() {
     [ "$_icon" != "${E_OK}" ] && PROBE_TG_BLOCKED=1
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # ChatGPT — Statsig endpoint, POST with --compressed (Accept-Encoding: gzip)
-    # ipregion.sh uses curl_wrapper which always adds --compressed
+    # ChatGPT — platform.openai.com/v1/models returns 401 (auth required) = accessible
+    # ab.chatgpt.com times out on many datacenter IPs — use API endpoint instead
     _name="ChatGPT"
-    _code=$(curl -s -k -X POST --compressed \
-        -H "Statsig-Api-Key: ${_statsig_key}" \
+    _code=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 8 --max-time 15 \
-        -o /tmp/podkop_probe_svc.tmp \
+        -o /dev/null \
         -w "%{http_code}" \
-        "https://ab.chatgpt.com/v1/initialize" 2>/dev/null)
-    _detail=""
-    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-        local _gpt_country
-        _gpt_country=$(jq -r '.derived_fields.country // empty' /tmp/podkop_probe_svc.tmp 2>/dev/null)
-        [ -n "$_gpt_country" ] && _detail=" ($_gpt_country)"
-        _icon="${E_OK}"
-    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
-        _icon="${E_RED}"; _detail=" (timeout)"
-    elif [ "$_code" = "403" ] || [ "$_code" = "451" ]; then
-        _icon="${E_RED}"; _detail=" (geo-blocked)"
-    else
-        _icon="${E_YLW}"; _detail=" (HTTP $_code)"
-    fi
-    rm -f /tmp/podkop_probe_svc.tmp
+        "https://api.openai.com/v1/models" 2>/dev/null)
+    case "$_code" in
+        200|401) _icon="${E_OK}";  _detail="" ;;
+        ''|000)  _icon="${E_RED}"; _detail=" (timeout)" ;;
+        403|451) _icon="${E_RED}"; _detail=" (geo-blocked)" ;;
+        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+    esac
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # Claude.ai — test actual frontend, not status page
-    # status.anthropic.com is on separate infra and always returns 200 regardless of geo/proxy ban
-    # claude.ai/login goes through Cloudflare and reflects real geo/IP restrictions
+    # Claude.ai — api.anthropic.com/v1/models returns 401 (auth required) = accessible
+    # claude.ai/login returns 403 for datacenter IPs via Cloudflare — use API instead
     _name="Claude.ai"
-    _code=$(curl -s -k -L -A "$_ua" \
+    _code=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 10 \
         -o /dev/null \
         -w "%{http_code}" \
-        "https://claude.ai/login" 2>/dev/null)
+        "https://api.anthropic.com/v1/models" 2>/dev/null)
     case "$_code" in
-        200)     _icon="${E_OK}"; _detail="" ;;
+        200|401) _icon="${E_OK}";  _detail="" ;;
         ''|000)  _icon="${E_RED}"; _detail=" (timeout)" ;;
         403|451) _icon="${E_RED}"; _detail=" (geo-blocked)" ;;
         *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
@@ -1848,117 +1849,6 @@ probe_throughput() {
     fi
 }
 
-# probe_dns_hijacking: detect ISP DNS substitution by comparing regular DNS vs DoH.
-# Ported from dpicheck.sh (doc index 12). Runs WITHOUT proxy — tests ISP directly.
-# Both nslookup and DoH curl go direct (no SOCKS) — this tests the ISP, not the proxy.
-# Sets: DNS_HIJACK_DOMAIN, DNS_HIJACK_IP, DNS_HIJACK_STATUS (ok|hijacked|inconclusive)
-# inconclusive = DoH servers unreachable (ISP may be blocking DoH itself)
-probe_dns_hijacking() {
-    DNS_HIJACK_STATUS="ok"
-    DNS_HIJACK_DOMAIN=""
-    DNS_HIJACK_IP=""
-    DNS_HIJACK_ISP_BLOCKS_DOH=0
-
-    # Get proxy address for fallback DoH (used if ISP blocks direct DoH)
-    local m_ip m_port _sec
-    _sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${_sec}.mixed_proxy_port 2>/dev/null || echo "2080")
-    m_ip=$(get_proxy_ip)
-
-    # Test domains — known blocked in RU, stable IPs elsewhere
-    local _test_domains="rutracker.org linkedin.com flibusta.is"
-    # DoH servers — try both, no proxy
-    local _doh_servers="https://cloudflare-dns.com/dns-query https://dns.google/dns-query"
-
-    local _domain _dns_ip _doh_ip _doh_url _doh_resp _doh_ok=0
-
-    # Find ISP upstream DNS — skip local/fake resolvers
-    # resolv.conf on OpenWrt+podkop points to 127.0.0.42 (sing-box fake-IP).
-    # We need the real upstream DNS to detect ISP substitution.
-    local _isp_dns="" _candidate
-    for _candidate in $(awk '/^nameserver/{print $2}' /tmp/resolv.conf.auto /etc/resolv.conf 2>/dev/null); do
-        case "$_candidate" in
-            127.*|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;;
-            *) _isp_dns="$_candidate"; break ;;
-        esac
-    done
-    # Fallback: podkop configured DNS server
-    [ -z "$_isp_dns" ] && _isp_dns=$(uci -q get podkop.settings.dns_server 2>/dev/null)
-    # Last resort: use 8.8.8.8 so test still runs
-    [ -z "$_isp_dns" ] && _isp_dns="8.8.8.8"
-    logger -t podkop-bot "[Probe] DNS hijacking — using upstream: ${_isp_dns}"
-
-    for _domain in $_test_domains; do
-        # Step 1: query via ISP upstream DNS (not local fake-IP resolver)
-        _dns_ip=$(nslookup -type=A "$_domain" "$_isp_dns" 2>/dev/null | \
-            awk '/^Address( [0-9]+)?:/ && !/#/ {print $NF; exit}')
-        [ -z "$_dns_ip" ] && continue
-
-        # Skip local/fake resolver addresses:
-        # 127.x.x.x   — loopback (stubby, local DNS proxy)
-        # 0.0.0.0      — NXDOMAIN substitute
-        # ::1          — IPv6 loopback
-        # 198.18.x.x   — podkop fake-IP range (RFC 2544 test range, used by sing-box)
-        # 10.x / 192.168.x / 172.16-31.x — private ranges (some local DNS setups)
-        case "$_dns_ip" in
-            127.*|0.0.0.0|::1|"") continue ;;
-            198.18.*|198.19.*)    continue ;;  # podkop fake-IP
-        esac
-
-        # Step 2: DoH — try direct first (no proxy), then via proxy
-        # Direct = tests ISP behaviour. Via proxy = fallback if ISP blocks DoH.
-        _doh_ip=""
-        local _doh_blocked_by_isp=0
-        for _doh_url in $_doh_servers; do
-            _doh_resp=$(curl -s -k \
-                --connect-timeout 5 --max-time 8 \
-                -H "accept: application/dns-json" \
-                "${_doh_url}?name=${_domain}&type=A" 2>/dev/null)
-            _doh_ip=$(printf '%s' "$_doh_resp" | \
-                jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null | \
-                head -1)
-            [ -n "$_doh_ip" ] && { _doh_ok=1; break; }
-        done
-
-        # Direct DoH failed — try via proxy (if available)
-        if [ -z "$_doh_ip" ] && [ -n "$m_ip" ] && [ -n "$m_port" ]; then
-            _doh_blocked_by_isp=1
-            for _doh_url in $_doh_servers; do
-                _doh_resp=$(curl -s -k \
-                    -x "socks5h://${m_ip}:${m_port}" \
-                    --connect-timeout 5 --max-time 8 \
-                    -H "accept: application/dns-json" \
-                    "${_doh_url}?name=${_domain}&type=A" 2>/dev/null)
-                _doh_ip=$(printf '%s' "$_doh_resp" | \
-                    jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null | \
-                    head -1)
-                [ -n "$_doh_ip" ] && { _doh_ok=1; break; }
-            done
-        fi
-
-        # DoH unreachable even via proxy — truly inconclusive
-        if [ -z "$_doh_ip" ]; then
-            DNS_HIJACK_STATUS="inconclusive"
-            continue
-        fi
-
-        # If DoH only worked via proxy — note that ISP blocks direct DoH
-        [ "$_doh_blocked_by_isp" = "1" ] && DNS_HIJACK_ISP_BLOCKS_DOH=1
-
-        # Step 3: compare
-        if [ "$_dns_ip" != "$_doh_ip" ]; then
-            DNS_HIJACK_STATUS="hijacked"
-            DNS_HIJACK_DOMAIN="$_domain"
-            DNS_HIJACK_IP="$_dns_ip"
-            logger -t podkop-bot "[Probe] DNS hijacking: ${_domain} → ${_dns_ip} (DoH: ${_doh_ip})"
-            return
-        fi
-    done
-
-    # If we never reached a DoH server at all — inconclusive
-    [ "$_doh_ok" = "0" ] && DNS_HIJACK_STATUS="inconclusive"
-    logger -t podkop-bot "[Probe] DNS hijacking check: ${DNS_HIJACK_STATUS}"
-}
 
 
 do_podkop_stop() {
@@ -5466,7 +5356,7 @@ EOF
             active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
             local mode_note=""
             [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
-            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n• DNS hijacking check (ISP DNS vs DoH)\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 25–50 sec. Traffic ~1.3 MB.</i>' \
+            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP, GeoIP, Cloudflare geo, Google hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~1.3 MB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -5500,7 +5390,7 @@ EOF
                 '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
 
             # Step 1: Geo
-            PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""
+            PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""; PROBE_CF_COUNTRY=""
             probe_geo
             send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 2/5: Google hint...' "$E_MICRO")" ""
 
@@ -5512,16 +5402,11 @@ EOF
             # Step 3: Services
             PROBE_SVC_RESULTS=""; PROBE_TG_BLOCKED=0
             probe_services
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 4/5: Throughput (200 KB)...' "$E_MICRO")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 4/4: Throughput...' "$E_MICRO")" ""
 
             # Step 4: Throughput
             PROBE_SPEED_MBPS=""; PROBE_SPEED_BYTES=0; PROBE_SPEED_SECS=""; PROBE_SPEED_STATUS=""
             probe_throughput
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 5/5: DNS hijacking check...' "$E_MICRO")" ""
-
-            # Step 5: DNS hijacking (tests ISP directly, no proxy)
-            DNS_HIJACK_STATUS=""; DNS_HIJACK_DOMAIN=""; DNS_HIJACK_IP=""
-            probe_dns_hijacking
 
             # ── Build result card ──────────────────────────────────────────
             local size_kb_disp size_unit
@@ -5575,25 +5460,6 @@ EOF
             local org_line=""
             [ -n "$PROBE_ORG" ] && org_line=$(printf '\n%s <code>%s</code>' "$E_ORG" "$PROBE_ORG")
 
-            # DNS hijacking block
-            local dns_line
-            case "${DNS_HIJACK_STATUS:-ok}" in
-                hijacked)
-                    dns_line=$(printf '%s <b>DNS hijacked!</b> ISP redirects <code>%s</code> → <code>%s</code>' \
-                        "$E_WARN" "$DNS_HIJACK_DOMAIN" "$DNS_HIJACK_IP")
-                    ;;
-                ok)
-                    if [ "${DNS_HIJACK_ISP_BLOCKS_DOH:-0}" = "1" ]; then
-                        dns_line="${E_OK} No DNS hijacking ${E_YLW}(ISP blocks direct DoH)"
-                    else
-                        dns_line="${E_OK} No DNS hijacking detected"
-                    fi
-                    ;;
-                inconclusive)
-                    dns_line="${E_YLW} DNS check inconclusive — DoH servers unreachable (ISP may block DoH)"
-                    ;;
-            esac
-
             local result_text
             result_text=$(printf '%b <b>Active Outbound Probe</b>
 <code>────────────────────</code>
@@ -5601,26 +5467,25 @@ EOF
 <code>────────────────────</code>
 %s <b>Exit IP:</b> <code>%s</code>
 %s <b>GeoIP:</b> %s%s
+%s <b>Cloudflare:</b> %s
 %s <b>Google:</b> %s
 <code>────────────────────</code>
 %s <b>Services:</b>
 <code>%s</code>
 <code>────────────────────</code>
 %s <b>Throughput:</b> %s
-%s <b>Downloaded:</b> %s in %ss%b
-<code>────────────────────</code>
-%s' \
+%s <b>Downloaded:</b> %s in %ss%b' \
                 "$E_MICRO" \
                 "$E_GLOB" "$active_px_display" "$mode_hint" "$px_type" \
                 "$E_MAP" "$PROBE_EXIT_IP" \
                 "$E_MAP" "$PROBE_COUNTRY" "$org_line" \
+                "$E_MAP" "$PROBE_CF_COUNTRY" \
                 "$E_MAP" "$PROBE_GOOGLE_COUNTRY" \
                 "$E_ENVELOPE" \
                 "$svc_block" \
                 "$E_BOLT" "$speed_line" \
                 "$E_BOLT" "$size_unit" "$PROBE_SPEED_SECS" \
-                "$speed_verdict" \
-                "$dns_line")
+                "$speed_verdict")
 
             # Action buttons — context-aware
             local action_btn=""
@@ -5640,7 +5505,7 @@ EOF
             local result_kb
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
 
-            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS} dns=${DNS_HIJACK_STATUS:-ok}${DNS_HIJACK_DOMAIN:+/}${DNS_HIJACK_DOMAIN}"
+            logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
             ;;
 
@@ -5894,45 +5759,41 @@ EOF
         # is sent BEFORE the binary is replaced (send_or_edit → then update).
         # ------------------------------------------------------------------
         "cmd_check_update_bot")
-            local remote_ver text kb changelog_url changelog_raw whats_new
+            local remote_ver highlights text kb
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
-            remote_ver=$(curl -s --connect-timeout 5 --max-time 8 \
+
+            # version.txt format:
+            #   line 1: version number (e.g. 0.13.96)
+            #   line 2: highlights, comma-separated (e.g. "Probe Outbound, DNS check, Gemini")
+            local version_raw
+            version_raw=$(curl -s --connect-timeout 5 --max-time 8 \
                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
-                2>/dev/null | tr -d '\n\r\t ')
+                2>/dev/null)
+            remote_ver=$(printf '%s' "$version_raw" | head -1 | tr -d '\r\t ')
+            highlights=$(printf '%s' "$version_raw" | sed -n '2p' | tr -d '\r')
+
             if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")" "$kb"
                 return
             fi
 
-            # Fetch CHANGELOG and extract bullet points for remote version
-            whats_new=""
-            if [ "$remote_ver" != "$BOT_VERSION" ]; then
-                changelog_raw=$(curl -s --connect-timeout 5 --max-time 10 \
-                    "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/CHANGELOG.md" \
-                    2>/dev/null)
-                if [ -n "$changelog_raw" ]; then
-                    # Extract lines between "## vX.Y.Z" and next "## " or "---"
-                    whats_new=$(printf '%s' "$changelog_raw" | \
-                        awk "/^## v${remote_ver}/{found=1; next} found && /^## |^---/{exit} found && /^- /{print}" | \
-                        head -8)
-                fi
-            fi
+            local changelog_link="https://github.com/Medvedolog/podkop_bot/blob/main/CHANGELOG.md"
 
             if [ "$remote_ver" = "$BOT_VERSION" ]; then
+                if [ -n "$highlights" ]; then
+                    text=$(printf '%s Bot is up to date: <b>v%s</b>\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>' \
+                        "$E_OK" "$BOT_VERSION" "$(html_escape "$highlights")" "$changelog_link")
+                else
+                    text=$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")
+                fi
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
-                send_or_edit "$mid" "$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")" "$kb"
+                send_or_edit "$mid" "$text" "$kb"
             else
-                local changelog_link="https://github.com/Medvedolog/podkop_bot/blob/main/CHANGELOG.md"
-                if [ -n "$whats_new" ]; then
-                    # Format bullets: strip "- **TAG:** " prefix to keep it short
-                    local bullets
-                    bullets=$(printf '%s' "$whats_new" | \
-                        sed 's/^- \*\*[A-Z]*:\*\* /• /; s/^- /• /' | \
-                        cut -c1-120)
-                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<b>What'\''s new:</b>\n<code>%s</code>\n\n<a href="%s">Full changelog</a>' \
+                if [ -n "$highlights" ]; then
+                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>' \
                         "$E_NEW" "$BOT_VERSION" "$remote_ver" \
-                        "$(html_escape "$bullets")" "$changelog_link")
+                        "$(html_escape "$highlights")" "$changelog_link")
                 else
                     text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<a href="%s">Full changelog</a>' \
                         "$E_NEW" "$BOT_VERSION" "$remote_ver" "$changelog_link")
