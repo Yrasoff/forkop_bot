@@ -1,1 +1,2 @@
-0.13.95
+0.13.96
+Cloudflare geo, removed DNS hijack check, ChatGPT country, Gemini availability check, YouTube/Google country
