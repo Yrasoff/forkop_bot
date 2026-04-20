@@ -1666,7 +1666,6 @@ probe_services() {
 
     local _name _url _expected _parse _code _icon _detail _tab
     _tab=$(printf '\t')
-    local _statsig_key="client-zUdXdSTygXJdzoE0sWTkP8GKTVsUMF2IRM7ShVO2JAG"
     local _ua="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
     local _proxy="-x socks5h://${m_ip}:${m_port}"
     local _curl_base="curl -s -k --connect-timeout 6 --max-time 10"
@@ -5392,12 +5391,12 @@ EOF
             # Step 1: Geo
             PROBE_EXIT_IP=""; PROBE_COUNTRY=""; PROBE_ORG=""; PROBE_CF_COUNTRY=""
             probe_geo
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 2/5: Google hint...' "$E_MICRO")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 2/4: Google hint...' "$E_MICRO")" ""
 
             # Step 2: Google
             PROBE_GOOGLE_COUNTRY=""
             probe_google
-            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 3/5: Services...' "$E_MICRO")" ""
+            send_or_edit "$mid" "$(printf '%s <b>Probing active outbound...</b>\n\nStep 3/4: Services...' "$E_MICRO")" ""
 
             # Step 3: Services
             PROBE_SVC_RESULTS=""; PROBE_TG_BLOCKED=0
