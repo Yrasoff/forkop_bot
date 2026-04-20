@@ -3150,31 +3150,43 @@ EOF
             fi
 
             # Get active proxy info for display (ping + probe button)
-            local _ul_proxies _ul_selector _ul_active _ul_delay _ul_delay_txt _ul_verdict
-            _ul_proxies=$(clash_request "/proxies")
-            _ul_selector=$(get_selector_tag "$_ul_proxies")
-            _ul_active=$(get_active_proxy_name "$_ul_proxies")
-            _ul_delay=$(echo "$_ul_proxies" | jq -r --arg n "$_ul_active" \
-                '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
-            [ -z "$_ul_delay" ] || [ "$_ul_delay" = "0" ] && _ul_delay_txt="N/A" || _ul_delay_txt="${_ul_delay}ms"
-            case "${_ul_delay:-0}" in
-                0|'')   _ul_verdict="Offline" ;;
-                *)
-                    if   [ "$_ul_delay" -lt 150 ]; then _ul_verdict="${E_ON} Excellent"
-                    elif [ "$_ul_delay" -lt 300 ]; then _ul_verdict="${E_ON} Good"
-                    elif [ "$_ul_delay" -lt 500 ]; then _ul_verdict="${E_YLW} Acceptable"
-                    else                                 _ul_verdict="${E_RED} High latency"; fi ;;
+            # In Single URL mode sing-box has no Selector/URLTest group in Clash API —
+            # only a direct outbound. Use direct latency probe via mixed_proxy instead.
+            local _ul_delay_txt _ul_verdict _ul_name _ul_probe_row=""
+            local _ul_m_ip _ul_m_port _ul_sec _ul_lat
+            _ul_sec=$(get_active_section)
+            _ul_m_port=$(uci -q get podkop.${_ul_sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+            _ul_m_ip=$(get_proxy_ip)
+            # Measure latency via gstatic through mixed_proxy
+            _ul_lat=$(curl -o /dev/null -s \
+                -x "socks5h://${_ul_m_ip}:${_ul_m_port}" \
+                --connect-timeout 4 --max-time 5 \
+                -w "%{time_total}" \
+                "http://www.gstatic.com/generate_204" 2>/dev/null)
+            # Get proxy name from proxy_string fragment
+            local _ul_ps
+            _ul_ps=$(uci -q get podkop.${_ul_sec}.proxy_string 2>/dev/null | head -1)
+            case "$_ul_ps" in
+                *#?*) _ul_name=$(url_decode "${_ul_ps##*#}") ;;
+                *@*)  _ul_name=$(echo "$_ul_ps" | sed 's|.*@||;s|[/?].*||' | cut -c1-25) ;;
+                *)    _ul_name="proxy" ;;
             esac
-
-            # Probe button only when proxy is active
-            local _ul_probe_row=""
-            [ -n "$_ul_active" ] && \
+            if [ -z "$_ul_lat" ] || [ "$_ul_lat" = "0" ]; then
+                _ul_delay_txt="N/A"; _ul_verdict="Offline"
+            else
+                local _ul_ms; _ul_ms=$(awk -v t="$_ul_lat" 'BEGIN{printf "%d", int(t*1000)}')
+                _ul_delay_txt="${_ul_ms}ms"
+                if   [ "$_ul_ms" -lt 150 ]; then _ul_verdict="${E_ON} Excellent"
+                elif [ "$_ul_ms" -lt 300 ]; then _ul_verdict="${E_ON} Good"
+                elif [ "$_ul_ms" -lt 500 ]; then _ul_verdict="${E_YLW} Acceptable"
+                else                              _ul_verdict="${E_RED} High latency"; fi
                 _ul_probe_row="[{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound\"}],"
+            fi
 
             kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],${_ul_probe_row}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             text=$(cat <<EOF
 ${E_GLOB} <b>Single URL Proxy</b> [<code>${sec}</code>]
-<b>Active:</b> $(html_escape "$(display_proxy_name_with_tag "$_ul_active")") | ${_ul_delay_txt} — ${_ul_verdict}
+<b>Active:</b> $(html_escape "$_ul_name") | ${_ul_delay_txt} — ${_ul_verdict}
 
 ${list_text}
 
