@@ -1,2 +1,2 @@
-CRITICAL FIX: Add proxy in URLTest/Selector mode now writes to correct UCI list — previous versions corrupted podkop config causing tunnel failure
+CRITICAL FIX: Add proxy in URLTest/Selector mode now writes to correct UCI list — previous versions corrupted podkop config causing tunnel failure, active proxy tag/display separation, Single URL UX fixes, Probe back label
  
