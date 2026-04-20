@@ -1,1 +1,2 @@
 0.13.96
+Cloudflare geo, removed DNS hijack test, Gemini test, YouTube country, AI services availability
