@@ -5790,8 +5790,19 @@ EOF
             version_raw=$(curl -s --connect-timeout 5 --max-time 8 \
                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
                 2>/dev/null)
-            remote_ver=$(printf '%s' "$version_raw" | head -1 | tr -d '\r\t ')
-            highlights=$(printf '%s' "$version_raw" | sed -n '2p' | tr -d '\r')
+            remote_ver=$(printf '%s' "$version_raw" | head -1 | tr -d '\r\n\t ')
+            # highlights.txt is a separate file for forward/backward compatibility
+            # Old versions (pre-0.13.96) used version.txt with tr -d '[:space:]' —
+            # putting highlights in version.txt broke their update loop.
+            local _hl_raw
+            _hl_raw=$(curl -s --connect-timeout 5 --max-time 8 \
+                "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/highlights.txt" \
+                2>/dev/null | head -1 | tr -d '\r')
+            # Discard if response looks like HTML (404 page) or is empty
+            case "$_hl_raw" in
+                ''|'<'*|'{'*) highlights="" ;;
+                *) highlights="$_hl_raw" ;;
+            esac
 
             if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
