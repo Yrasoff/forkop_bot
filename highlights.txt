@@ -1,3 +1,2 @@
-NEW: Active Outbound Probe — geo (ipapi.co + Cloudflare + Google), YouTube/ChatGPT/Gemini/Discord reachability, 2-stage speed test with RKN 16KB block detection  
-CRITICAL FIX: Add proxy in URLTest/Selector mode now writes to correct UCI list — previous versions corrupted podkop config causing tunnel failure
+NEW: Active Outbound Probe — geo (ipapi.co + Cloudflare + Google), YouTube/ChatGPT/Gemini/Discord reachability, 2-stage speed test with RKN 16KB block detection. CRITICAL FIX: Add proxy in URLTest/Selector mode now writes to correct UCI list — previous versions corrupted podkop config causing tunnel failure
  
