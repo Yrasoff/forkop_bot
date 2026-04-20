@@ -1,18 +1,24 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.94
+# Podkop Telegram Bot v0.13.96
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
 # 'podkop' package (sing-box wrapper). Written in strict POSIX ash.
 #
 # KEY SUBSYSTEMS:
-# 1. 4-Tier Fallback Transport: SOCKS5 -> Custom Proxy -> Direct -> Emergency IPs
-# 2. UCI Native Core: direct uci read/write, protected by flock
+# 1. 5-Tier Fallback Transport: Podkop SOCKS5 -> Fallback SOCKS -> Custom Proxy
+#    -> Direct -> Emergency IPs. Atomic IPC via mv for watchdog <-> main loop.
+# 2. UCI Native Core: direct uci read/write, protected by flock.
+#    uci_list_clean + set -f replaces eval for safe list splitting.
 # 3. Dynamic State Machine: STATE_FILE for multi-step text inputs
 # 4. Sub-Function Routing: _handle_proxy / _handle_settings / _handle_lists /
 #    _handle_dns / _handle_bot / _handle_sections
-# 5. Background Health Daemon: TG connectivity + sing-box watchdog
+# 5. Background Health Daemon: 5 watchdog checks (TG connectivity, sing-box,
+#    SOCKS probe, proxy leaf change, route degradation). Alerts on tier4/tier5.
+# 6. Active Outbound Probe: geo (ipapi.co + Cloudflare + Google), service
+#    reachability (YouTube/Telegram/ChatGPT/Gemini/Discord), 2-stage throughput
+#    (32KB block detection + 1MB speed measurement).
 #
 # ==============================================================================
 
@@ -2870,7 +2876,7 @@ EOF
                 inline_keyboard: [
                     [{"text":$ok,  "callback_data":("do_px_"+$i)},   {"text":$test,"callback_data":("test_px_"+$i)}],
                     [{"text":$del, "callback_data":("ask_del_px_"+$i)},{"text":$back,"callback_data":("proxy_menu_p_"+$p)}],
-                    (if $is_active == "1" then [{"text":$probe,"callback_data":"ask_probe_outbound"}] else [] end),
+                    (if $is_active == "1" then [{"text":$probe,"callback_data":("ask_probe_outbound_px_"+$i)}] else [] end),
                     [{"text":"Menu","callback_data":"/menu"}]
                 ] | map(select(length > 0))
                 }')
@@ -5346,8 +5352,16 @@ EOF
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
-        "ask_probe_outbound")
+        "ask_probe_outbound"|"ask_probe_outbound_px_"*)
             local sec proxy_mode active_px active_px_display text kb
+            # Determine back target: px_view_N if came from proxy card, else diagnostics
+            local _back_target="cmd_diagnostics"
+            case "$cmd" in
+                ask_probe_outbound_px_*)
+                    local _px_idx="${cmd#ask_probe_outbound_px_}"
+                    _back_target="px_view_${_px_idx}"
+                    ;;
+            esac
             sec=$(get_active_section)
             proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
             local proxies; proxies=$(clash_request "/proxies")
@@ -5357,11 +5371,13 @@ EOF
             [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
             text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP, GeoIP, Cloudflare geo, Google hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~1.3 MB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"${_back_target}\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
-        "cmd_probe_outbound")
+        "cmd_probe_outbound_back_"*)
+            # Extract back target encoded in callback_data
+            local _back="${cmd#cmd_probe_outbound_back_}"
             # Cooldown: not more than once per 2 minutes
             local _probe_ts_file="/tmp/podkop_probe_ts"
             local _now; _now=$(date +%s)
@@ -5369,7 +5385,7 @@ EOF
             if [ $((_now - _last)) -lt 120 ]; then
                 local _wait=$(( 120 - (_now - _last) ))
                 send_or_edit "$mid" "$(printf '%s Cooldown active. Try again in %ds.' "$E_WARN" "$_wait")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"ask_probe_outbound\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"${_back}\"}]]}"
                 return
             fi
             printf '%s' "$_now" > "$_probe_ts_file"
@@ -5502,7 +5518,8 @@ EOF
             fi
 
             local result_kb
-            result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            local _back_label; [ "$_back" = "cmd_diagnostics" ] && _back_label="Diagnostics" || _back_label="← Back"
+            result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
 
             logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
@@ -5997,7 +6014,7 @@ handle_command() {
         do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
-        ask_probe_outbound|cmd_probe_outbound|\
+        ask_probe_outbound|ask_probe_outbound_px_*|cmd_probe_outbound_back_*|\
         cmd_check_update_bot|ask_update_bot_*|do_update_bot_*|\
         ask_restart_bot|do_restart_bot|\
         ask_restart_router_1|ask_restart_router_2)
