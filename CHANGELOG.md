@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.13.98
+
+- **FIXED:** `get_active_proxy_name()` restored to return Clash API tag/leaf only — previously returned human display name in url mode which broke tag comparisons throughout the UI (active proxy marking in Outbounds list, Probe button visibility in proxy card). Added separate `get_active_proxy_display()` helper for display-only contexts.
+- **FIXED:** Single URL Proxy menu — status showed 🔴 Offline when delay is 0 (untested). Changed to 🟡 Untested — delay is 0 when sing-box hasn't pinged yet, not when proxy is down.
+- **FIXED:** Single URL Proxy menu — delete button showed ping icon and delay instead of trash icon. Restored `${E_DEL} [N] host` format; status is already visible in the header line.
+- **FIXED:** Probe Active Outbound navigation from Single URL menu — Cancel and Back returned to Diagnostics instead of url_links_menu. Added `ask_probe_outbound_url` callback with `url_links_menu` back target.
+- **FIXED:** Probe result action button in url mode — showed "Switch Proxy" (proxy_menu) which is wrong for Single URL. Now shows "Set New URL" (cmd_url_link_add) when throttled/blocked.
+- **FIXED:** Active proxy display in Status, Runtime Info, Tunnel Health, Probe — now uses `get_active_proxy_display()` which shows human name from `#fragment` in url mode.
+- **NEW:** Probe result back button label adapts to context: "Diagnostics" / "Single URL" / "← Back".
+
+---
+
 ## v0.13.97
 
 - **CRITICAL FIX:** Add proxy (`wait_proxy_link`) always wrote to `selector_proxy_links` regardless of active mode. In URLTest or Selector mode the new proxy went into the wrong UCI list — podkop read both lists when generating sing-box config, produced an invalid JSON, and aborted with `[fatal] Sing-box configuration is invalid`. Tunnel went down, all proxies appeared lost from the bot UI. Fix: detect `proxy_config_type` at add time and write to `urltest_proxy_links` (urltest mode) or `selector_proxy_links` (selector mode) accordingly.
