@@ -265,7 +265,7 @@ url_decode() {
             }
             printf "%s", r s
         }')
-    printf "$escaped"
+    printf '%b' "$escaped"
 }
 
 # ==============================================================================
@@ -601,7 +601,7 @@ _route_request() {
 api_request_fast() {
     local method="$1" payload="$2" max_time="${3:-8}" tmp final_args
     API_RESPONSE=""
-    tmp=$(mktemp /tmp/podkop_req.XXXXXX)
+    tmp=$(mktemp /tmp/podkop_req.XXXXXX 2>/dev/null) || return 1
     printf '%s' "$payload" > "$tmp"
     final_args="-X POST -H Content-Type:application/json --data-binary @${tmp} ${API_URL}/${method}"
     # Recovery mode: try SOCKS tiers first before sticky (mirrors api_poll_long behaviour)
@@ -2005,10 +2005,9 @@ check_health() {
         _transport=ok
     fi
 
-    # Write both results; watchdog reads tg_direct= and tg_transport= separately
-    printf 'tg_direct=%s
-tg_transport=%s
-' "$_direct" "$_transport" > "$HEALTH_STATE_FILE"
+    # Write atomically via tmp+mv — prevents watchdog reading truncated file
+    printf 'tg_direct=%s\ntg_transport=%s\n' "$_direct" "$_transport" \
+        > "${HEALTH_STATE_FILE}.tmp" && mv "${HEALTH_STATE_FILE}.tmp" "$HEALTH_STATE_FILE" 2>/dev/null
 
     # Return 0 (success) if at least one path works
     [ "$_direct" = "ok" ] || [ "$_transport" = "ok" ]
@@ -5399,9 +5398,10 @@ EOF
             proxies=$(clash_request "/proxies")
             active_px=$(get_active_proxy_name "$proxies")
             active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
-            px_type=$(echo "$proxies" | jq -r \
-                --arg n "$(echo "$proxies" | jq -r --arg sel "$(get_selector_tag "$proxies")" \
-                    '. as $r | $r.proxies[$sel].now // empty' 2>/dev/null)" \
+            local active_leaf
+            active_leaf=$(_resolve_leaf "$active_px" "$proxies")
+            [ -z "$active_leaf" ] && active_leaf="$active_px"
+            px_type=$(echo "$proxies" | jq -r --arg n "$active_leaf" \
                 '.proxies[$n].type // "unknown"' 2>/dev/null || echo "unknown")
 
             # Step 1: Geo
@@ -5673,7 +5673,12 @@ EOF
                 /etc/init.d/podkop_bot restart
                 kill -9 "$_old_pid" 2>/dev/null || true
             else
-                kill -9 $$ 2>/dev/null || true
+                # No init.d: kill watchdog subshells by script name before exec.
+                # HEALTH_PID already killed above, but check_health/probe forks
+                # may have detached and will survive exec — they cause duplicate alerts.
+                # killall targets them by bot basename without touching the new instance
+                # (exec hasn't happened yet, so only old forks match).
+                killall -9 "$(basename "$BOT_PATH")" 2>/dev/null || true
                 sleep 1
                 exec "$BOT_PATH"
             fi
@@ -5873,8 +5878,8 @@ EOF
                 /etc/init.d/podkop_bot restart
                 kill -9 "$_upd_pid" 2>/dev/null || true
             else
-                # No init.d: kill zombies first, then exec (replaces this process)
-                kill -9 $$ 2>/dev/null || true
+                # No init.d: kill orphaned subshells before exec
+                killall -9 "$(basename "$BOT_PATH")" 2>/dev/null || true
                 sleep 1
                 exec "$BOT_PATH"
             fi
