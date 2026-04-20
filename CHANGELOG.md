@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.13.95
+
+- **NEW:** Probe Active Outbound — two-stage throughput test. Stage 1: 32 KB fast check detects 16 KB block pattern (РКН drops connection after first ~16 KB). Stage 2: 1 MB accurate speed measurement (skipped if Stage 1 shows block). Result shows MB/KB automatically based on actual downloaded size.
+- **NEW:** Probe Active Outbound — Gemini added to service checks. `gemini.google.com/app` with browser UA and `-L` follow; geo-blocked regions get 403 or redirect.
+- **FIXED:** Claude.ai probe now tests `claude.ai/login` (real Cloudflare-protected endpoint) instead of `status.anthropic.com`. Status page is hosted on separate infra and always returns 200 regardless of geo/proxy ban — previous check was a false positive.
+- **FIXED:** DNS hijacking probe: `nslookup` now queries ISP upstream DNS explicitly (not local resolver). Reads `/tmp/resolv.conf.auto` first (WAN DHCP DNS), then `/etc/resolv.conf`, skipping loopback/private ranges. Eliminates false positives from stubby, FakeTLS, local dnsmasq.
+- **FIXED:** DNS hijacking probe: added `198.18.*` and `198.19.*` (podkop fake-IP, RFC 2544) to local address filter. Without this, any blocked domain resolved via sing-box fake-IP would trigger false hijacking alert.
+- **FIXED:** DNS hijacking probe: DoH fallback via proxy when ISP blocks direct DoH. If direct `cloudflare-dns.com`/`dns.google` unreachable — retries through active SOCKS. Result distinguishes: hijacked / ok / ok (ISP blocks direct DoH) / inconclusive.
+- **NEW:** Bot update check shows What's New from CHANGELOG.md. Fetches remote CHANGELOG, extracts bullet points for new version via `awk`, shows up to 8 items with full changelog link. Gracefully falls back to version-only display if CHANGELOG unreachable.
+- **FIXED:** `uci_list_clean` — replaced `echo` with `printf '%s
+'` to prevent BusyBox interpreting `-n`/`-e` prefixed values as flags.
+- **FIXED:** `probe_throughput` raw field parsing hardened against partial curl output on RST/timeout — each field sanitized with `grep -oE` numeric pattern, defaults to 0.
+
+---
+
 ## v0.13.94
 
 - **NEW:** Probe Active Outbound — new Diagnostics feature. Tests the currently active proxy through `mixed_proxy` SOCKS without switching selector or interrupting traffic. Four sequential checks: (1) Geo — exit IP, country, ASN via ipapi.co; (2) Google hint — parses `MgUcDb` field from google.com, shows how Google sees the exit country; (3) Service reachability — YouTube, Telegram API, ChatGPT, Discord through the proxy, each with HTTP status classification (OK / Redirect / Blocked / Timeout); (4) Throughput — 200 KB Range download via speed.cloudflare.com with ISP throttle and 16 KB block detection. Result card shows all findings in one message with context-aware action buttons.
