@@ -1,0 +1,2 @@
+NEW: Active Outbound Probe — geo (ipapi.co + Cloudflare + Google), YouTube/ChatGPT/Gemini/Discord reachability, 2-stage speed test with RKN 16KB block detection
+ 
