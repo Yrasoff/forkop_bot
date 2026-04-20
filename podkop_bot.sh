@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.96
+# Podkop Telegram Bot v0.13.97
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -24,7 +24,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.96"
+BOT_VERSION="0.13.97"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -2545,17 +2545,24 @@ _handle_proxy() {
         if [ "$state" = "wait_proxy_link" ]; then
             delete_message "$mid"
             local safe_link=$(printf "%s" "$text" | tr -d '\r\n')
+            local _pmode; _pmode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            local _links_key
+            case "$_pmode" in
+                urltest)  _links_key="urltest_proxy_links" ;;
+                selector) _links_key="selector_proxy_links" ;;
+                *)        _links_key="selector_proxy_links" ;;  # fallback
+            esac
             if echo "$safe_link" | grep -q '[[:space:]]'; then
                 send_message "$(printf '%s <b>Invalid!</b>\nLink contains spaces.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
             elif ! echo "$safe_link" | grep -qE '^(vless|hy2|hysteria2|ss|trojan|vmess|tuic)://'; then
                 send_message "$(printf '%s <b>Invalid protocol!</b>' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
-            elif uci -q show podkop.${sec} 2>/dev/null | grep -qF "selector_proxy_links='$safe_link'"; then
+            elif uci -q show podkop.${sec} 2>/dev/null | grep -qF "${_links_key}='$safe_link'"; then
                 send_message "$(printf '%s <b>Duplicate!</b>\nThis link is already in the list.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
             else
-                uci add_list podkop.${sec}.selector_proxy_links="$safe_link"
+                uci add_list podkop.${sec}.${_links_key}="$safe_link"
                 uci_commit_safe podkop; build_all_caches
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
@@ -2829,7 +2836,7 @@ EOF
             [ -n "$tag_idx" ] && raw_link=$(get_selector_link_by_index "$tag_idx")
             [ -z "$raw_link" ] && raw_link=$(get_uri_by_tag "$p_name")
             if [ -n "$raw_link" ]; then
-                share_uri="${raw_link%%#*}"; p_svr_port=$(extract_server_port_from_uri "$share_uri")
+                share_uri="$raw_link"; p_svr_port=$(extract_server_port_from_uri "${raw_link%%#*}")
             else share_uri="N/A"; p_svr_port="N/A"; fi
             p_svr_port_esc=$(html_escape "$p_svr_port")
 
@@ -3142,9 +3149,32 @@ EOF
                 nav_row="[{\"text\":\"< Prev\",\"callback_data\":\"${prev_cb}\"},{\"text\":\"$((page+1))/${total_pages}\",\"callback_data\":\"url_links_p_${page}\"},{\"text\":\"Next >\",\"callback_data\":\"${next_cb}\"}],"
             fi
 
-            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            # Get active proxy info for display (ping + probe button)
+            local _ul_proxies _ul_selector _ul_active _ul_delay _ul_delay_txt _ul_verdict
+            _ul_proxies=$(clash_request "/proxies")
+            _ul_selector=$(get_selector_tag "$_ul_proxies")
+            _ul_active=$(get_active_proxy_name "$_ul_proxies")
+            _ul_delay=$(echo "$_ul_proxies" | jq -r --arg n "$_ul_active" \
+                '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
+            [ -z "$_ul_delay" ] || [ "$_ul_delay" = "0" ] && _ul_delay_txt="N/A" || _ul_delay_txt="${_ul_delay}ms"
+            case "${_ul_delay:-0}" in
+                0|'')   _ul_verdict="Offline" ;;
+                *)
+                    if   [ "$_ul_delay" -lt 150 ]; then _ul_verdict="${E_ON} Excellent"
+                    elif [ "$_ul_delay" -lt 300 ]; then _ul_verdict="${E_ON} Good"
+                    elif [ "$_ul_delay" -lt 500 ]; then _ul_verdict="${E_YLW} Acceptable"
+                    else                                 _ul_verdict="${E_RED} High latency"; fi ;;
+            esac
+
+            # Probe button only when proxy is active
+            local _ul_probe_row=""
+            [ -n "$_ul_active" ] && \
+                _ul_probe_row="[{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound\"}],"
+
+            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],${_ul_probe_row}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             text=$(cat <<EOF
 ${E_GLOB} <b>Single URL Proxy</b> [<code>${sec}</code>]
+<b>Active:</b> $(html_escape "$(display_proxy_name_with_tag "$_ul_active")") | ${_ul_delay_txt} — ${_ul_verdict}
 
 ${list_text}
 
