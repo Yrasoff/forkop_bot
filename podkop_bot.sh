@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.97
+# Podkop Telegram Bot v0.13.98
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -24,7 +24,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.97"
+BOT_VERSION="0.13.98"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -1397,13 +1397,42 @@ get_selector_tag() {
 }
 
 get_active_proxy_name() {
-    local proxies="$1" sel now
+    local proxies="$1" sel now sel_type
     [ -z "$proxies" ] && proxies=$(clash_request "/proxies" 2>/dev/null)
     sel=$(get_selector_tag "$proxies")
-    now=$(printf '%s' "$proxies" | jq -r --arg sel "$sel" '.proxies[$sel].now // empty' 2>/dev/null)
-    [ -z "$now" ] && { echo "Unknown"; return 0; }
-    # Resolve through any chain of Selector/URLTest/Fallback groups
-    _resolve_leaf "$now" "$proxies"
+    sel_type=$(printf '%s' "$proxies" | jq -r --arg sel "$sel" '.proxies[$sel].type // empty' 2>/dev/null)
+    case "$sel_type" in
+        Selector|URLTest|Fallback|LoadBalance)
+            now=$(printf '%s' "$proxies" | jq -r --arg sel "$sel" '.proxies[$sel].now // empty' 2>/dev/null)
+            [ -z "$now" ] && { echo "Unknown"; return 0; }
+            _resolve_leaf "$now" "$proxies"
+            ;;
+        *)
+            # url mode: direct outbound tag (Hysteria2/VLESS/etc) or Clash unavailable
+            # Return the selector tag itself — it IS the active outbound in url mode
+            # Returns "Unknown" (via get_selector_tag default) when Clash API is down
+            _resolve_leaf "$sel" "$proxies"
+            ;;
+    esac
+}
+
+# get_active_proxy_display: human-readable display name for UI.
+# In url mode: decoded #fragment from proxy_string (e.g. "LV-hysteria2").
+# In selector/urltest mode: delegates to display_proxy_name_with_tag.
+# Use this for display only — NOT for tag comparisons.
+get_active_proxy_display() {
+    local proxies="$1" tag _sec _mode _ps
+    tag=$(get_active_proxy_name "$proxies")
+    _sec=$(get_active_section)
+    _mode=$(uci -q get podkop.${_sec}.proxy_config_type 2>/dev/null)
+    if [ "$_mode" = "url" ]; then
+        _ps=$(uci -q get podkop.${_sec}.proxy_string 2>/dev/null | head -1)
+        case "$_ps" in
+            *#?*) url_decode "${_ps##*#}"; return 0 ;;
+            *@*)  echo "$_ps" | sed 's|.*@||;s|[/?].*||' | cut -c1-25; return 0 ;;
+        esac
+    fi
+    display_proxy_name_with_tag "$tag"
 }
 
 _resolve_leaf() {
@@ -3117,6 +3146,36 @@ _handle_url_links() {
             end_idx=$(( start_idx + per_page ))
             [ "$end_idx" -gt "$total" ] && end_idx="$total"
 
+            # Get active proxy info FIRST — need icon for list button
+            local _ul_delay_txt _ul_verdict _ul_name _ul_probe_row="" _ul_icon
+            local _ul_sec _ul_ms
+            _ul_sec=$(get_active_section)
+            local _ul_proxies _ul_sel _ul_delay_raw
+            _ul_proxies=$(clash_request "/proxies")
+            _ul_sel=$(get_selector_tag "$_ul_proxies")
+            # Clash API has delay for main-out directly in url mode
+            _ul_delay_raw=$(printf '%s' "$_ul_proxies" | jq -r \
+                --arg sel "$_ul_sel" '.proxies[$sel].history[-1].delay // 0' 2>/dev/null)
+            local _ul_ps
+            _ul_ps=$(uci -q get podkop.${_ul_sec}.proxy_string 2>/dev/null | head -1)
+            case "$_ul_ps" in
+                *#?*) _ul_name=$(url_decode "${_ul_ps##*#}") ;;
+                *@*)  _ul_name=$(echo "$_ul_ps" | sed 's|.*@||;s|[/?].*||' | cut -c1-25) ;;
+                *)    _ul_name="proxy" ;;
+            esac
+            if [ -z "$_ul_delay_raw" ] || [ "$_ul_delay_raw" = "0" ]; then
+                _ul_delay_txt="N/A"; _ul_verdict="Untested"; _ul_icon="$E_YLW"
+                _ul_probe_row="[{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound_url\"}],"
+            else
+                _ul_ms="$_ul_delay_raw"
+                _ul_delay_txt="${_ul_ms}ms"
+                if   [ "$_ul_ms" -lt 150 ]; then _ul_verdict="${E_ON} Excellent";   _ul_icon="$E_ON"
+                elif [ "$_ul_ms" -lt 300 ]; then _ul_verdict="${E_ON} Good";        _ul_icon="$E_ON"
+                elif [ "$_ul_ms" -lt 500 ]; then _ul_verdict="${E_YLW} Acceptable"; _ul_icon="$E_YLW"
+                else                              _ul_verdict="${E_RED} High latency"; _ul_icon="$E_RED"; fi
+                _ul_probe_row="[{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound_url\"}],"
+            fi
+
             rows=""; list_text=""; abs_idx=0
             local line_n=0
             if [ "$total" -gt 0 ]; then
@@ -3135,52 +3194,6 @@ _handle_url_links() {
                 done <<EOF
 $link_list
 EOF
-            fi
-
-            list_text="${list_text#?}"
-            [ -z "$list_text" ] && list_text="<i>No links configured yet.</i>"
-
-            nav_row=""
-            if [ "$total" -gt "$per_page" ]; then
-                local prev_p=$((page - 1)) next_p=$((page + 1))
-                local prev_cb="url_links_p_${prev_p}" next_cb="url_links_p_${next_p}"
-                [ "$page" -eq 0 ] && prev_cb="url_links_p_0"
-                [ "$next_p" -ge "$total_pages" ] && next_cb="url_links_p_${page}"
-                nav_row="[{\"text\":\"< Prev\",\"callback_data\":\"${prev_cb}\"},{\"text\":\"$((page+1))/${total_pages}\",\"callback_data\":\"url_links_p_${page}\"},{\"text\":\"Next >\",\"callback_data\":\"${next_cb}\"}],"
-            fi
-
-            # Get active proxy info for display (ping + probe button)
-            # In Single URL mode sing-box has no Selector/URLTest group in Clash API —
-            # only a direct outbound. Use direct latency probe via mixed_proxy instead.
-            local _ul_delay_txt _ul_verdict _ul_name _ul_probe_row=""
-            local _ul_m_ip _ul_m_port _ul_sec _ul_lat
-            _ul_sec=$(get_active_section)
-            _ul_m_port=$(uci -q get podkop.${_ul_sec}.mixed_proxy_port 2>/dev/null || echo "2080")
-            _ul_m_ip=$(get_proxy_ip)
-            # Measure latency via gstatic through mixed_proxy
-            _ul_lat=$(curl -o /dev/null -s \
-                -x "socks5h://${_ul_m_ip}:${_ul_m_port}" \
-                --connect-timeout 4 --max-time 5 \
-                -w "%{time_total}" \
-                "http://www.gstatic.com/generate_204" 2>/dev/null)
-            # Get proxy name from proxy_string fragment
-            local _ul_ps
-            _ul_ps=$(uci -q get podkop.${_ul_sec}.proxy_string 2>/dev/null | head -1)
-            case "$_ul_ps" in
-                *#?*) _ul_name=$(url_decode "${_ul_ps##*#}") ;;
-                *@*)  _ul_name=$(echo "$_ul_ps" | sed 's|.*@||;s|[/?].*||' | cut -c1-25) ;;
-                *)    _ul_name="proxy" ;;
-            esac
-            if [ -z "$_ul_lat" ] || [ "$_ul_lat" = "0" ]; then
-                _ul_delay_txt="N/A"; _ul_verdict="Offline"
-            else
-                local _ul_ms; _ul_ms=$(awk -v t="$_ul_lat" 'BEGIN{printf "%d", int(t*1000)}')
-                _ul_delay_txt="${_ul_ms}ms"
-                if   [ "$_ul_ms" -lt 150 ]; then _ul_verdict="${E_ON} Excellent"
-                elif [ "$_ul_ms" -lt 300 ]; then _ul_verdict="${E_ON} Good"
-                elif [ "$_ul_ms" -lt 500 ]; then _ul_verdict="${E_YLW} Acceptable"
-                else                              _ul_verdict="${E_RED} High latency"; fi
-                _ul_probe_row="[{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound\"}],"
             fi
 
             kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],${_ul_probe_row}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
@@ -4779,7 +4792,7 @@ _handle_bot() {
             # Pass cached proxies to avoid extra clash_request
             local proxies; proxies=$(clash_request "/proxies")
             active_proxy=$(get_active_proxy_name "$proxies")
-            active_proxy_display=$(html_escape "$(display_proxy_name_with_tag "$active_proxy")")
+            active_proxy_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             sec=$(get_active_section)
             sec_count=$(uci -q show podkop 2>/dev/null | grep -cE '^podkop\.[^.=]+=section$')
 
@@ -4896,7 +4909,7 @@ EOF
 
             proxies=$(clash_request "/proxies")
             active_proxy=$(get_active_proxy_name "$proxies")
-            active_proxy_display=$(html_escape "$(display_proxy_name_with_tag "$active_proxy")")
+            active_proxy_display=$(html_escape "$(get_active_proxy_display "$proxies")")
 
             # Public IP: read from cache (instant). Background refresh if stale.
             pub_ip_display=$(get_public_ip_display)
@@ -4943,17 +4956,25 @@ EOF
             proxies=$(clash_request "/proxies")
             selector=$(get_selector_tag "$proxies")
             active_proxy=$(get_active_proxy_name "$proxies")
-            active_proxy_display=$(html_escape "$(display_proxy_name "$active_proxy")")
+            active_proxy_display=$(html_escape "$(get_active_proxy_display "$proxies")")
 
             # Resolve leaf to get accurate type and delay (follows Selector/URLTest chains)
             active_leaf=$(_resolve_leaf "$active_proxy" "$proxies")
             [ -z "$active_leaf" ] && active_leaf="$active_proxy"
 
-            # Try delay on named proxy first, fall back to leaf (mirrors proxy_menu logic)
+            # Try delay: by proxy name, then leaf, then selector tag (url mode: tag is main-out)
             p_delay_raw=$(echo "$proxies" | jq -r --arg n "$active_proxy" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
-            [ -z "$p_delay_raw" ] || [ "$p_delay_raw" = "0" ] &&                 p_delay_raw=$(echo "$proxies" | jq -r --arg n "$active_leaf" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
+            [ -z "$p_delay_raw" ] || [ "$p_delay_raw" = "0" ] && \
+                p_delay_raw=$(echo "$proxies" | jq -r --arg n "$active_leaf" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
+            [ -z "$p_delay_raw" ] || [ "$p_delay_raw" = "0" ] && \
+                p_delay_raw=$(echo "$proxies" | jq -r --arg n "$selector" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
             [ -z "$p_delay_raw" ] || [ "$p_delay_raw" = "0" ] && p_delay="N/A" || p_delay="${p_delay_raw}ms"
-            p_type=$(echo "$proxies" | jq -r --arg n "$active_leaf" '.proxies[$n].type // .proxies[$n].adapterType // "Unknown"' 2>/dev/null)
+            p_type=$(echo "$proxies" | jq -r --arg n "$active_leaf" \
+                '.proxies[$n].type // .proxies[$n].adapterType // empty' 2>/dev/null)
+            # In url mode leaf name != Clash tag — try selector tag for type too
+            [ -z "$p_type" ] || [ "$p_type" = "null" ] && \
+                p_type=$(echo "$proxies" | jq -r --arg n "$selector" \
+                    '.proxies[$n].type // .proxies[$n].adapterType // "Unknown"' 2>/dev/null)
 
             # Bot transport summary line for Runtime Info
             local rt_socks_state rt_transport_summary
@@ -5393,7 +5414,7 @@ EOF
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
-        "ask_probe_outbound"|"ask_probe_outbound_px_"*)
+        "ask_probe_outbound"|"ask_probe_outbound_px_"*|"ask_probe_outbound_url")
             local sec proxy_mode active_px active_px_display text kb
             # Determine back target: px_view_N if came from proxy card, else diagnostics
             local _back_target="cmd_diagnostics"
@@ -5402,12 +5423,15 @@ EOF
                     local _px_idx="${cmd#ask_probe_outbound_px_}"
                     _back_target="px_view_${_px_idx}"
                     ;;
+                ask_probe_outbound_url)
+                    _back_target="url_links_menu"
+                    ;;
             esac
             sec=$(get_active_section)
             proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
             local proxies; proxies=$(clash_request "/proxies")
             active_px=$(get_active_proxy_name "$proxies")
-            active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
+            active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local mode_note=""
             [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
             text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP, GeoIP, Cloudflare geo, Google hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~1.3 MB.</i>' \
@@ -5439,7 +5463,7 @@ EOF
             proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
             proxies=$(clash_request "/proxies")
             active_px=$(get_active_proxy_name "$proxies")
-            active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
+            active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local active_leaf
             active_leaf=$(_resolve_leaf "$active_px" "$proxies")
             [ -z "$active_leaf" ] && active_leaf="$active_px"
@@ -5553,6 +5577,9 @@ EOF
                     urltest)
                         action_btn="[{\"text\":\"${E_TEST} Test All Proxies\",\"callback_data\":\"cmd_all_delay_test\"}],"
                         ;;
+                    url)
+                        action_btn="[{\"text\":\"${E_EDIT} Set New URL\",\"callback_data\":\"cmd_url_link_add\"}],"
+                        ;;
                     *)
                         action_btn="[{\"text\":\"${E_GLOB} Switch Proxy\",\"callback_data\":\"proxy_menu\"}],"
                         ;;
@@ -5560,7 +5587,12 @@ EOF
             fi
 
             local result_kb
-            local _back_label; [ "$_back" = "cmd_diagnostics" ] && _back_label="Diagnostics" || _back_label="← Back"
+            local _back_label
+            case "$_back" in
+                cmd_diagnostics)  _back_label="Diagnostics" ;;
+                url_links_menu)   _back_label="Single URL" ;;
+                *)                _back_label="← Back" ;;
+            esac
             result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
 
             logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
@@ -6072,7 +6104,7 @@ handle_command() {
         do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
-        ask_probe_outbound|ask_probe_outbound_px_*|cmd_probe_outbound_back_*|\
+        ask_probe_outbound|ask_probe_outbound_px_*|ask_probe_outbound_url|cmd_probe_outbound_back_*|\
         cmd_check_update_bot|ask_update_bot_*|do_update_bot_*|\
         ask_restart_bot|do_restart_bot|\
         ask_restart_router_1|ask_restart_router_2)
