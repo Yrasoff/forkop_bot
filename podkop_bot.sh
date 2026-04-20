@@ -18,7 +18,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.94"
+BOT_VERSION="0.13.95"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -1736,31 +1736,38 @@ probe_services() {
     rm -f /tmp/podkop_probe_svc.tmp
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
-    # Claude / Anthropic — status.anthropic.com is public, not CF-protected
-    # Returns JSON with status indicator — accessible from any region if not blocked
+    # Claude.ai — test actual frontend, not status page
+    # status.anthropic.com is on separate infra and always returns 200 regardless of geo/proxy ban
+    # claude.ai/login goes through Cloudflare and reflects real geo/IP restrictions
     _name="Claude.ai"
-    _code=$(curl -s -k -L \
+    _code=$(curl -s -k -L -A "$_ua" \
         -x "socks5h://${m_ip}:${m_port}" \
         --connect-timeout 6 --max-time 10 \
-        -o /tmp/podkop_probe_svc.tmp \
+        -o /dev/null \
         -w "%{http_code}" \
-        "https://status.anthropic.com/api/v2/status.json" 2>/dev/null)
-    _detail=""
-    if [ "$_code" = "200" ] && [ -s /tmp/podkop_probe_svc.tmp ]; then
-        local _claude_status
-        _claude_status=$(jq -r '.status.indicator // empty' /tmp/podkop_probe_svc.tmp 2>/dev/null)
-        case "$_claude_status" in
-            none)       _icon="${E_OK}"; _detail="" ;;
-            minor)      _icon="${E_YLW}"; _detail=" (minor issues)" ;;
-            major|critical) _icon="${E_RED}"; _detail=" (outage)" ;;
-            *)          _icon="${E_OK}"; _detail="" ;;
-        esac
-    elif [ -z "$_code" ] || [ "$_code" = "000" ]; then
-        _icon="${E_RED}"; _detail=" (timeout)"
-    else
-        _icon="${E_RED}"; _detail=" (HTTP $_code)"
-    fi
-    rm -f /tmp/podkop_probe_svc.tmp
+        "https://claude.ai/login" 2>/dev/null)
+    case "$_code" in
+        200)     _icon="${E_OK}"; _detail="" ;;
+        ''|000)  _icon="${E_RED}"; _detail=" (timeout)" ;;
+        403|451) _icon="${E_RED}"; _detail=" (geo-blocked)" ;;
+        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+    esac
+    PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
+"
+    # Gemini — google.com/app returns 200 in supported regions, redirects/403 elsewhere
+    _name="Gemini"
+    _code=$(curl -s -k -L -A "$_ua" \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 10 \
+        -o /dev/null \
+        -w "%{http_code}" \
+        "https://gemini.google.com/app" 2>/dev/null)
+    case "$_code" in
+        200)     _icon="${E_OK}"; _detail="" ;;
+        ''|000)  _icon="${E_RED}"; _detail=" (timeout)" ;;
+        403|451) _icon="${E_RED}"; _detail=" (geo-blocked)" ;;
+        *)       _icon="${E_YLW}"; _detail=" (HTTP $_code)" ;;
+    esac
     PROBE_SVC_RESULTS="${PROBE_SVC_RESULTS}${_name}${_tab}${_icon}${_tab}${_detail}
 "
     # Discord
@@ -1770,8 +1777,10 @@ probe_services() {
 "
 }
 
-# probe_throughput: measure download speed through active outbound
-# Requests 200 KB via Range header to detect ISP throttle/16KB block
+# probe_throughput: measure download speed and detect ISP throttle/block.
+# Two-stage test:
+#   Stage 1: 32 KB — fast, detects 16 KB block pattern (РКН drops after ~16 KB)
+#   Stage 2: 1 MB  — accurate speed measurement (skipped if stage 1 shows block)
 # Sets: PROBE_SPEED_MBPS, PROBE_SPEED_BYTES, PROBE_SPEED_SECS, PROBE_SPEED_STATUS
 probe_throughput() {
     local m_ip m_port sec raw speed_bps size_bytes time_secs
@@ -1779,48 +1788,63 @@ probe_throughput() {
     m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
 
-    # 200 KB range test — enough to detect 16 KB block and measure throttle
-    # speed_download in bytes/sec, size_download in bytes, time_total in seconds
-    # curl writes -w fields even on connection reset (RST) — values may be 0
-    # but the colon-separated format is always emitted if curl starts at all.
-    raw=$(curl -s -k \
+    # Stage 1: 32 KB — detect 16 KB block quickly (РКН pattern: drops after ~16 KB)
+    # curl writes -w fields even on RST — colon-separated format always emitted
+    local raw1
+    raw1=$(curl -s -k \
         -x "socks5h://${m_ip}:${m_port}" \
-        --connect-timeout 6 --max-time 30 \
-        -H "Range: bytes=0-204799" \
+        --connect-timeout 6 --max-time 15 \
+        -H "Range: bytes=0-32767" \
         -o /dev/null \
         -w "%{speed_download}:%{size_download}:%{time_total}" \
-        "https://speed.cloudflare.com/__down?bytes=204800" 2>/dev/null)
+        "https://speed.cloudflare.com/__down?bytes=32768" 2>/dev/null)
 
-    # Sanitize each field: keep only digits and dot, default to 0 if empty/malformed
-    speed_bps=$(printf '%s' "${raw%%:*}"              | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
-    size_bytes=$(printf '%s' "$raw" | cut -d: -f2     | grep -oE '^[0-9]+'            || echo "0")
-    time_secs=$(printf '%s' "$raw"  | cut -d: -f3     | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
-    # Ensure non-empty after sanitization
-    speed_bps="${speed_bps:-0}"
-    size_bytes="${size_bytes:-0}"
-    time_secs="${time_secs:-0}"
+    local s1_size s1_size_kb
+    s1_size=$(printf '%s' "$raw1" | cut -d: -f2 | grep -oE '^[0-9]+' || echo "0")
+    s1_size="${s1_size:-0}"
+    s1_size_kb=$(awk "BEGIN{printf \"%d\", ${s1_size} / 1024}")
 
-    # Convert speed bytes/sec → Mbps (×8 / 1000000), keep 2 decimal places
-    PROBE_SPEED_MBPS=$(awk "BEGIN{printf \"%.2f\", ${speed_bps:-0} * 8 / 1000000}")
-    PROBE_SPEED_BYTES="${size_bytes:-0}"
-    PROBE_SPEED_SECS=$(awk "BEGIN{printf \"%.1f\", ${time_secs:-0}}")
-
-    # Classify result
-    # Thresholds: <100 KB/s (0.8 Mbps) = throttled, <20 KB received = full block
-    local size_kb
-    size_kb=$(awk "BEGIN{printf \"%d\", ${size_bytes:-0} / 1024}")
-
-    if [ "${size_kb:-0}" -lt 20 ]; then
-        PROBE_SPEED_STATUS="blocked"       # received almost nothing
-    elif [ "$(awk "BEGIN{print (${speed_bps:-0} < 100000) ? 1 : 0}")" = "1" ]; then
-        PROBE_SPEED_STATUS="throttled"     # received data but very slow
-    else
-        PROBE_SPEED_STATUS="ok"
+    # Detect 16 KB block: received ≤20 KB out of 32 KB
+    if [ "${s1_size_kb:-0}" -le 20 ] && [ "${s1_size:-0}" -gt 0 ]; then
+        PROBE_SPEED_STATUS="block16k"
+        PROBE_SPEED_MBPS="0.00"
+        PROBE_SPEED_BYTES="$s1_size"
+        PROBE_SPEED_SECS=$(printf '%s' "$raw1" | cut -d: -f3 | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
+        PROBE_SPEED_SECS=$(awk "BEGIN{printf \"%.1f\", ${PROBE_SPEED_SECS:-0}}")
+        return
+    elif [ "${s1_size:-0}" -eq 0 ]; then
+        PROBE_SPEED_STATUS="blocked"
+        PROBE_SPEED_MBPS="0.00"
+        PROBE_SPEED_BYTES=0
+        PROBE_SPEED_SECS="0.0"
+        return
     fi
 
-    # Detect 16 KB block specifically: received ~16 KB but not more
-    if [ "$size_kb" -ge 14 ] && [ "$size_kb" -le 20 ] && [ "$PROBE_SPEED_STATUS" = "blocked" ]; then
-        PROBE_SPEED_STATUS="block16k"
+    # Stage 2: 1 MB — accurate speed measurement
+    raw=$(curl -s -k \
+        -x "socks5h://${m_ip}:${m_port}" \
+        --connect-timeout 6 --max-time 60 \
+        -H "Range: bytes=0-1048575" \
+        -o /dev/null \
+        -w "%{speed_download}:%{size_download}:%{time_total}" \
+        "https://speed.cloudflare.com/__down?bytes=1048576" 2>/dev/null)
+
+    speed_bps=$(printf '%s' "${raw%%:*}"          | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
+    size_bytes=$(printf '%s' "$raw" | cut -d: -f2 | grep -oE '^[0-9]+'            || echo "0")
+    time_secs=$(printf '%s' "$raw"  | cut -d: -f3 | grep -oE '^[0-9]+(\.[0-9]+)?' || echo "0")
+    speed_bps="${speed_bps:-0}"; size_bytes="${size_bytes:-0}"; time_secs="${time_secs:-0}"
+
+    PROBE_SPEED_MBPS=$(awk "BEGIN{printf \"%.2f\", ${speed_bps} * 8 / 1000000}")
+    PROBE_SPEED_BYTES="${size_bytes}"
+    PROBE_SPEED_SECS=$(awk "BEGIN{printf \"%.1f\", ${time_secs}}")
+
+    local size_kb
+    size_kb=$(awk "BEGIN{printf \"%d\", ${size_bytes} / 1024}")
+
+    if [ "$(awk "BEGIN{print (${speed_bps} < 100000) ? 1 : 0}")" = "1" ]; then
+        PROBE_SPEED_STATUS="throttled"
+    else
+        PROBE_SPEED_STATUS="ok"
     fi
 }
 
@@ -1833,6 +1857,13 @@ probe_dns_hijacking() {
     DNS_HIJACK_STATUS="ok"
     DNS_HIJACK_DOMAIN=""
     DNS_HIJACK_IP=""
+    DNS_HIJACK_ISP_BLOCKS_DOH=0
+
+    # Get proxy address for fallback DoH (used if ISP blocks direct DoH)
+    local m_ip m_port _sec
+    _sec=$(get_active_section)
+    m_port=$(uci -q get podkop.${_sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_ip=$(get_proxy_ip)
 
     # Test domains — known blocked in RU, stable IPs elsewhere
     local _test_domains="rutracker.org linkedin.com flibusta.is"
@@ -1841,22 +1872,43 @@ probe_dns_hijacking() {
 
     local _domain _dns_ip _doh_ip _doh_url _doh_resp _doh_ok=0
 
+    # Find ISP upstream DNS — skip local/fake resolvers
+    # resolv.conf on OpenWrt+podkop points to 127.0.0.42 (sing-box fake-IP).
+    # We need the real upstream DNS to detect ISP substitution.
+    local _isp_dns="" _candidate
+    for _candidate in $(awk '/^nameserver/{print $2}' /tmp/resolv.conf.auto /etc/resolv.conf 2>/dev/null); do
+        case "$_candidate" in
+            127.*|::1|10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;;
+            *) _isp_dns="$_candidate"; break ;;
+        esac
+    done
+    # Fallback: podkop configured DNS server
+    [ -z "$_isp_dns" ] && _isp_dns=$(uci -q get podkop.settings.dns_server 2>/dev/null)
+    # Last resort: use 8.8.8.8 so test still runs
+    [ -z "$_isp_dns" ] && _isp_dns="8.8.8.8"
+    logger -t podkop-bot "[Probe] DNS hijacking — using upstream: ${_isp_dns}"
+
     for _domain in $_test_domains; do
-        # Step 1: regular DNS (router's ISP DNS — potentially hijacked)
-        # BusyBox nslookup outputs "Address 1: x.x.x.x" not "Address: x.x.x.x"
-        # Use /^Address( [0-9]+)?:/ and $NF to handle both formats
-        _dns_ip=$(nslookup -type=A "$_domain" 2>/dev/null | \
+        # Step 1: query via ISP upstream DNS (not local fake-IP resolver)
+        _dns_ip=$(nslookup -type=A "$_domain" "$_isp_dns" 2>/dev/null | \
             awk '/^Address( [0-9]+)?:/ && !/#/ {print $NF; exit}')
         [ -z "$_dns_ip" ] && continue
 
-        # Skip local resolver addresses — these indicate a local DNS (stubby, FakeTLS,
-        # podkop fake-IP, etc.) and are not ISP hijacking
+        # Skip local/fake resolver addresses:
+        # 127.x.x.x   — loopback (stubby, local DNS proxy)
+        # 0.0.0.0      — NXDOMAIN substitute
+        # ::1          — IPv6 loopback
+        # 198.18.x.x   — podkop fake-IP range (RFC 2544 test range, used by sing-box)
+        # 10.x / 192.168.x / 172.16-31.x — private ranges (some local DNS setups)
         case "$_dns_ip" in
             127.*|0.0.0.0|::1|"") continue ;;
+            198.18.*|198.19.*)    continue ;;  # podkop fake-IP
         esac
 
-        # Step 2: DoH — direct HTTPS, bypasses ISP DNS
+        # Step 2: DoH — try direct first (no proxy), then via proxy
+        # Direct = tests ISP behaviour. Via proxy = fallback if ISP blocks DoH.
         _doh_ip=""
+        local _doh_blocked_by_isp=0
         for _doh_url in $_doh_servers; do
             _doh_resp=$(curl -s -k \
                 --connect-timeout 5 --max-time 8 \
@@ -1868,11 +1920,30 @@ probe_dns_hijacking() {
             [ -n "$_doh_ip" ] && { _doh_ok=1; break; }
         done
 
-        # DoH unreachable for this domain — ISP may be blocking DoH
+        # Direct DoH failed — try via proxy (if available)
+        if [ -z "$_doh_ip" ] && [ -n "$m_ip" ] && [ -n "$m_port" ]; then
+            _doh_blocked_by_isp=1
+            for _doh_url in $_doh_servers; do
+                _doh_resp=$(curl -s -k \
+                    -x "socks5h://${m_ip}:${m_port}" \
+                    --connect-timeout 5 --max-time 8 \
+                    -H "accept: application/dns-json" \
+                    "${_doh_url}?name=${_domain}&type=A" 2>/dev/null)
+                _doh_ip=$(printf '%s' "$_doh_resp" | \
+                    jq -r '.Answer[]? | select(.type == 1) | .data' 2>/dev/null | \
+                    head -1)
+                [ -n "$_doh_ip" ] && { _doh_ok=1; break; }
+            done
+        fi
+
+        # DoH unreachable even via proxy — truly inconclusive
         if [ -z "$_doh_ip" ]; then
             DNS_HIJACK_STATUS="inconclusive"
             continue
         fi
+
+        # If DoH only worked via proxy — note that ISP blocks direct DoH
+        [ "$_doh_blocked_by_isp" = "1" ] && DNS_HIJACK_ISP_BLOCKS_DOH=1
 
         # Step 3: compare
         if [ "$_dns_ip" != "$_doh_ip" ]; then
@@ -5395,7 +5466,7 @@ EOF
             active_px_display=$(html_escape "$(display_proxy_name_with_tag "$active_px")")
             local mode_note=""
             [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
-            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Discord)\n• Download throughput — detects ISP throttle and 16 KB block\n• DNS hijacking check (ISP DNS vs DoH)\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~250 KB.</i>' \
+            text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP and geo location\n• Google country hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n• DNS hijacking check (ISP DNS vs DoH)\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 25–50 sec. Traffic ~1.3 MB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -5453,8 +5524,13 @@ EOF
             probe_dns_hijacking
 
             # ── Build result card ──────────────────────────────────────────
-            local size_kb_disp
+            local size_kb_disp size_unit
             size_kb_disp=$(awk "BEGIN{printf \"%d\", ${PROBE_SPEED_BYTES:-0} / 1024}")
+            if [ "${size_kb_disp:-0}" -ge 900 ]; then
+                size_unit=$(awk "BEGIN{printf \"%.1f MB\", ${PROBE_SPEED_BYTES:-0} / 1048576}")
+            else
+                size_unit="${size_kb_disp} KB"
+            fi
 
             local speed_line speed_verdict
             case "${PROBE_SPEED_STATUS:-ok}" in
@@ -5507,7 +5583,11 @@ EOF
                         "$E_WARN" "$DNS_HIJACK_DOMAIN" "$DNS_HIJACK_IP")
                     ;;
                 ok)
-                    dns_line="${E_OK} No DNS hijacking detected"
+                    if [ "${DNS_HIJACK_ISP_BLOCKS_DOH:-0}" = "1" ]; then
+                        dns_line="${E_OK} No DNS hijacking ${E_YLW}(ISP blocks direct DoH)"
+                    else
+                        dns_line="${E_OK} No DNS hijacking detected"
+                    fi
                     ;;
                 inconclusive)
                     dns_line="${E_YLW} DNS check inconclusive — DoH servers unreachable (ISP may block DoH)"
@@ -5527,7 +5607,7 @@ EOF
 <code>%s</code>
 <code>────────────────────</code>
 %s <b>Throughput:</b> %s
-%s <b>Downloaded:</b> %s KB in %ss%b
+%s <b>Downloaded:</b> %s in %ss%b
 <code>────────────────────</code>
 %s' \
                 "$E_MICRO" \
@@ -5538,7 +5618,7 @@ EOF
                 "$E_ENVELOPE" \
                 "$svc_block" \
                 "$E_BOLT" "$speed_line" \
-                "$E_BOLT" "$size_kb_disp" "$PROBE_SPEED_SECS" \
+                "$E_BOLT" "$size_unit" "$PROBE_SPEED_SECS" \
                 "$speed_verdict" \
                 "$dns_line")
 
@@ -5814,7 +5894,7 @@ EOF
         # is sent BEFORE the binary is replaced (send_or_edit → then update).
         # ------------------------------------------------------------------
         "cmd_check_update_bot")
-            local remote_ver text kb
+            local remote_ver text kb changelog_url changelog_raw whats_new
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
             remote_ver=$(curl -s --connect-timeout 5 --max-time 8 \
                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
@@ -5824,12 +5904,39 @@ EOF
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")" "$kb"
                 return
             fi
+
+            # Fetch CHANGELOG and extract bullet points for remote version
+            whats_new=""
+            if [ "$remote_ver" != "$BOT_VERSION" ]; then
+                changelog_raw=$(curl -s --connect-timeout 5 --max-time 10 \
+                    "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/CHANGELOG.md" \
+                    2>/dev/null)
+                if [ -n "$changelog_raw" ]; then
+                    # Extract lines between "## vX.Y.Z" and next "## " or "---"
+                    whats_new=$(printf '%s' "$changelog_raw" | \
+                        awk "/^## v${remote_ver}/{found=1; next} found && /^## |^---/{exit} found && /^- /{print}" | \
+                        head -8)
+                fi
+            fi
+
             if [ "$remote_ver" = "$BOT_VERSION" ]; then
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")" "$kb"
             else
-                text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<i>The bot will restart automatically after update.\nYou will receive a startup notification when it is back online.</i>' \
-                    "$E_NEW" "$BOT_VERSION" "$remote_ver")
+                local changelog_link="https://github.com/Medvedolog/podkop_bot/blob/main/CHANGELOG.md"
+                if [ -n "$whats_new" ]; then
+                    # Format bullets: strip "- **TAG:** " prefix to keep it short
+                    local bullets
+                    bullets=$(printf '%s' "$whats_new" | \
+                        sed 's/^- \*\*[A-Z]*:\*\* /• /; s/^- /• /' | \
+                        cut -c1-120)
+                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<b>What'\''s new:</b>\n<code>%s</code>\n\n<a href="%s">Full changelog</a>' \
+                        "$E_NEW" "$BOT_VERSION" "$remote_ver" \
+                        "$(html_escape "$bullets")" "$changelog_link")
+                else
+                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<a href="%s">Full changelog</a>' \
+                        "$E_NEW" "$BOT_VERSION" "$remote_ver" "$changelog_link")
+                fi
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             fi
