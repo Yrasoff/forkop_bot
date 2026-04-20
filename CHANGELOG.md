@@ -1,10 +1,20 @@
 # Changelog
 
+## v0.13.97
+
+- **CRITICAL FIX:** Add proxy (`wait_proxy_link`) always wrote to `selector_proxy_links` regardless of active mode. In URLTest or Selector mode the new proxy went into the wrong UCI list — podkop read both lists when generating sing-box config, produced an invalid JSON, and aborted with `[fatal] Sing-box configuration is invalid`. Tunnel went down, all proxies appeared lost from the bot UI. Fix: detect `proxy_config_type` at add time and write to `urltest_proxy_links` (urltest mode) or `selector_proxy_links` (selector mode) accordingly.
+- **FIXED:** Single URL Proxy menu — Back button returned to `advanced_settings` instead of `proxy_menu`. Now returns to Outbounds as expected.
+- **NEW:** Single URL Proxy menu — shows active proxy name, ping delay and verdict (Excellent/Good/Acceptable/High latency), consistent with Selector and URLTest menus.
+- **NEW:** Single URL Proxy menu — Probe Active Outbound button added when proxy is active.
+- **FIXED:** Proxy Card (px_view) — Share Link was truncated at `#` stripping the proxy name fragment (e.g. `#medved`). Now shows full link including fragment.
+
+---
+
 ## v0.13.96
 
 - **NEW:** probe_geo now queries Cloudflare cdn-cgi/trace as second geo source — independent of ipapi.co, no rate limits, plain text parse. Result card shows GeoIP (ipapi.co), Cloudflare, and Google as three separate country indicators.
 - **REMOVED:** DNS hijacking check — not reliable with podkop/sing-box architecture (fake-IP, FakeTLS, stubby intercept all DNS including public resolvers, making honest ISP comparison impossible).
-- **FIXED:** probe_services — Claude.ai now checks claude.ai/login through Cloudflare (real geo/IP restriction endpoint) instead of status.anthropic.com which is on separate infra and always returns 200.
+- **FIXED:** probe_services — Claude.ai probe moved from status.anthropic.com (always 200, separate infra) to api.anthropic.com/v1/models. Returns 401 (auth required) = service reachable, 403/timeout = geo-blocked or unreachable. Note: claude.ai/login returns 403 for all datacenter IPs via Cloudflare bot protection regardless of geo — api endpoint gives honest signal.
 - **NEW:** Gemini added to probe_services — gemini.google.com/app with browser UA.
 - **NEW:** version.txt now includes highlights line (line 2) — bot update card shows concise summary without fetching CHANGELOG.
 
