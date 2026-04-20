@@ -431,9 +431,9 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
         1|*)
             # ── Update flow ────────────────────────────────────────────────────
             step "Checking for updates..."
-            REMOTE_VER=$(wget -q -O - "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+            REMOTE_VER=$(wget -q -O - "$VERSION_URL" 2>/dev/null | head -1 | tr -d '\r\n\t ')
             [ -z "$REMOTE_VER" ] && \
-                REMOTE_VER=$(curl -s "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+                REMOTE_VER=$(curl -s "$VERSION_URL" 2>/dev/null | head -1 | tr -d '\r\n\t ')
             [ -z "$REMOTE_VER" ] && REMOTE_VER="unknown"
 
             echo ""
