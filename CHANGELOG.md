@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.13.96
+
+- **NEW:** probe_geo now queries Cloudflare cdn-cgi/trace as second geo source — independent of ipapi.co, no rate limits, plain text parse. Result card shows GeoIP (ipapi.co), Cloudflare, and Google as three separate country indicators.
+- **REMOVED:** DNS hijacking check — not reliable with podkop/sing-box architecture (fake-IP, FakeTLS, stubby intercept all DNS including public resolvers, making honest ISP comparison impossible).
+- **FIXED:** probe_services — Claude.ai now checks claude.ai/login through Cloudflare (real geo/IP restriction endpoint) instead of status.anthropic.com which is on separate infra and always returns 200.
+- **NEW:** Gemini added to probe_services — gemini.google.com/app with browser UA.
+- **NEW:** version.txt now includes highlights line (line 2) — bot update card shows concise summary without fetching CHANGELOG.
+
+---
+
 ## v0.13.95
 
 - **NEW:** Probe Active Outbound — two-stage throughput test. Stage 1: 32 KB fast check detects 16 KB block pattern (РКН drops connection after first ~16 KB). Stage 2: 1 MB accurate speed measurement (skipped if Stage 1 shows block). Result shows MB/KB automatically based on actual downloaded size.
