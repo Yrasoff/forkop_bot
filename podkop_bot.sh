@@ -2048,19 +2048,22 @@ run_upstream_health_report() {
 # Return value: 0 if either path succeeded, 1 if both failed.
 # Does NOT touch LAST_ROUTE_* — uses its own independent curl sessions.
 check_health() {
-    local tmp_resp _direct=fail _transport=fail
+    local tmp_resp _direct=fail _transport=fail _tier2=fail
     local _sec _port _ip
 
-    # A1: direct (no proxy) — raw TCP connectivity to Telegram DC IP
-    # Uses --resolve to bypass DNS and connect directly to DC IP on port 443.
-    # This matches what MTProxy checks: actual TCP reachability to DC, not CDN.
-    # DC1: 149.154.167.220, DC2: 149.154.167.51, DC5: 91.108.56.190
-    tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 8 \
-        --resolve "api.telegram.org:443:149.154.167.220" \
-        -X GET "${API_URL}/getMe" 2>/dev/null)
-    if printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
-        _direct=ok
-    fi
+    # A1: direct (no proxy) — raw TCP connectivity to Telegram DC IPs
+    # Checks 3 DCs, requires 2/3 success to report "ok".
+    # Uses --resolve to bypass DNS and connect directly to DC IP, matching
+    # what MTProxy checks: actual TCP reachability, not CDN/Cloudflare.
+    local _dc_ok=0
+    for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
+        tmp_resp=$(curl -s -k --connect-timeout 4 --max-time 6 \
+            --resolve "api.telegram.org:443:${_dc_ip}" \
+            -X GET "${API_URL}/getMe" 2>/dev/null)
+        printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1 && \
+            _dc_ok=$((_dc_ok + 1))
+    done
+    [ "$_dc_ok" -ge 2 ] && _direct=ok
 
     # A2: via primary SOCKS (mixed_proxy / Podkop tier1)
     _sec=$(get_active_section)
@@ -2073,8 +2076,27 @@ check_health() {
         _transport=ok
     fi
 
+    # A3: via first fallback SOCKS (tier2_1) — independent path check
+    local _fb_raw _fb1
+    _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
+    if [ -n "$_fb_raw" ]; then
+        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+        _fb1="$1"
+    fi
+    if [ -n "$_fb1" ]; then
+        tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
+            -x "$_fb1" \
+            -X GET "${API_URL}/getMe" 2>/dev/null)
+        if printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
+            _tier2=ok
+        fi
+    else
+        _tier2=none  # no fallback configured
+    fi
+
     # Write atomically via tmp+mv — prevents watchdog reading truncated file
-    printf 'tg_direct=%s\ntg_transport=%s\n' "$_direct" "$_transport" \
+    printf 'tg_direct=%s\ntg_transport=%s\ntg_tier2=%s\n' \
+        "$_direct" "$_transport" "$_tier2" \
         > "${HEALTH_STATE_FILE}.tmp" && mv "${HEALTH_STATE_FILE}.tmp" "$HEALTH_STATE_FILE" 2>/dev/null
 
     # Return 0 (success) if at least one path works
@@ -2085,18 +2107,20 @@ _write_socks_state() {
     # Args: $1=tg_aggregate(ok|fail)  $2=socks(up|down)  $3=last_ok_route
     # Reads tg_direct/tg_transport from HEALTH_STATE_FILE (written by check_health).
     # Keeps tg= for backward compat with any external tooling.
-    local _tg_direct _tg_transport
+    local _tg_direct _tg_transport _tg_tier2
     _tg_direct=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
     _tg_transport=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    _tg_tier2=$(grep "^tg_tier2=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
     # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
     # Authoritative route key is in MAIN_ROUTE_KEY_FILE, written by main process.
     printf 'tg=%s
 tg_direct=%s
 tg_transport=%s
+tg_tier2=%s
 socks=%s
 last_ok=%s
 ' \
-        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "$2" "$3" > "$SOCKS_STATE_FILE"
+        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$2" "$3" > "$SOCKS_STATE_FILE"
 }
 
 # send_health_alert: health daemon uses this instead of bare api_request_fast.
@@ -4936,14 +4960,25 @@ EOF
                 sb_ram=$(awk '/VmRSS/{print int($2/1024)}' /proc/"$sb_pid"/status 2>/dev/null || echo "0")
 
             # Build health summary from SOCKS_STATE_FILE (two TG metrics + SOCKS)
-            local _h_tgd _h_tgt _h_socks _h_tgd_icon _h_tgt_icon _h_socks_icon
+            local _h_tgd _h_tgt _h_socks _h_tgd_icon _h_tgt_icon _h_socks_icon _h_tunnel_icon
             _h_tgd=$(grep "^tg_direct=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             _h_tgt=$(grep "^tg_transport=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             _h_socks=$(grep "^socks=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            local _h_tier2; _h_tier2=$(grep "^tg_tier2=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             [ "$_h_tgd" = "ok" ]   && _h_tgd_icon="$E_OK"   || _h_tgd_icon="$E_ERR"
             [ "$_h_tgt" = "ok" ]   && _h_tgt_icon="$E_OK"   || _h_tgt_icon="$E_ERR"
             [ "$_h_socks" = "up" ] && _h_socks_icon="$E_OK" || _h_socks_icon="$E_ERR"
-            health_st="${_h_tgd_icon} TG direct: ${_h_tgd:-?} | ${_h_tgt_icon} via SOCKS: ${_h_tgt:-?} | ${_h_socks_icon} SOCKS: ${_h_socks:-?}"
+            # tunnel (SOCKS5): ok if transport ok AND socks up
+            [ "$_h_tgt" = "ok" ] && [ "$_h_socks" = "up" ] && _h_tunnel_icon="$E_OK" || {
+                [ "$_h_tgt" = "ok" ] && _h_tunnel_icon="$E_YLW" || _h_tunnel_icon="$E_ERR"
+            }
+            local _h_tier2_icon=""
+            case "$_h_tier2" in
+                ok)   _h_tier2_icon=" | ${E_OK} tier2" ;;
+                fail) _h_tier2_icon=" | ${E_ERR} tier2" ;;
+                none) _h_tier2_icon="" ;;
+            esac
+            health_st="${_h_tgd_icon} TG direct | ${_h_tunnel_icon} tunnel (SOCKS5)${_h_tier2_icon}"
             strategy=$(uci -q get podkop.settings.dns_type || echo "udp")
             yacd_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
             tg_lat=$(get_tg_latency)
@@ -4971,7 +5006,7 @@ ${E_SET} <b>Mode:</b> <code>${podkop_mode_lbl}</code>
 ${E_BOX} <b>Sing-box:</b> ${sb_state}$([ "$sb_ram" != "0" ] && printf ' | <b>RAM:</b> %s MB' "$sb_ram")
 <code>────────────────────</code>
 ${E_GLOB} <b>Active Proxy:</b> <code>${active_proxy_display}</code>
-${E_ENVELOPE} <b>Telegram:</b> direct ${_h_tgd_icon} | tunnel ${_h_tgt_icon} | SOCKS ${_h_socks_icon}
+${E_ENVELOPE} <b>Telegram:</b> direct ${_h_tgd_icon} | tunnel SOCKS5 ${_h_tunnel_icon}${_h_tier2_icon}
 ${E_NET} <b>DNS:</b> <code>${strategy}</code> | <b>YACD:</b> $([ "$yacd_en" = "1" ] && echo "${E_ON} ON" || echo "${E_OFF} OFF")
 ${E_SHLD} <b>Bot Route:</b> ${LAST_ROUTE_NAME} (${tg_lat})
 EOF
@@ -5113,10 +5148,18 @@ EOF
                 wd_tg_transport=$(grep "^tg_transport=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
                 wd_socks=$(grep "^socks=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             fi
-            local tgd_icon tgt_icon socks_icon
-            [ "$wd_tg_direct" = "ok" ]    && tgd_icon="$E_OK"  || tgd_icon="$E_ERR"
-            [ "$wd_tg_transport" = "ok" ] && tgt_icon="$E_OK"  || tgt_icon="$E_ERR"
-            [ "$wd_socks" = "up" ]        && socks_icon="$E_OK" || socks_icon="$E_ERR"
+            # tunnel icon: ok only if both transport ok AND socks up
+            local tunnel_icon tgd_icon tier2_icon tier2_line
+            [ "$wd_tg_direct" = "ok" ] && tgd_icon="$E_OK" || tgd_icon="$E_ERR"
+            [ "$wd_tg_transport" = "ok" ] && [ "$wd_socks" = "up" ] && tunnel_icon="$E_OK" || {
+                [ "$wd_tg_transport" = "ok" ] && tunnel_icon="$E_YLW" || tunnel_icon="$E_ERR"
+            }
+            local wd_tier2; wd_tier2=$(grep "^tg_tier2=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+            case "$wd_tier2" in
+                ok)   tier2_icon="$E_OK";  tier2_line="${tier2_icon} <b>TG tier2 SOCKS:</b> <code>ok</code>" ;;
+                fail) tier2_icon="$E_ERR"; tier2_line="${tier2_icon} <b>TG tier2 SOCKS:</b> <code>fail</code>" ;;
+                *)    tier2_line="" ;;
+            esac
 
             # Read SOCKS latency probe results
             local probe_ts="" probe_tier1="" probe_fb_text="" probe_age_str="" probe_t3_text=""
@@ -5175,9 +5218,9 @@ ${E_SET} <b>Mode:</b> <code>${proxy_mode}</code>
 ${E_NET} <b>WAN iface:</b> <code>${wan_iface}</code>
 ${E_GLOB} <b>Active proxy:</b> <code>${th_active_display}</code>
 <code>────────────────────</code>
-${tgd_icon} <b>TG direct:</b> <code>${wd_tg_direct:-?}</code> <i>(no proxy)</i>
-${tgt_icon} <b>TG via Podkop (tier1):</b> <code>${wd_tg_transport:-?}</code> <i>(primary mixed_proxy — not full bot transport chain)</i>
-${socks_icon} <b>SOCKS upstream:</b> <code>${wd_socks:-unknown}</code>
+${tgd_icon} <b>TG direct:</b> <code>${wd_tg_direct:-?}</code> <i>(no proxy, 2/3 DC)</i>
+${tunnel_icon} <b>TG tunnel SOCKS5:</b> <code>${wd_tg_transport:-?}</code> / SOCKS <code>${wd_socks:-?}</code>
+$([ -n "$tier2_line" ] && printf '%s' "$tier2_line")
 ${E_SHLD} <b>Bot transport:</b> <code>${LAST_ROUTE_NAME}</code>
 ${E_NET} <b>Poll route:</b> <code>${LAST_ROUTE_POLL}</code> | <b>Fast:</b> <code>${LAST_ROUTE_FAST}</code>${probe_section}
 <code>────────────────────</code>
