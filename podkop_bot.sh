@@ -2941,13 +2941,14 @@ EOF
                 --arg ok "${E_OK} Switch" --arg test "${E_RST} Test" \
                 --arg del "${E_DEL} Delete" --arg back "${E_BACK} Back" \
                 --arg probe "${E_MICRO} Probe" \
+                --arg menu "🏠 Menu" \
                 --arg is_active "$( [ "$p_name" = "$(get_active_proxy_name "$proxies")" ] && echo 1 || echo 0 )" \
                 '{
                 inline_keyboard: [
                     [{"text":$ok,  "callback_data":("do_px_"+$i)},   {"text":$test,"callback_data":("test_px_"+$i)}],
                     [{"text":$del, "callback_data":("ask_del_px_"+$i)},{"text":$back,"callback_data":("proxy_menu_p_"+$p)}],
                     (if $is_active == "1" then [{"text":$probe,"callback_data":("ask_probe_outbound_px_"+$i)}] else [] end),
-                    [{"text":"🏠 Menu","callback_data":"/menu"}]
+                    [{"text":$menu,"callback_data":"/menu"}]
                 ] | map(select(length > 0))
                 }')
             send_or_edit "$mid" "$text" "$kb"
