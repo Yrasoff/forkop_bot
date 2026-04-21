@@ -1214,8 +1214,8 @@ get_public_ip_display() {
         case "$ts" in
             ''|*[!0-9]*) ts=0 ;;
         esac
-        [ -z "$winner" ] && winner="?"
-        [ -z "$sources" ] && sources="?"
+        [ -z "$winner" ] && winner="N/A"
+        [ -z "$sources" ] && sources="unknown"
 
         age=$((now - ts))
         if [ "$age" -gt "$PUBIP_CACHE_TTL" ]; then
@@ -3328,6 +3328,7 @@ EOF
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"${E_FILE} Routing & Lists\",\"callback_data\":\"community_lists\"}],
                 [{\"text\":\"${E_SET} Core Settings\",\"callback_data\":\"advanced_settings\"}],
+                [{\"text\":\"${E_TEST} Test Proxies\",\"callback_data\":\"cmd_all_delay_test\"}],
                 [{\"text\":\"${E_CLIP} Sections\",\"callback_data\":\"sections_menu\"}],
                 [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]
             ]}"
@@ -4656,7 +4657,7 @@ _handle_fallback_socks() {
             [ -z "$list_text" ] && list_text="<i>No fallback SOCKS configured.</i>"
             local text kb
             text=$(printf '%s <b>Fallback SOCKS</b>\n\nTried in order after Podkop SOCKS5 fails.\nFormat: <code>socks5://IP:PORT</code> or <code>socks5h://IP:PORT</code>\n\n%s' "$E_NET" "$list_text")
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_fb_socks_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"fallback_socks_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_fb_socks_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"fallback_socks_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5307,7 +5308,7 @@ $(_fmt_tier "tier5" "Emergency IPs")"
 
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"Transport: ${tr_disp}\",\"callback_data\":\"ask_set_tr_menu\"},{\"text\":\"Health: ${hi}s\",\"callback_data\":\"set_bot_hi_${next_hi}\"}],
-                [{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"}],
+                [{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"},{\"text\":\"${E_TEST} Test Fallback\",\"callback_data\":\"cmd_test_fb_socks\"}],
                 [${cp_btn},${bi_btn}],
                 [{\"text\":\"${st_icon} Startup Notify\",\"callback_data\":\"toggle_bot_st\"},{\"text\":\"${al_icon} Alert Notify\",\"callback_data\":\"toggle_bot_al\"}],
                 [{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
@@ -5465,7 +5466,23 @@ EOF
             esac
             sec=$(get_active_section)
             proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+
+            # Check mixed_proxy is enabled — probe uses it as SOCKS5 endpoint
+            local _mixed_enabled
+            _mixed_enabled=$(uci -q get podkop.${sec}.mixed_proxy_enabled 2>/dev/null || echo "1")
+            if [ "$_mixed_enabled" = "0" ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Probe unavailable</b>\n\n<code>mixed_proxy</code> is disabled for section <code>%s</code>.\n\nProbe routes traffic through mixed_proxy SOCKS5 — it cannot run without it.\n\n<i>Enable mixed_proxy in Podkop settings and reload to use Probe.</i>' \
+                    "$E_WARN" "$sec")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"${_back_target}\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                return
+            fi
             local proxies; proxies=$(clash_request "/proxies")
+            if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Probe unavailable</b>\n\nClash API is not responding.\n\n<i>Enable YACD in Podkop settings (Dashboard tab) and reload, then try again.</i>' \
+                    "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"${_back_target}\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                return
+            fi
             active_px=$(get_active_proxy_name "$proxies")
             active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local mode_note=""
@@ -6262,6 +6279,15 @@ EOF
 
 send_startup_notification_async &
 start_health_daemon
+
+# Initialize active section file if missing — default to first configured section
+# (not always "main" — user may have renamed or use antiz/vpn/etc as primary)
+if [ ! -f "$ACTIVE_SECTION_FILE" ]; then
+    _first_sec=$(uci -q show podkop 2>/dev/null \
+        | grep "^podkop\.[^.]*=section$" \
+        | head -1 | cut -d. -f2 | cut -d= -f1)
+    echo "${_first_sec:-main}" > "$ACTIVE_SECTION_FILE"
+fi
 
 trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE" "/tmp/podkop_bot_last_nudge"; rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
 
