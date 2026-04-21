@@ -2051,8 +2051,12 @@ check_health() {
     local tmp_resp _direct=fail _transport=fail
     local _sec _port _ip
 
-    # A1: direct (no proxy) — raw internet reachability
-    tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
+    # A1: direct (no proxy) — raw TCP connectivity to Telegram DC IP
+    # Uses --resolve to bypass DNS and connect directly to DC IP on port 443.
+    # This matches what MTProxy checks: actual TCP reachability to DC, not CDN.
+    # DC1: 149.154.167.220, DC2: 149.154.167.51, DC5: 91.108.56.190
+    tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 8 \
+        --resolve "api.telegram.org:443:149.154.167.220" \
         -X GET "${API_URL}/getMe" 2>/dev/null)
     if printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
         _direct=ok
