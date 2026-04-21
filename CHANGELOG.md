@@ -9,6 +9,11 @@
 - **FIXED:** Probe result action button in url mode — showed "Switch Proxy" (proxy_menu) which is wrong for Single URL. Now shows "Set New URL" (cmd_url_link_add) when throttled/blocked.
 - **FIXED:** Active proxy display in Status, Runtime Info, Tunnel Health, Probe — now uses `get_active_proxy_display()` which shows human name from `#fragment` in url mode.
 - **NEW:** Probe result back button label adapts to context: "Diagnostics" / "Single URL" / "← Back".
+- **FIXED:** Cache race condition — `build_all_caches` no longer called before `safe_reload_podkop` in add/delete proxy paths. Cache was built on stale `config.json` producing empty `TAG_URI/UCI_LINKS/TAG_NAME` caches, causing raw `main-N-out` tags instead of human names in Outbounds.
+- **FIXED:** `safe_reload_podkop` waits up to 10s for `config.json` validity (`.outbounds | length > 0`) before building caches. Skips cache build with warning if timeout exceeded.
+- **FIXED:** `get_uri_by_tag`, `get_selector_link_by_index` — check `-s` (non-empty) instead of `-f`; rebuild on miss with retry.
+- **FIXED:** `display_proxy_name` — on `TAG_NAME_CACHE` miss, ensures `TAG_URI_CACHE` is fresh before rebuild (dependency chain: name cache depends on URI cache for server:port matching).
+- **FIXED:** Tunnel Health and startup notification now use `get_active_proxy_display()` for consistent human name in url mode.
 
 ---
 
