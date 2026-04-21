@@ -1,1 +1,1 @@
-FIXED: proxy name cache race after reload, Single URL display/nav, active proxy tag vs display separation
+FIXED: proxy name cache race after reload, Single URL display/nav, active proxy tag vs display; NEW: TG 3-DC check, tier2 SOCKS health, 🏠 Menu, mixed_proxy/Clash guards
