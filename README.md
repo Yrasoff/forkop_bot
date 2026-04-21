@@ -247,6 +247,3 @@ MIT
 **podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. It provides control over podkop without SSH or LuCI access: start/stop/reload, outbound proxy switching with latency display, correct multi-section support, routing lists editor, DNS and YACD settings, and a multi-tier watchdog that keeps the bot reachable through Telegram even when the main tunnel is down. The bot operates via a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs) with sticky routing, IPC-based recovery signalling, active outbound diagnostics, and automatic return to tier1 within one health interval after podkop recovers. Full [changelog](CHANGELOG.md) available.
 
 ```
-
-Если нужно, я могу сразу сделать ещё и отдельный блок для `CHANGELOG_RUS.md` в том же стиле.
-```
