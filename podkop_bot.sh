@@ -143,6 +143,7 @@ E_PRX=$(printf '\xF0\x9F\x94\x8C')
 E_SET=$(printf '\xE2\x9A\x99')
 E_ADD=$(printf '\xE2\x9E\x95')
 E_BACK=$(printf '\xE2\x86\x90')
+E_HOME=$(printf '\xF0\x9F\x8F\xA0')
 E_FILE=$(printf '\xF0\x9F\x93\x84')
 E_LOG=$(printf '\xF0\x9F\x93\x8B')
 E_RST=$(printf '\xF0\x9F\x94\x84')
@@ -759,7 +760,7 @@ api_document() {
     custom_url=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
     b_iface=$(uci -q get podkop_bot.settings.bind_interface 2>/dev/null)
     if_flag=""; [ -n "$b_iface" ] && if_flag="--interface $b_iface"
-    doc_kb="{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"delete_msg\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"doc_to_runtime\"}]]}"
+    doc_kb="{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"delete_msg\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"doc_to_runtime\"}]]}"
 
     _do_curl_doc() {
         # shellcheck disable=SC2086
@@ -1348,13 +1349,28 @@ get_urltest_proxy_links() {
 }
 
 get_uri_by_tag() {
-    [ -f "$TAG_URI_CACHE" ] || build_tag_uri_cache
-    grep "^${1}=" "$TAG_URI_CACHE" | cut -d= -f2-
+    local _tag="$1" _uri
+    # Rebuild if file missing OR empty (built too early after reload)
+    [ -s "$TAG_URI_CACHE" ] || build_tag_uri_cache
+    _uri=$(grep "^${_tag}=" "$TAG_URI_CACHE" 2>/dev/null | cut -d= -f2-)
+    # On miss: rebuild once and retry — catches stale cache from early build
+    if [ -z "$_uri" ]; then
+        build_tag_uri_cache
+        _uri=$(grep "^${_tag}=" "$TAG_URI_CACHE" 2>/dev/null | cut -d= -f2-)
+    fi
+    printf '%s\n' "$_uri"
 }
 
 get_selector_link_by_index() {
     local idx="$1" line i=0
-    [ -f "$UCI_LINKS_CACHE" ] || build_uci_links_cache
+    # Rebuild if file missing OR empty
+    [ -s "$UCI_LINKS_CACHE" ] || build_uci_links_cache
+    while IFS= read -r line; do
+        [ "$i" -eq "$idx" ] && { printf '%s\n' "$line"; return 0; }
+        i=$((i + 1))
+    done < "$UCI_LINKS_CACHE"
+    # On miss: rebuild and retry
+    build_uci_links_cache; i=0
     while IFS= read -r line; do
         [ "$i" -eq "$idx" ] && { printf '%s\n' "$line"; return 0; }
         i=$((i + 1))
@@ -1489,10 +1505,17 @@ display_proxy_name() {
     human=$(get_proxy_human_name_by_tag "$tag")
     [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
     # 2. Try tag_name_cache (covers urltest_proxy_links, url_proxy_links, all modes)
-    if [ -f "$TAG_NAME_CACHE" ]; then
-        human=$(grep "^${tag}=" "$TAG_NAME_CACHE" | cut -d= -f2-)
-        [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
+    # Use -s to check non-empty; rebuild on miss (stale cache from early reload)
+    [ -s "$TAG_NAME_CACHE" ] || build_tag_name_cache
+    human=$(grep "^${tag}=" "$TAG_NAME_CACHE" 2>/dev/null | cut -d= -f2-)
+    if [ -z "$human" ]; then
+        # Ensure TAG_URI_CACHE is fresh before rebuilding TAG_NAME_CACHE —
+        # build_tag_name_cache depends on TAG_URI_CACHE for server:port matching
+        [ -s "$TAG_URI_CACHE" ] || build_tag_uri_cache
+        build_tag_name_cache
+        human=$(grep "^${tag}=" "$TAG_NAME_CACHE" 2>/dev/null | cut -d= -f2-)
     fi
+    [ -n "$human" ] && { printf '%s\n' "$human"; return 0; }
     # 3. Fallback: reconstruct [type] server:port from TAG_URI_CACHE
     cached_uri=$(get_uri_by_tag "$tag")
     if [ -n "$cached_uri" ] && [ "$cached_uri" != "N/A" ]; then
@@ -1605,7 +1628,19 @@ safe_reload_podkop() {
     fi
 
     /etc/init.d/podkop reload; rc=$?
-    build_all_caches
+    # Wait for sing-box config.json to be written and valid before building caches.
+    # podkop reload is semi-async: returns before sing-box fully restarts.
+    # Building caches too early produces empty TAG_URI/UCI_LINKS/TAG_NAME caches.
+    local _cfg_ready=0
+    if [ "$rc" -eq 0 ]; then
+        local _ci=0 _cfg="${SINGBOX_CONFIG_PATH:-/etc/sing-box/config.json}"
+        while [ "$_ci" -lt 10 ]; do
+            jq -e '.outbounds | length > 0' "$_cfg" >/dev/null 2>&1 && { _cfg_ready=1; break; }
+            sleep 1; _ci=$((_ci + 1))
+        done
+        [ "$_cfg_ready" = "0" ] && logger -t podkop-bot "[Reload] Warning: config.json not ready after 10s, skipping cache build"
+    fi
+    [ "$_cfg_ready" = "1" ] && build_all_caches
     [ "$rc" -ne 0 ] && { logger -t podkop-bot "[Error] Reload failed (RC=$rc)"; return 2; }
     logger -t podkop-bot "[Reload] Success"; return 0
 }
@@ -2546,7 +2581,7 @@ ${E_CLIP} <b>Sections Management</b>
 <i>Select a section to switch to:</i>
 EOF
 )
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
         "set_sec_"*)
@@ -2592,7 +2627,7 @@ _handle_proxy() {
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
             else
                 uci add_list podkop.${sec}.${_links_key}="$safe_link"
-                uci_commit_safe podkop; build_all_caches
+                uci_commit_safe podkop
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
                 _handle_proxy "proxy_menu" "" "" ""
@@ -2630,7 +2665,7 @@ _handle_proxy() {
             fi
             if [ -z "$proxies" ] || [ "$proxies" = "null" ]; then
                 send_or_edit "$mid" "$(printf '%s <b>Clash API Unavailable</b>\n<i>sing-box may be restarting. Try Refresh in a moment.</i>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Retry\",\"callback_data\":\"proxy_menu\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Retry\",\"callback_data\":\"proxy_menu\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
 
@@ -2783,7 +2818,7 @@ EOF
                     kb="${kb}[{\"text\":\"${E_SCAN} Switch to URLTest auto\",\"callback_data\":\"do_px_auto_urltest\"}],"
                 fi
             fi
-            kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
+            kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"main_menu\"}]]}"
             local _card_title
             case "$proxy_mode_cur" in
                 urltest) _card_title="${E_TGT} <b>URLTest Outbounds</b>" ;;
@@ -2912,7 +2947,7 @@ EOF
                     [{"text":$ok,  "callback_data":("do_px_"+$i)},   {"text":$test,"callback_data":("test_px_"+$i)}],
                     [{"text":$del, "callback_data":("ask_del_px_"+$i)},{"text":$back,"callback_data":("proxy_menu_p_"+$p)}],
                     (if $is_active == "1" then [{"text":$probe,"callback_data":("ask_probe_outbound_px_"+$i)}] else [] end),
-                    [{"text":"Menu","callback_data":"/menu"}]
+                    [{"text":"${E_HOME} Menu","callback_data":"/menu"}]
                 ] | map(select(length > 0))
                 }')
             send_or_edit "$mid" "$text" "$kb"
@@ -3068,7 +3103,7 @@ EOF
             fi
             [ -n "$p_idx" ] && ret_page=$(( p_idx / per_page ))
             uci del_list podkop.${sec}.selector_proxy_links="$raw_link"
-            uci_commit_safe podkop; build_all_caches
+            uci_commit_safe podkop
             send_or_edit "$mid" "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
             safe_reload_podkop "force"; sleep 1
             _handle_proxy "proxy_menu_p_${ret_page}" "$mid" "" ""
@@ -3196,7 +3231,7 @@ $link_list
 EOF
             fi
 
-            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],${_ul_probe_row}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}${nav_row}[{\"text\":\"${E_ADD} Set URL\",\"callback_data\":\"cmd_url_link_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"url_links_menu\"}],${_ul_probe_row}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             text=$(cat <<EOF
 ${E_GLOB} <b>Single URL Proxy</b> [<code>${sec}</code>]
 <b>Active:</b> $(html_escape "$_ul_name") | ${_ul_delay_txt} — ${_ul_verdict}
@@ -3268,7 +3303,7 @@ EOF
             luci_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Outbound Config mode</b>\n\nThis mode requires editing raw sing-box JSON.\nEditing JSON via Telegram is error-prone and not supported by the bot.\n\n<b>Please use LuCI or console instead:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set podkop.%s.outbound_json=...</code>\n\n<i>After editing in LuCI/console, use Reload Podkop in the bot to apply.</i>' "$E_WARN" "$luci_ip" "$sec")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"main_menu\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"main_menu\"}]]}"
             ;;
     esac
 }
@@ -3516,11 +3551,11 @@ EOF
         "do_autostart_off")
             /etc/init.d/podkop disable 2>/dev/null
             send_or_edit "$mid" "$(printf '%s Podkop autostart <b>disabled</b>.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
         "do_autostart_on")
             /etc/init.d/podkop enable 2>/dev/null
             send_or_edit "$mid" "$(printf '%s Podkop autostart <b>enabled</b>.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
     esac
 }
 
@@ -3994,7 +4029,7 @@ EOF
             kb_boot=""
             [ "$protocol" = "doh" ] || [ "$protocol" = "dot" ] && \
                 kb_boot="[{\"text\":\"${E_EDIT} Set Bootstrap\",\"callback_data\":\"cmd_boot_dns\"}],"
-            kb="{\"inline_keyboard\":[${kb_boot}[{\"text\":\"Protocol: ${protocol}\",\"callback_data\":\"dns_proto_menu\"}],[{\"text\":\"${E_EDIT} Change Server\",\"callback_data\":\"cmd_dns_server\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${kb_boot}[{\"text\":\"Protocol: ${protocol}\",\"callback_data\":\"dns_proto_menu\"}],[{\"text\":\"${E_EDIT} Change Server\",\"callback_data\":\"cmd_dns_server\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
         "cmd_dns_server")
@@ -4037,7 +4072,7 @@ WAN Access: $([ "$wn" = "1" ] && echo "${E_ON}" || echo "${E_OFF}")
 Secret Key: $([ "$sk" != "Not set" ] && echo "${E_OK} Set" || echo "${E_ERR} Not set")
 EOF
 )
-            kb="{\"inline_keyboard\":[[{\"text\":\"$([ "$en" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") Toggle YACD\",\"callback_data\":\"ask_toggle_yacd\"}],[{\"text\":\"$([ "$wn" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") WAN Access\",\"callback_data\":\"ask_toggle_yacd_wan\"}],[{\"text\":\"${E_KEY} Secret Key\",\"callback_data\":\"yacd_secret_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"$([ "$en" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") Toggle YACD\",\"callback_data\":\"ask_toggle_yacd\"}],[{\"text\":\"$([ "$wn" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") WAN Access\",\"callback_data\":\"ask_toggle_yacd_wan\"}],[{\"text\":\"${E_KEY} Secret Key\",\"callback_data\":\"yacd_secret_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
         "ask_toggle_yacd")     send_or_edit "$mid" "$(printf '%s Toggle YACD?' "$E_WARN")"         "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_yacd\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"yacd_settings\"}]]}" ;;
@@ -4097,7 +4132,7 @@ _handle_lists() {
             local ip=$(printf "%s" "$text" | tr -d '\r\n\t ')
             if ! validate_ip_or_cidr "$ip"; then
                 send_message "$(printf '%s Invalid IP/CIDR.' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
             uci add_list podkop.${sec}.fully_routed_ips="$ip"; uci_commit_safe podkop
@@ -4308,7 +4343,7 @@ Domains in these lists bypass your ISP completely.</i>
 Changes apply immediately with reload.
 EOF
 )
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4344,7 +4379,7 @@ EOF
             [ "$i" -eq 0 ] && text=$(printf '%s<i>No lists configured.</i>' "$text")
             local add_cb="cmd_add_r_dom"
             [ "$cmd" = "r_sub_edit" ] && add_cb="cmd_add_r_sub"
-            local kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add URL\",\"callback_data\":\"${add_cb}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            local kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add URL\",\"callback_data\":\"${add_cb}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4388,7 +4423,7 @@ Tap an IP button to remove it.
 ${E_IDEA} <i>Fully Routed IPs bypass the domain/subnet lists and always go through the tunnel.</i>
 EOF
 )
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add IP\",\"callback_data\":\"cmd_add_fr_ip\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add IP\",\"callback_data\":\"cmd_add_fr_ip\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4419,7 +4454,7 @@ Tap an IP button to remove it.
 ${E_IDEA} <i>Excluded IPs bypass the tunnel entirely — always go direct regardless of rules. This is a global setting (applies to all sections).</i>
 EOF
 )
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add IP\",\"callback_data\":\"cmd_add_excl_ip\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add IP\",\"callback_data\":\"cmd_add_excl_ip\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4492,7 +4527,7 @@ To remove: tap "${E_DEL} Remove by #" and enter the line number.
 EOF
 )
             local kb
-            kb="{\"inline_keyboard\":[${nav_row}[{\"text\":\"${E_ADD} Add line\",\"callback_data\":\"cmd_user_add_${add_state}\"},{\"text\":\"${E_DEL} Remove by #\",\"callback_data\":\"cmd_user_del_${del_state}\"}],[{\"text\":\"${E_FILE} Download as file\",\"callback_data\":\"cmd_user_download_${field}\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${nav_row}[{\"text\":\"${E_ADD} Add line\",\"callback_data\":\"cmd_user_add_${add_state}\"},{\"text\":\"${E_DEL} Remove by #\",\"callback_data\":\"cmd_user_del_${del_state}\"}],[{\"text\":\"${E_FILE} Download as file\",\"callback_data\":\"cmd_user_download_${field}\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4620,7 +4655,7 @@ _handle_fallback_socks() {
             [ -z "$list_text" ] && list_text="<i>No fallback SOCKS configured.</i>"
             local text kb
             text=$(printf '%s <b>Fallback SOCKS</b>\n\nTried in order after Podkop SOCKS5 fails.\nFormat: <code>socks5://IP:PORT</code> or <code>socks5h://IP:PORT</code>\n\n%s' "$E_NET" "$list_text")
-            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_fb_socks_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"fallback_socks_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_fb_socks_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_test_fb_socks\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"fallback_socks_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -4937,7 +4972,7 @@ EOF
 )
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime\"}],
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5003,7 +5038,7 @@ EOF
                 [{\"text\":\"${E_HEALTH} Tunnel Health\",\"callback_data\":\"cmd_tunnel_health\"}],
                 [{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"}],
                 [{\"text\":\"${E_FILE} Configs & Logs\",\"callback_data\":\"cmd_files\"}],
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_status\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_status\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5062,7 +5097,7 @@ EOF
             local th_proxies th_active_proxy th_active_display
             th_proxies=$(clash_request "/proxies" 2>/dev/null)
             th_active_proxy=$(get_active_proxy_name "$th_proxies")
-            th_active_display=$(html_escape "$(display_proxy_name_with_tag "$th_active_proxy")")
+            th_active_display=$(html_escape "$(get_active_proxy_display "$th_proxies")")
             [ -z "$th_active_display" ] && th_active_display="N/A (Clash API unavailable)"
 
             # Read structured watchdog state: two TG keys + socks
@@ -5148,7 +5183,7 @@ ${E_ON} <b>Community Lists:</b>
 EOF
 )
             kb="{\"inline_keyboard\":[
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_tunnel_health\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_tunnel_health\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5274,7 +5309,7 @@ $(_fmt_tier "tier5" "Emergency IPs")"
                 [{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"}],
                 [${cp_btn},${bi_btn}],
                 [{\"text\":\"${st_icon} Startup Notify\",\"callback_data\":\"toggle_bot_st\"},{\"text\":\"${al_icon} Alert Notify\",\"callback_data\":\"toggle_bot_al\"}],
-                [{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]
             ]}"
 
             text=$(cat <<EOF
@@ -5381,7 +5416,7 @@ EOF
                 [{\"text\":\"${E_SCAN} Upstream Health\",\"callback_data\":\"ask_upstream_health\"}],
                 [{\"text\":\"${E_GLOB} Global Check\",\"callback_data\":\"ask_run_podkop_tests\"},{\"text\":\"${E_CPU} Internal Diag\",\"callback_data\":\"ask_run_internal_diag\"}],
                 [{\"text\":\"${E_LOG} Support Bundle\",\"callback_data\":\"ask_support_bundle\"}],
-                [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5389,28 +5424,28 @@ EOF
         "ask_upstream_health")
             local text kb
             text=$(printf '%s <b>Upstream Health</b>\n\nTests all outbound proxies via Clash API.\nSends results as a text file.\n\n<i>May take 10\xe2\x80\x9330 sec on slow routers.</i>' "$E_WARN")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_upstream_health\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_upstream_health\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_run_podkop_tests")
             local text kb
             text=$(printf '%s <b>Global Check</b>\n\nRuns <code>podkop global_check</code> \xe2\x80\x94 tests DNS, routing, connectivity.\nSends results as a text file.\n\n<i>May take 10\xe2\x80\x9330 sec.</i>' "$E_WARN")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_run_podkop_tests\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_run_podkop_tests\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_run_internal_diag")
             local text kb
             text=$(printf '%s <b>Internal Diagnostics</b>\n\nGathers UCI config, routes, nft rules, syslog, bot state.\nSends results as a text file.\n\n<i>~5 sec, light CPU load.</i>' "$E_WARN")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_run_internal_diag\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_run_internal_diag\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "ask_support_bundle")
             local text kb
             text=$(printf '%s <b>Support Bundle</b>\n\nCollects everything: versions, UCI config (token redacted), routes, nft, interfaces, bot transport state, last 80 syslog lines.\nSends as a single text file.\n\n<i>~5 sec. Share with maintainer when reporting bugs.</i>' "$E_WARN")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Collect & Send\",\"callback_data\":\"cmd_support_bundle\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Collect & Send\",\"callback_data\":\"cmd_support_bundle\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5436,7 +5471,7 @@ EOF
             [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
             text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP, GeoIP, Cloudflare geo, Google hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~1.3 MB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"${_back_target}\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"${_back_target}\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5593,7 +5628,7 @@ EOF
                 url_links_menu)   _back_label="Single URL" ;;
                 *)                _back_label="← Back" ;;
             esac
-            result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            result_kb="{\"inline_keyboard\":[${action_btn}[{\"text\":\"${E_BACK} ${_back_label}\",\"callback_data\":\"${_back}\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
 
             logger -t podkop-bot "[Probe] ${active_px_display}: geo=${PROBE_COUNTRY} cf=${PROBE_CF_COUNTRY} google=${PROBE_GOOGLE_COUNTRY} tg_blocked=${PROBE_TG_BLOCKED} speed=${PROBE_SPEED_MBPS}Mbps size=${size_kb_disp}KB status=${PROBE_SPEED_STATUS}"
             send_or_edit "$mid" "$result_text" "$result_kb"
@@ -5628,7 +5663,7 @@ EOF
                 "{\"inline_keyboard\":[
                     [{\"text\":\"${E_FILE} Podkop Config\",\"callback_data\":\"cmd_get_config\"},{\"text\":\"${E_FILE} Sing-box JSON\",\"callback_data\":\"cmd_get_sb_json\"}],
                     [{\"text\":\"${E_LOG} Syslog\",\"callback_data\":\"cmd_get_log\"}],
-                    [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]
+                    [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]
                 ]}"
             ;;
         "cmd_get_config")  api_document "/etc/config/podkop"        "Podkop Config" ;;
@@ -5731,7 +5766,7 @@ EOF
         "ask_restart_bot")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Restart Bot?</b>\n\nKills all bot processes (main loop + watchdog subshells) and restarts via init.d.\nBot will send a startup notification when back online.' "$E_WARN")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Restart\",\"callback_data\":\"do_restart_bot\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Restart\",\"callback_data\":\"do_restart_bot\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             ;;
 
         "do_restart_bot")
@@ -5778,7 +5813,7 @@ ${E_INFO} <b>System Information</b>
 <b>YACD:</b> $([ "$y_en" = "1" ] && echo "${E_ON} Enabled - http://${lan_ip}:9090/ui" || echo "${E_OFF} Disabled")
 EOF
 )
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],[{\"text\":\"${E_SKULL} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],[{\"text\":\"${E_SKULL} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5879,7 +5914,7 @@ EOF
             esac
 
             if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")" "$kb"
                 return
             fi
@@ -5893,7 +5928,7 @@ EOF
                 else
                     text=$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")
                 fi
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             else
                 if [ -n "$highlights" ]; then
@@ -5904,7 +5939,7 @@ EOF
                     text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<a href="%s">Full changelog</a>' \
                         "$E_NEW" "$BOT_VERSION" "$remote_ver" "$changelog_link")
                 fi
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             fi
             ;;
@@ -5913,7 +5948,7 @@ EOF
             local target_ver="${cmd#ask_update_bot_}" text kb
             text=$(printf '%s <b>Update bot to v%s?</b>\n\nThe bot will download the new version and restart.\nAll active menus will be interrupted.\n\nSection: <code>%s</code>' \
                 "$E_WARN" "$target_ver" "$(get_active_section)")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Update & Restart\",\"callback_data\":\"do_update_bot_${target_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Update & Restart\",\"callback_data\":\"do_update_bot_${target_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -5921,7 +5956,7 @@ EOF
             local target_ver="${cmd#do_update_bot_}"
             local bot_tmp="/tmp/podkop_bot_update.$$"
             local bot_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
-            local kb_err="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"Menu\",\"callback_data\":\"/menu\"}]]}"
+            local kb_err="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
 
             send_or_edit "$mid" "$(printf '%s <b>Downloading bot v%s...</b>' "$E_TIME" "$target_ver")" ""
 
@@ -5979,16 +6014,16 @@ EOF
         "do_cmd_stop")
             if do_podkop_stop; then
                 send_or_edit "$mid" "$(printf '%s <b>Podkop Stopped</b>' "$E_STP")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             else
                 send_or_edit "$mid" "$(printf '%s <b>Stop Failed!</b>\nCheck: <code>ps w | grep sing-box</code>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             fi
             ;;
         "cmd_start")
             /etc/init.d/podkop start
             send_or_edit "$mid" "$(printf '%s <b>Podkop Starting...</b>' "$E_ON")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             ;;
         "ask_reload_podkop")
             send_or_edit "$mid" "$(printf '%s Reload Podkop?' "$E_WARN")" \
@@ -6004,16 +6039,16 @@ EOF
                     podkop_dns_check 15
                     if [ "${PODKOP_DNS_OK:-0}" = "1" ]; then
                         send_or_edit "$mid" "$(printf '%s Reloaded.\n%s Tunnel OK — traffic is routing.' "$E_OK" "$E_OK")" \
-                            "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                     else
                         send_or_edit "$mid" "$(printf '%s Reloaded.\n%s Tunnel check failed — podkop may not be routing traffic.' "$E_OK" "$E_WARN")" \
-                            "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
                     fi
                     ;;
                 1) send_or_edit "$mid" "$(printf '%s Cooldown active (10s).' "$E_WARN")" \
-                       "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                       "{\"inline_keyboard\":[[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
                 *) send_or_edit "$mid" "$(printf '%s Reload failed!' "$E_ERR")" \
-                       "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                       "{\"inline_keyboard\":[[{\"text\":\"${E_LOG} Logs\",\"callback_data\":\"cmd_get_log\"},{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}" ;;
             esac
             ;;
     esac
@@ -6176,7 +6211,19 @@ printf 'Initializing...' > "$MAIN_ROUTE_FILE"
 send_startup_notification_async() {
     local i=1 hostname p_ver active_proxy startup_txt tg_lat sec
 
-    build_all_caches
+    # Cold-start readiness check — same logic as safe_reload_podkop.
+    # sing-box may still be starting when bot launches; building caches too early
+    # produces empty TAG_URI/UCI_LINKS/TAG_NAME caches → raw main-N-out in UI.
+    local _ci=0 _cfg="${SINGBOX_CONFIG_PATH:-/etc/sing-box/config.json}" _cfg_ready=0
+    while [ "$_ci" -lt 10 ]; do
+        jq -e '.outbounds | length > 0' "$_cfg" >/dev/null 2>&1 && { _cfg_ready=1; break; }
+        sleep 1; _ci=$((_ci + 1))
+    done
+    if [ "$_cfg_ready" = "1" ]; then
+        build_all_caches
+    else
+        logger -t podkop-bot "[Startup] Warning: config.json not ready after 10s, skipping early cache build"
+    fi
     refresh_public_ip_cache &  # Pre-warm public IP cache on startup
 
     while [ "$i" -le 12 ]; do
@@ -6189,7 +6236,7 @@ send_startup_notification_async() {
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
                 p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
-                active_proxy=$(display_proxy_name_with_tag "$(get_active_proxy_name "")")
+                active_proxy=$(get_active_proxy_display "")
                 tg_lat=$(get_tg_latency)
                 sec=$(get_active_section)
                 startup_txt=$(cat <<EOF
@@ -6203,7 +6250,7 @@ ${E_BOT} <b>Bot Online</b> v${BOT_VERSION}
 EOF
 )
                 reset_chat_context
-                send_message "$startup_txt" "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Menu\",\"callback_data\":\"/menu\"}]]}"
+                send_message "$startup_txt" "{\"inline_keyboard\":[[{\"text\":\"${E_HOME} Menu\",\"callback_data\":\"/menu\"}]]}"
             fi
             break
         fi
