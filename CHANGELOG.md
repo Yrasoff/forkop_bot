@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.13.99
+
+- **FIXED:** TG direct check now uses `--resolve` to bypass DNS and connect directly to Telegram DC IPs (149.154.167.220, 149.154.167.51, 91.108.56.190) — requires 2/3 DCs to respond. Previously resolved through DNS which could return CDN/Cloudflare IPs giving false positive under RKN blocking.
+- **NEW:** `check_health` A3: probes first fallback SOCKS (tier2_1) against Telegram API — result shown as tier2 ✅/❌ in Status and Tunnel Health. Hidden when no fallback configured.
+- **UX:** Status and Tunnel Health — merged `tunnel` and `SOCKS` into single `tunnel SOCKS5` indicator. Green = transport ok + SOCKS up, yellow = transport ok but SOCKS port down, red = transport fail.
+- **NEW:** `mixed_proxy` disabled guard in Probe — shows clear error instead of N/A results when mixed_proxy is off.
+- **NEW:** Clash API availability check in Probe — shows "Enable YACD" hint if Clash API unreachable.
+- **NEW:** Active section initialized from first configured podkop section at startup (not hardcoded `main`).
+- **FIXED:** Public IP display shows `N/A` instead of `?` when IP unavailable (double NAT / unreachable).
+- **NEW:** `Test Fallback` button added to Bot Settings top level alongside Fallback SOCKS entry.
+- **NEW:** Podkop Settings — `Test Proxies` button added to top-level settings menu.
+- **UX:** All Menu navigation buttons now show 🏠 — disambiguates "go back one screen" (← Back) from "go to main menu" (🏠 Menu).
+
+---
+
 ## v0.13.98
 
 - **FIXED:** `get_active_proxy_name()` restored to return Clash API tag/leaf only — previously returned human display name in url mode which broke tag comparisons throughout the UI (active proxy marking in Outbounds list, Probe button visibility in proxy card). Added separate `get_active_proxy_display()` helper for display-only contexts.
@@ -9,15 +24,15 @@
 - **FIXED:** Probe result action button in url mode — showed "Switch Proxy" (proxy_menu) which is wrong for Single URL. Now shows "Set New URL" (cmd_url_link_add) when throttled/blocked.
 - **FIXED:** Active proxy display in Status, Runtime Info, Tunnel Health, Probe — now uses `get_active_proxy_display()` which shows human name from `#fragment` in url mode.
 - **NEW:** Probe result back button label adapts to context: "Diagnostics" / "Single URL" / "← Back".
-- **FIXED:** Cold-start cache race — `send_startup_notification_async` now waits up to 10s for `config.json` validity before `build_all_caches`, same logic as `safe_reload_podkop`. Skips with warning on timeout; lazy getters handle first-access rebuild.
-- **UX:** All Menu navigation buttons now show 🏠 instead of ← arrow — disambiguates "go back one screen" (← Back) from "go to main menu" (🏠 Menu).
 - **FIXED:** Cache race condition — `build_all_caches` no longer called before `safe_reload_podkop` in add/delete proxy paths. Cache was built on stale `config.json` producing empty `TAG_URI/UCI_LINKS/TAG_NAME` caches, causing raw `main-N-out` tags instead of human names in Outbounds.
 - **FIXED:** `safe_reload_podkop` waits up to 10s for `config.json` validity (`.outbounds | length > 0`) before building caches. Skips cache build with warning if timeout exceeded.
+- **FIXED:** Cold-start cache race — `send_startup_notification_async` now waits up to 10s for `config.json` validity before `build_all_caches`. Skips with warning on timeout; lazy getters handle first-access rebuild.
 - **FIXED:** `get_uri_by_tag`, `get_selector_link_by_index` — check `-s` (non-empty) instead of `-f`; rebuild on miss with retry.
 - **FIXED:** `display_proxy_name` — on `TAG_NAME_CACHE` miss, ensures `TAG_URI_CACHE` is fresh before rebuild (dependency chain: name cache depends on URI cache for server:port matching).
 - **FIXED:** Tunnel Health and startup notification now use `get_active_proxy_display()` for consistent human name in url mode.
 
 ---
+
 
 ## v0.13.97
 
