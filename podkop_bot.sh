@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.13.98
+# Podkop Telegram Bot v0.14.0
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -24,7 +24,7 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.13.99"
+BOT_VERSION="0.14.0"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -329,17 +329,63 @@ _try_curl() {
     return 1
 }
 
-# _load_transport_ctx: populate shared locals for transport functions.
+# _resolve_primary_section: find first podkop section with connection_type=proxy
+# and mixed_proxy_enabled=1. This is the section whose mixed_proxy the bot uses
+# as tier1 transport to Telegram — independent of active UI section.
+# Returns section name via stdout; falls back to active section then "main".
+_resolve_primary_section() {
+    local _s _ct _me _sec=""
+    local _all
+    _all=$(uci -q show podkop 2>/dev/null \
+        | grep -E '^podkop\.[^.=]+=section$' \
+        | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+    for _s in $_all; do
+        _ct=$(uci -q get podkop.${_s}.connection_type 2>/dev/null || echo "proxy")
+        _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
+        if [ "$_ct" = "proxy" ] && [ "$_me" = "1" ]; then
+            _sec="$_s"; break
+        fi
+    done
+    [ -z "$_sec" ] && _sec=$(get_active_section)
+    [ -z "$_sec" ] && _sec="main"
+    echo "$_sec"
+}
+
+
 # Call at the top of each transport function.
+# IMPORTANT: tier1 is always the PRIMARY proxy section (connection_type=proxy,
+# mixed_proxy_enabled=1), NOT the active UI section. Active section affects which
+# proxies are managed in the bot UI, but bot transport to Telegram must use the
+# main tunnel, not e.g. awg_main/WARP which may not route Telegram.
 _load_transport_ctx() {
-    _t_sec=$(get_active_section)
     _t_policy=$(uci -q get podkop_bot.settings.transport || echo "auto")
+
+    # Find primary section via shared helper
+    local _primary_sec; _primary_sec=$(_resolve_primary_section)
+    local _all_secs
+    _all_secs=$(uci -q show podkop 2>/dev/null \
+        | grep -E '^podkop\.[^.=]+=section$' \
+        | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+
+    _t_sec="$_primary_sec"
     _t_port=$(uci -q get podkop."${_t_sec}".mixed_proxy_port || echo "2080")
-    _t_ip=$(get_proxy_ip)
+    _t_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+    # Resolve actual listen IP from config.json for tier1
+    if [ -f "/etc/sing-box/config.json" ]; then
+        local _sb_ip
+        _sb_ip=$(jq -r --arg p "$_t_port" \
+            '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
+            /etc/sing-box/config.json 2>/dev/null | head -1)
+        if [ -n "$_sb_ip" ]; then
+            [ "$_sb_ip" = "0.0.0.0" ] || [ "$_sb_ip" = "::" ] || _t_ip="$_sb_ip"
+        fi
+    fi
+
     _t_custom=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null || echo "")
     _t_biface=$(uci -q get podkop_bot.settings.bind_interface 2>/dev/null || echo "")
     _t_ifflag=""; [ -n "$_t_biface" ] && _t_ifflag="--interface $_t_biface"
-    # Load fallback_socks list via safe_set_args (glob-safe replacement for eval set --)
+
+    # Load explicit fallback_socks from bot UCI config
     local _fb_raw
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     _t_fb_socks=""
@@ -347,6 +393,25 @@ _load_transport_ctx() {
         set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
         _t_fb_socks="$*"
     fi
+
+    # Auto-add mixed_proxy from OTHER sections as additional fallback tiers.
+    # Each section with mixed_proxy_enabled=1 and a different port = independent
+    # transport path (e.g. awg_main/WARP on 2081 can reach Telegram even if main/2080 fails).
+    local _lan_ip; _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+    for _s in $_all_secs; do
+        [ "$_s" = "$_t_sec" ] && continue  # skip primary, already tier1
+        local _me _mp _ct
+        _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
+        _mp=$(uci -q get podkop.${_s}.mixed_proxy_port 2>/dev/null || echo "")
+        [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_t_port" ] || continue
+        local _auto_fb="socks5h://${_lan_ip}:${_mp}"
+        # Only add if not already in explicit fallback list — match by IP:PORT to
+        # handle socks5:// vs socks5h:// variants added manually by user
+        case " $_t_fb_socks " in
+            *"://${_lan_ip}:${_mp} "*|*"://${_lan_ip}:${_mp}") ;;  # already present
+            *) _t_fb_socks="${_t_fb_socks:+$_t_fb_socks }${_auto_fb}" ;;
+        esac
+    done
 }
 
 # _try_socks_tiers: attempt tier1 + all fallback_socks in order.
@@ -710,37 +775,31 @@ probe_socks_latency() {
 # structured results to SOCKS_PROBE_FILE. Called periodically from watchdog.
 # Format: tier1=<ms|timeout>  tier2_1=<ms|timeout>  ts=<epoch>
 probe_all_socks_write() {
-    local sec m_ip m_port lat
-    sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
-    m_ip=$(get_proxy_ip)
-
-    local out="ts=$(date +%s)"
+    # Use _load_transport_ctx to get tier1 + all fallbacks (explicit + auto-sections).
+    # This ensures Transport Latency card in Tunnel Health shows all paths including
+    # auto-added mixed_proxy from other sections.
+    _load_transport_ctx
+    local lat out="ts=$(date +%s)"
 
     # tier1: primary Podkop SOCKS
-    lat=$(probe_socks_latency "socks5h://${m_ip}:${m_port}")
+    lat=$(probe_socks_latency "socks5h://${_t_ip}:${_t_port}")
     out="${out}\ntier1=${lat}"
-    logger -t podkop-bot "[SOCKSProbe] Primary (${m_ip}:${m_port}): ${lat}"
+    logger -t podkop-bot "[SOCKSProbe] Primary (${_t_ip}:${_t_port}): ${lat}"
 
-    # tier2_N: fallback_socks list
-    local _fb_raw _n=0 _item _fb=""
-    _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-    if [ -n "$_fb_raw" ]; then
-        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
-        for _item in "$@"; do
-            _n=$((_n + 1))
-            lat=$(probe_socks_latency "$_item")
-            out="${out}\ntier2_${_n}=${lat} url=${_item}"
-            logger -t podkop-bot "[SOCKSProbe] Fallback-${_n} (${_item}): ${lat}"
-        done
-    fi
+    # tier2_N: all fallbacks (explicit fallback_socks + auto-added sections)
+    local _n=0 _fb
+    for _fb in $_t_fb_socks; do
+        _n=$((_n + 1))
+        lat=$(probe_socks_latency "$_fb")
+        out="${out}\ntier2_${_n}=${lat} url=${_fb}"
+        logger -t podkop-bot "[SOCKSProbe] Fallback-${_n} (${_fb}): ${lat}"
+    done
 
-    # tier3: custom_proxy (only if set and is a proxy URL, not just an IP)
-    local _custom; _custom=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
-    if [ -n "$_custom" ]; then
-        lat=$(probe_socks_latency "$_custom")
-        out="${out}\ntier3=${lat} url=${_custom}"
-        logger -t podkop-bot "[SOCKSProbe] Custom proxy (${_custom}): ${lat}"
+    # tier3: custom_proxy
+    if [ -n "$_t_custom" ]; then
+        lat=$(probe_socks_latency "$_t_custom")
+        out="${out}\ntier3=${lat} url=${_t_custom}"
+        logger -t podkop-bot "[SOCKSProbe] Custom proxy (${_t_custom}): ${lat}"
     fi
 
     local _probe_tmp; _probe_tmp=$(mktemp /tmp/podkop_socks_probe.XXXXXX 2>/dev/null) || return 1
@@ -831,30 +890,25 @@ api_document() {
 
 # get_tg_latency: measure round-trip to Telegram on the current LAST_ROUTE_FAST
 get_tg_latency() {
-    local m_port m_ip custom_url b_iface if_flag p_args res sec
-    sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
-    m_ip=$(get_proxy_ip)
-    custom_url=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
-    b_iface=$(uci -q get podkop_bot.settings.bind_interface 2>/dev/null)
-    if_flag=""; [ -n "$b_iface" ] && if_flag="--interface $b_iface"
+    local m_port m_ip custom_url b_iface if_flag p_args res
+    # Use _load_transport_ctx to get primary section port — same source of truth
+    # as actual bot transport. Active UI section may differ from primary proxy section.
+    _load_transport_ctx
+    m_ip="$_t_ip"; m_port="$_t_port"
+    custom_url="$_t_custom"
+    b_iface="$_t_biface"; if_flag="$_t_ifflag"
     case "$LAST_ROUTE_FAST" in
         tier1)
             p_args="-x socks5h://${m_ip}:${m_port}"
             ;;
         tier2_*)
-            # Resolve the actual fallback SOCKS endpoint by index
-            local _n="${LAST_ROUTE_FAST#tier2_}" _fb_raw _fb_url _i=0
-            _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-            _fb_url=""
-            if [ -n "$_fb_raw" ]; then
-                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
-                for _fb_url in "$@"; do
-                    _i=$((_i + 1))
-                    [ "$_i" -eq "$_n" ] && break
-                    _fb_url=""
-                done
-            fi
+            # Resolve the actual fallback SOCKS endpoint by index from combined list
+            local _n="${LAST_ROUTE_FAST#tier2_}" _fb_url="" _i=0
+            for _fb_url in $_t_fb_socks; do
+                _i=$((_i + 1))
+                [ "$_i" -eq "$_n" ] && break
+                _fb_url=""
+            done
             [ -z "$_fb_url" ] && { echo "N/A"; return; }
             p_args="-x ${_fb_url}"
             ;;
@@ -2052,23 +2106,36 @@ check_health() {
     local _sec _port _ip
 
     # A1: direct (no proxy) — raw TCP connectivity to Telegram DC IPs
-    # Checks 3 DCs, requires 2/3 success to report "ok".
-    # Uses --resolve to bypass DNS and connect directly to DC IP, matching
-    # what MTProxy checks: actual TCP reachability, not CDN/Cloudflare.
+    # All 3 DCs probed in parallel — max time = one timeout, not three.
+    # Requires 2/3 DCs to respond to report "ok".
+    local _dc_pids="" _dc_dir
+    _dc_dir=$(mktemp -d /tmp/podkop_dc_probes.XXXXXX 2>/dev/null) || _dc_dir="/tmp"
+    for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
+        ( curl -s -k --connect-timeout 4 --max-time 6 \
+            --resolve "api.telegram.org:443:${_dc_ip}" \
+            -X GET "${API_URL}/getMe" 2>/dev/null \
+            | jq -e '.ok == true' >/dev/null 2>&1 \
+            && echo "ok" || echo "fail" ) > "${_dc_dir}/dc_${_dc_ip}" &
+        _dc_pids="$_dc_pids $!"
+    done
+    wait $_dc_pids 2>/dev/null || true
     local _dc_ok=0
     for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
-        tmp_resp=$(curl -s -k --connect-timeout 4 --max-time 6 \
-            --resolve "api.telegram.org:443:${_dc_ip}" \
-            -X GET "${API_URL}/getMe" 2>/dev/null)
-        printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1 && \
+        [ -f "${_dc_dir}/dc_${_dc_ip}" ] && \
+            [ "$(cat "${_dc_dir}/dc_${_dc_ip}")" = "ok" ] && \
             _dc_ok=$((_dc_ok + 1))
     done
+    rm -rf "$_dc_dir" 2>/dev/null || true
     [ "$_dc_ok" -ge 2 ] && _direct=ok
 
     # A2: via primary SOCKS (mixed_proxy / Podkop tier1)
-    _sec=$(get_active_section)
-    _port=$(uci -q get podkop.${_sec}.mixed_proxy_port || echo "2080")
-    _ip=$(get_proxy_ip)
+    local _primary_sec; _primary_sec=$(_resolve_primary_section)
+    local _all_secs_h
+    _all_secs_h=$(uci -q show podkop 2>/dev/null \
+        | grep -E '^podkop\.[^.=]+=section$' \
+        | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+    _port=$(uci -q get podkop.${_primary_sec}.mixed_proxy_port || echo "2080")
+    _ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
     tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
         --socks5-hostname "${_ip}:${_port}" \
         -X GET "${API_URL}/getMe" 2>/dev/null)
@@ -2076,27 +2143,75 @@ check_health() {
         _transport=ok
     fi
 
-    # A3: via first fallback SOCKS (tier2_1) — independent path check
-    local _fb_raw _fb1
+    # A3: probe all fallback paths — explicit fallback_socks + other sections mixed_proxy
+    # Run all probes in parallel (background subshells) to avoid timeout accumulation.
+    # Pattern: same as refresh_public_ip_cache() and cmd_all_delay_test.
+    local _fb_raw _fb_list="" _tier2_results="" _tier2=none
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-    if [ -n "$_fb_raw" ]; then
-        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
-        _fb1="$1"
-    fi
-    if [ -n "$_fb1" ]; then
-        tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
-            -x "$_fb1" \
-            -X GET "${API_URL}/getMe" 2>/dev/null)
-        if printf '%s' "$tmp_resp" | jq -e '.ok == true' >/dev/null 2>&1; then
-            _tier2=ok
-        fi
-    else
-        _tier2=none  # no fallback configured
-    fi
+    [ -n "$_fb_raw" ] && { set -f; set -- $(uci_list_clean "$_fb_raw"); set +f; _fb_list="$*"; }
+
+    local _lan_ip; _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+
+    # Build probe list: [label, endpoint] pairs written to tmpfiles in parallel
+    local _probe_dir; _probe_dir=$(mktemp -d /tmp/podkop_health_probes.XXXXXX) || { _tier2=none; }
+    local _pids="" _probe_any=0
+
+    # explicit fallback_socks — ALL entries in parallel (not just first)
+    local _fn=0
+    for _fbe in $_fb_list; do
+        _fn=$((_fn + 1))
+        ( curl -s -k --connect-timeout 4 --max-time 8 \
+            -x "$_fbe" -X GET "${API_URL}/getMe" 2>/dev/null \
+            | jq -e '.ok == true' >/dev/null 2>&1 \
+            && echo "ok" || echo "fail" ) > "${_probe_dir}/fb_${_fn}" &
+        _pids="$_pids $!"
+        _probe_any=1
+    done
+
+    # other sections mixed_proxy — parallel, skip duplicates vs explicit fallback_socks
+    for _s in $_all_secs_h; do
+        [ "$_s" = "$_primary_sec" ] && continue
+        local _me _mp
+        _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
+        _mp=$(uci -q get podkop.${_s}.mixed_proxy_port 2>/dev/null || echo "")
+        [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_port" ] || continue
+        # Skip if already in explicit fallback_socks list (duplicate check)
+        local _auto_ep="socks5h://${_lan_ip}:${_mp}"
+        case " $_fb_list " in *" $_auto_ep "*) continue ;; esac
+        ( curl -s -k --connect-timeout 4 --max-time 8 \
+            --socks5-hostname "${_lan_ip}:${_mp}" \
+            -X GET "${API_URL}/getMe" 2>/dev/null \
+            | jq -e '.ok == true' >/dev/null 2>&1 \
+            && echo "ok" || echo "fail" ) > "${_probe_dir}/sec_${_s}" &
+        _pids="$_pids $!"
+        _probe_any=1
+    done
+
+    # Wait for all parallel probes
+    [ -n "$_pids" ] && wait $_pids 2>/dev/null || true
+
+    # Collect results from all parallel probes
+    local _rn=0
+    for _fbe in $_fb_list; do
+        _rn=$((_rn + 1))
+        local _rf="${_probe_dir}/fb_${_rn}"
+        [ -f "$_rf" ] && [ "$(cat "$_rf")" = "ok" ] && _tier2=ok || \
+            { [ "$_tier2" = "none" ] && _tier2=fail; }
+    done
+    for _s in $_all_secs_h; do
+        [ "$_s" = "$_primary_sec" ] && continue
+        local _rf="${_probe_dir}/sec_${_s}"
+        [ -f "$_rf" ] || continue
+        local _sec_result; _sec_result=$(cat "$_rf")
+        _tier2_results="${_tier2_results}tg_sec_${_s}=${_sec_result}\n"
+        [ "$_sec_result" = "ok" ] && _tier2=ok
+    done
+    [ "$_probe_any" = "0" ] && _tier2=none
+    rm -rf "$_probe_dir" 2>/dev/null || true
 
     # Write atomically via tmp+mv — prevents watchdog reading truncated file
-    printf 'tg_direct=%s\ntg_transport=%s\ntg_tier2=%s\n' \
-        "$_direct" "$_transport" "$_tier2" \
+    printf 'tg_direct=%s\ntg_transport=%s\ntg_tier2=%s\n%b' \
+        "$_direct" "$_transport" "$_tier2" "$_tier2_results" \
         > "${HEALTH_STATE_FILE}.tmp" && mv "${HEALTH_STATE_FILE}.tmp" "$HEALTH_STATE_FILE" 2>/dev/null
 
     # Return 0 (success) if at least one path works
@@ -2107,20 +2222,17 @@ _write_socks_state() {
     # Args: $1=tg_aggregate(ok|fail)  $2=socks(up|down)  $3=last_ok_route
     # Reads tg_direct/tg_transport from HEALTH_STATE_FILE (written by check_health).
     # Keeps tg= for backward compat with any external tooling.
-    local _tg_direct _tg_transport _tg_tier2
+    local _tg_direct _tg_transport _tg_tier2 _tg_sec_lines
     _tg_direct=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
     _tg_transport=$(grep "^tg_transport=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
     _tg_tier2=$(grep "^tg_tier2=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
+    # Forward per-section TG results so Tunnel Health can read them from SOCKS_STATE_FILE
+    _tg_sec_lines=$(grep "^tg_sec_" "$HEALTH_STATE_FILE" 2>/dev/null)
     # route= and route_name= removed: watchdog subshell holds stale LAST_ROUTE.
     # Authoritative route key is in MAIN_ROUTE_KEY_FILE, written by main process.
-    printf 'tg=%s
-tg_direct=%s
-tg_transport=%s
-tg_tier2=%s
-socks=%s
-last_ok=%s
-' \
-        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$2" "$3" > "$SOCKS_STATE_FILE"
+    printf 'tg=%s\ntg_direct=%s\ntg_transport=%s\ntg_tier2=%s\nsocks=%s\nlast_ok=%s\n%s\n' \
+        "$1" "${_tg_direct:-?}" "${_tg_transport:-?}" "${_tg_tier2:-none}" "$2" "$3" \
+        "${_tg_sec_lines}" > "$SOCKS_STATE_FILE"
 }
 
 # send_health_alert: health daemon uses this instead of bare api_request_fast.
@@ -5139,7 +5251,7 @@ EOF
             th_proxies=$(clash_request "/proxies" 2>/dev/null)
             th_active_proxy=$(get_active_proxy_name "$th_proxies")
             th_active_display=$(html_escape "$(get_active_proxy_display "$th_proxies")")
-            [ -z "$th_active_display" ] && th_active_display="N/A (Clash API unavailable)"
+            [ -z "$th_active_display" ] && th_active_display="N/A (Clash down)"
 
             # Read structured watchdog state: two TG keys + socks
             local wd_tg_direct="?" wd_tg_transport="?" wd_socks="?"
@@ -5160,6 +5272,50 @@ EOF
                 fail) tier2_icon="$E_ERR"; tier2_line="${tier2_icon} <b>TG tier2 SOCKS:</b> <code>fail</code>" ;;
                 *)    tier2_line="" ;;
             esac
+
+            # Consolidated per-section block: outbound delay + TG reachability in one line
+            # Format: 🟢 [main] LV-hysteria2 217ms | TG: ✅
+            local _sec_ob_lines=""
+            if [ -n "$th_proxies" ]; then
+                local _all_secs_th
+                _all_secs_th=$(uci -q show podkop 2>/dev/null \
+                    | grep -E '^podkop\.[^.=]+=section$' \
+                    | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+                for _s in $_all_secs_th; do
+                    local _s_sel _s_now _s_leaf _s_delay _s_icon _s_name _s_tg _s_tg_icon
+                    # Get selector tag for this section
+                    _s_sel=$(printf '%s' "$th_proxies" | jq -r \
+                        --arg s "$_s" \
+                        '[ .proxies | to_entries[] |
+                           select(.key | startswith($s)) |
+                           select(.value.type == "Selector" or .value.type == "URLTest") ]
+                         | sort_by(.value.all | length) | last | .key // empty' 2>/dev/null)
+                    # Get delay — from selector or direct outbound
+                    if [ -n "$_s_sel" ]; then
+                        _s_now=$(printf '%s' "$th_proxies" | jq -r \
+                            --arg sel "$_s_sel" '.proxies[$sel].now // empty' 2>/dev/null)
+                        [ -n "$_s_now" ] && _s_leaf=$(_resolve_leaf "$_s_now" "$th_proxies") \
+                                         || _s_leaf="$_s_sel"
+                    else
+                        # VPN/url mode — direct outbound tag
+                        _s_leaf="${_s}-out"
+                    fi
+                    _s_delay=$(printf '%s' "$th_proxies" | jq -r \
+                        --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
+                    _s_name=$(html_escape "$(display_proxy_name "$_s_leaf")")
+                    [ -z "$_s_name" ] && _s_name="$_s_leaf"
+                    if [ -z "$_s_delay" ] || [ "$_s_delay" = "0" ]; then
+                        _s_icon="$E_YLW"; _s_delay="N/A"
+                    elif [ "$_s_delay" -lt 300 ]; then _s_icon="$E_ON"
+                    elif [ "$_s_delay" -lt 500 ]; then _s_icon="$E_YLW"
+                    else _s_icon="$E_RED"; fi
+                    [ "$_s_delay" != "N/A" ] && _s_delay="${_s_delay}ms"
+                    # TG reachability for this section from SOCKS_STATE_FILE
+                    _s_tg=$(grep "^tg_sec_${_s}=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+                    [ "$_s_tg" = "ok" ] && _s_tg_icon="$E_OK" || { [ -n "$_s_tg" ] && _s_tg_icon="$E_ERR" || _s_tg_icon="…"; }
+                    _sec_ob_lines="${_sec_ob_lines}${_s_icon} [${_s}] <code>${_s_name}</code> ${_s_delay} | TG: ${_s_tg_icon}\n"
+                done
+            fi
 
             # Read SOCKS latency probe results
             local probe_ts="" probe_tier1="" probe_fb_text="" probe_age_str="" probe_t3_text=""
@@ -5224,6 +5380,7 @@ $([ -n "$tier2_line" ] && printf '%s' "$tier2_line")
 ${E_SHLD} <b>Bot transport:</b> <code>${LAST_ROUTE_NAME}</code>
 ${E_NET} <b>Poll route:</b> <code>${LAST_ROUTE_POLL}</code> | <b>Fast:</b> <code>${LAST_ROUTE_FAST}</code>${probe_section}
 <code>────────────────────</code>
+$([ -n "$_sec_ob_lines" ] && printf '📡 <b>Active outbounds by section:</b>\n%b<code>────────────────────</code>\n' "$_sec_ob_lines")
 ${E_FILE} <b>nftables rules (podkop):</b> ${nft_count}
 ${E_RST} <b>Last reload:</b> ${last_reload_str}
 <code>────────────────────</code>
