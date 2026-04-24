@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.14.0
+
+- **FIXED:** `_load_transport_ctx` — tier1 (bot transport to Telegram) now always uses the **primary proxy section** (`connection_type=proxy` + `mixed_proxy_enabled=1`), not the active UI section. Previously switching active section to e.g. `awg_main` (WARP/VPN) caused bot to use port 2081 for its own transport, breaking connectivity.
+- **NEW:** `_load_transport_ctx` auto-adds other sections' `mixed_proxy` endpoints as additional fallback tiers. Each section with `mixed_proxy_enabled=1` and a different port is appended to `_t_fb_socks` after explicit `fallback_socks` entries — no manual configuration needed.
+- **FIXED:** `check_health` A2 now uses primary proxy section for tier1 health check (same fix as transport ctx).
+- **NEW:** `check_health` A3 tests **each section's mixed_proxy independently** — per-section results written as `tg_sec_<name>=ok|fail` to `HEALTH_STATE_FILE`. Aggregate `tg_tier2` is ok if any section passes.
+- **NEW:** Tunnel Health — **"Active outbounds by section"** block: read-only overview of active proxy and delay for every podkop section simultaneously. No section switching needed — see all paths at a glance. Sections without Selector/URLTest group (VPN type) show N/A gracefully.
+- **NEW:** Tunnel Health — per-section TG reachability lines (`✅ TG via awg_main: ok`) from per-section health check results.
+
+---
+
 ## v0.13.99
 
 - **FIXED:** TG direct check now uses `--resolve` to bypass DNS and connect directly to Telegram DC IPs (149.154.167.220, 149.154.167.51, 91.108.56.190) — requires 2/3 DCs to respond. Previously resolved through DNS which could return CDN/Cloudflare IPs giving false positive under RKN blocking.
