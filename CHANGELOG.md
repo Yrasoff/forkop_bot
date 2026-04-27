@@ -9,8 +9,11 @@
 - **NEW:** Tunnel Health — **"Active outbounds by section"** block: read-only overview of active proxy and delay for every podkop section simultaneously. No section switching needed — see all paths at a glance. Sections without Selector/URLTest group (VPN type) show N/A gracefully.
 - **NEW:** Tunnel Health — per-section TG reachability lines (`✅ TG via awg_main: ok`) from per-section health check results.
 
----
+- **FIXED:** `do_toggle_mixed` — enabling mixed proxy when `mixed_proxy_port` is not set in UCI caused podkop to pass empty string to `--argjson listen_port` in `sing_box_config_manager.sh`, producing `jq: invalid JSON` and aborting sing-box config generation. Bot now auto-assigns port before enabling: scans all sections for used ports, starts from 2080 and increments until a free port is found. Confirmation screen shows the port that will be auto-assigned.
+- **FIXED:** `do_toggle_mixed` — if `podkop reload` fails after toggle, user now sees explicit error message with `logread` hint instead of bot silently returning to settings screen.
+- **FIXED:** Root cause confirmed from podkop 0.7.14 source: `configure_section_mixed_proxy()` calls `config_get mixed_proxy_port "$section" "mixed_proxy_port"` with no default — only `mixed_proxy_port` is affected, all other `--argjson` calls in podkop use `_normalize_arg()` or hardcoded values.
 
+---
 ## v0.13.99
 
 - **FIXED:** TG direct check now uses `--resolve` to bypass DNS and connect directly to Telegram DC IPs (149.154.167.220, 149.154.167.51, 91.108.56.190) — requires 2/3 DCs to respond. Previously resolved through DNS which could return CDN/Cloudflare IPs giving false positive under RKN blocking.
