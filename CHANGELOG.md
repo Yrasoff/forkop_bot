@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.14.1
+
+- **FIXED (Critical):** `eval "set -- $(uci_list_clean \"$var\")"` — all 33 occurrences replaced with 2-step `{ _ucl=$(uci_list_clean "$var"); eval "set -- $_ucl"; }`. The inline `$(...)` form caused `sh: eval: Syntax error: Unterminated quoted string` in ash whenever a UCI list contained single-quoted values (which all `*_proxy_links` lists do). The eval failure crashed the **entire subshell** silently (exit code 2), causing: (1) `build_tag_name_cache` producing 0-entry cache → empty proxy names in Outbounds, alerts, startup notification; (2) `send_startup_notification_async` subshell dying before ever sending the startup message; (3) all proxy add/delete/count operations silently failing in URLTest mode.
+- **FIXED:** Startup ordering — `ACTIVE_SECTION_FILE` is now initialized **before** launching `send_startup_notification_async &` and `start_health_daemon`. Previously caches were built for `main` (fallback default) even when the user's primary section had a different name.
+- **REFACTORED:** All 27 persistent bot runtime files consolidated under `BOT_DIR="/tmp/podkop_bot"` (created with `mkdir -p`). Trap simplified to `rm -rf "$BOT_DIR"`. Eliminates `/tmp` clutter and makes cleanup atomic.
+
+---
+
 ## v0.14.0
 
 - **FIXED:** `_load_transport_ctx` — tier1 (bot transport to Telegram) now always uses the **primary proxy section** (`connection_type=proxy` + `mixed_proxy_enabled=1`), not the active UI section. Previously switching active section to e.g. `awg_main` (WARP/VPN) caused bot to use port 2081 for its own transport, breaking connectivity.
