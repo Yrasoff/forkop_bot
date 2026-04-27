@@ -1695,7 +1695,7 @@ safe_reload_podkop() {
         [ "$_cfg_ready" = "0" ] && logger -t podkop-bot "[Reload] Warning: config.json not ready after 10s, skipping cache build"
     fi
     [ "$_cfg_ready" = "1" ] && build_all_caches
-    [ "$rc" -ne 0 ] && { logger -t podkop-bot "[Error] Reload failed (RC=$rc)"; return 2; }
+    [ "$rc" -ne 0 ] && { logger -t podkop-bot "[Error] Reload failed (RC=$rc) — podkop config invalid, sing-box not restarted"; return 2; }
     logger -t podkop-bot "[Reload] Success"; return 0
 }
 
@@ -3468,7 +3468,6 @@ EOF
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"${E_FILE} Routing & Lists\",\"callback_data\":\"community_lists\"}],
                 [{\"text\":\"${E_SET} Core Settings\",\"callback_data\":\"advanced_settings\"}],
-                [{\"text\":\"${E_TEST} Test Proxies\",\"callback_data\":\"cmd_all_delay_test\"}],
                 [{\"text\":\"${E_CLIP} Sections\",\"callback_data\":\"sections_menu\"}],
                 [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]
             ]}"
@@ -3658,8 +3657,26 @@ EOF
         "ask_toggle_quic") send_or_edit "$mid" "$(printf '%s Toggle QUIC blocking?' "$E_WARN")"             "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_quic\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
         "ask_toggle_wan")  send_or_edit "$mid" "$(printf '%s Toggle bad WAN monitoring?' "$E_WARN")"        "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_wan\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
         "ask_toggle_ntp")  send_or_edit "$mid" "$(printf '%s Toggle NTP exclusion?' "$E_WARN")"             "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_ntp\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
-        "ask_toggle_mixed") send_or_edit "$mid" "$(printf '%s Toggle Mixed Proxy (SOCKS5 listener on port %s)?' "$E_WARN" "$(uci -q get podkop.${sec}.mixed_proxy_port || echo 2080)")" \
-            "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_mixed\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
+        "ask_toggle_mixed")
+            local _mp; _mp=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null)
+            local _cur_me; _cur_me=$(uci -q get podkop.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
+            local _note=""
+            if [ "$_cur_me" != "1" ] && [ -z "$_mp" ]; then
+                # Calculate what port would be auto-assigned
+                local _used _candidate=2080
+                _used=$(uci -q show podkop 2>/dev/null \
+                    | grep '\.mixed_proxy_port=' \
+                    | sed "s/.*mixed_proxy_port='//;s/'$//" \
+                    | grep -E '^[0-9]+$')
+                while echo "$_used" | grep -qx "$_candidate"; do
+                    _candidate=$((_candidate + 1))
+                done
+                _mp="$_candidate"
+                _note="\n\n<i>Port not set — will auto-assign ${_candidate}.</i>"
+            fi
+            send_or_edit "$mid" "$(printf '%s Toggle Mixed Proxy (SOCKS5 listener on port %s)?%s' "$E_WARN" "${_mp:-2080}" "$_note")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_mixed\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+            ;;
 
         "conn_type_menu")
             local curr_ct; curr_ct=$(uci -q get podkop.${sec}.connection_type || echo "proxy")
@@ -3680,7 +3697,33 @@ EOF
         "do_toggle_quic") toggle_uci_bool "podkop.settings" "disable_quic";                        safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
         "do_toggle_wan")  toggle_uci_bool "podkop.settings" "enable_badwan_interface_monitoring";   safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
         "do_toggle_ntp")  toggle_uci_bool "podkop.settings" "exclude_ntp";                         safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
-        "do_toggle_mixed") toggle_uci_bool "podkop.${sec}" "mixed_proxy_enabled";                  safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
+        "do_toggle_mixed")
+            local _cur_me; _cur_me=$(uci -q get podkop.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
+            # When enabling mixed proxy — ensure required parameters are set
+            if [ "$_cur_me" != "1" ]; then
+                [ -z "$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null)" ] && {
+                    # Find a free port — collect all ports already used by other sections
+                    local _used_ports _candidate=2080
+                    _used_ports=$(uci -q show podkop 2>/dev/null \
+                        | grep '\.mixed_proxy_port=' \
+                        | sed "s/.*mixed_proxy_port='//;s/'$//" \
+                        | grep -E '^[0-9]+$')
+                    # Increment until we find an unused port
+                    while echo "$_used_ports" | grep -qx "$_candidate"; do
+                        _candidate=$((_candidate + 1))
+                    done
+                    uci set podkop.${sec}.mixed_proxy_port="${_candidate}"
+                    logger -t podkop-bot "[Config] Auto-set mixed_proxy_port=${_candidate} for section ${sec}"
+                }
+            fi
+            toggle_uci_bool "podkop.${sec}" "mixed_proxy_enabled"
+            if safe_reload_podkop; then
+                _handle_settings "advanced_settings" "$mid" "" ""
+            else
+                send_or_edit "$mid" "$(printf '%s <b>Reload failed</b>\n\nPodkop could not apply the config change.\nMixed proxy toggle was saved to UCI but sing-box did not restart.\n\nCheck: <code>logread | grep podkop</code>' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            fi
+            ;;
 
         "ask_toggle_autostart_off")
             send_or_edit "$mid" \
