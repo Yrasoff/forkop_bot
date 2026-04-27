@@ -6337,7 +6337,7 @@ EOF
                 else
                     text=$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")
                 fi
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_force_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             else
                 if [ -n "$highlights" ]; then
@@ -6355,14 +6355,19 @@ EOF
 
         "ask_update_bot_"*)
             local target_ver="${cmd#ask_update_bot_}" text kb
+            # Strip force_ prefix for display, preserve it for do_ callback
+            local _disp_ver="${target_ver#force_}"
             text=$(printf '%s <b>Update bot to v%s?</b>\n\nThe bot will download the new version and restart.\nAll active menus will be interrupted.\n\nSection: <code>%s</code>' \
-                "$E_WARN" "$target_ver" "$(get_active_section)")
+                "$E_WARN" "$_disp_ver" "$(get_active_section)")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Update & Restart\",\"callback_data\":\"do_update_bot_${target_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "do_update_bot_"*)
             local target_ver="${cmd#do_update_bot_}"
+            # Check for force_ prefix — force skips same-version guard
+            local _force=0
+            case "$target_ver" in force_*) _force=1; target_ver="${target_ver#force_}" ;; esac
             local bot_tmp="/tmp/podkop_bot_update.$$"
             local bot_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
             local kb_err="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
@@ -6383,6 +6388,17 @@ EOF
 
             local new_ver
             new_ver=$(grep '^BOT_VERSION=' "$bot_tmp" | cut -d'"' -f2)
+
+            # Guard: skip if downloaded version matches current AND not a force update.
+            # Prevents infinite loop when old "do_update_bot_" callbacks are
+            # replayed after a restart (e.g. offset migration or BOT_DIR change).
+            if [ "$_force" = "0" ] && [ -n "$new_ver" ] && [ "$new_ver" = "$BOT_VERSION" ]; then
+                rm -f "$bot_tmp"
+                send_or_edit "$mid" "$(printf '%s Already running v%s — no update needed.' "$E_OK" "$BOT_VERSION")"                     "{"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"/menu"}]]}"
+                logger -t podkop-bot "[Self-update] Skipped: already at v${BOT_VERSION}"
+                return
+            fi
+
             chmod +x "$bot_tmp"
 
             send_message \
@@ -6610,6 +6626,16 @@ find /tmp -maxdepth 1 -name 'podkop_req.*' -o -name 'podkop_updates.*' \
 done
 
 logger -t podkop-bot "=== Podkop Bot v${BOT_VERSION} Starting ==="
+
+# Migrate offset from old flat /tmp path to new BOT_DIR path (0.14.0 -> 0.14.1 upgrade).
+# Without this, after update the offset resets to 0 and the bot replays old Telegram
+# updates — including the "do_update_bot_" callback that triggered the update —
+# causing an infinite update/restart loop.
+if [ ! -f "$OFFSET_FILE" ] && [ -f "/tmp/podkop_bot_offset" ]; then
+    cp "/tmp/podkop_bot_offset" "$OFFSET_FILE" 2>/dev/null
+    logger -t podkop-bot "[Startup] Migrated offset from legacy path"
+fi
+
 # Pre-initialize route key file so watchdog nudge logic works from first cycle.
 # Without this, MAIN_ROUTE_KEY_FILE is empty until first api_request_fast succeeds,
 # and watchdog sees "unknown" → sends nudge → IPC up resets FAST/POLL → bot does
