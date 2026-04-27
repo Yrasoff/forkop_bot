@@ -11,6 +11,7 @@
 
 - **FIXED:** `do_toggle_mixed` — enabling mixed proxy when `mixed_proxy_port` is not set in UCI caused podkop to pass empty string to `--argjson listen_port` in `sing_box_config_manager.sh`, producing `jq: invalid JSON` and aborting sing-box config generation. Bot now auto-assigns port before enabling: scans all sections for used ports, starts from 2080 and increments until a free port is found. Confirmation screen shows the port that will be auto-assigned.
 - **FIXED:** `do_toggle_mixed` — if `podkop reload` fails after toggle, user now sees explicit error message with `logread` hint instead of bot silently returning to settings screen.
+- **FIXED:** `build_uci_links_cache` always read `selector_proxy_links` regardless of mode — in URLTest mode the cache was always empty (0 entries), causing proxy deletion to fail with "Cannot resolve link". Now reads `urltest_proxy_links` when `proxy_config_type=urltest`.
 - **FIXED:** Root cause confirmed from podkop 0.7.14 source: `configure_section_mixed_proxy()` calls `config_get mixed_proxy_port "$section" "mixed_proxy_port"` with no default — only `mixed_proxy_port` is affected, all other `--argjson` calls in podkop use `_normalize_arg()` or hardcoded values.
 
 ---
