@@ -241,8 +241,15 @@ json_escape() {
 #   for item in "$@"; do ...; done
 # IMPORTANT: set -- must happen in the caller's scope, not inside a function,
 # because set -- only affects positional params of the current shell context.
+# uci_list_clean: normalize UCI list output for safe iteration.
+# UCI show returns: key='val1' 'val2' 'val3'
+# After cut -d= -f2- we get: 'val1' 'val2' 'val3'
+# Usage: eval "set -- $(uci_list_clean "$raw")" — preserves spaces in values.
+# The eval pattern is the only reliable way in ash to handle UCI lists where
+# values may contain spaces (e.g. proxy names with spaces in #fragment).
 uci_list_clean() {
-    printf '%s\n' "$1" | tr -d "'"
+    # Keep single-quotes intact — eval "set --" relies on them for word splitting
+    printf '%s' "$1"
 }
 
 url_decode() {
@@ -390,7 +397,7 @@ _load_transport_ctx() {
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     _t_fb_socks=""
     if [ -n "$_fb_raw" ]; then
-        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+        eval "set -- $(uci_list_clean \"$_fb_raw\")"
         _t_fb_socks="$*"
     fi
 
@@ -811,14 +818,8 @@ probe_all_socks_write() {
 # Uses its own LAST_ROUTE_DOC so multipart failures don't poison polling.
 api_document() {
     local file="$1" caption="$2"
-    local res doc_kb nr sec m_port m_ip policy custom_url b_iface if_flag
-    sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
-    m_ip=$(get_proxy_ip)
-    policy=$(uci -q get podkop_bot.settings.transport || echo "auto")
-    custom_url=$(uci -q get podkop_bot.settings.custom_proxy 2>/dev/null)
-    b_iface=$(uci -q get podkop_bot.settings.bind_interface 2>/dev/null)
-    if_flag=""; [ -n "$b_iface" ] && if_flag="--interface $b_iface"
+    local res doc_kb nr
+    _load_transport_ctx
     doc_kb="{\"inline_keyboard\":[[{\"text\":\"${E_DEL} Delete\",\"callback_data\":\"delete_msg\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"doc_to_runtime\"}]]}"
 
     _do_curl_doc() {
@@ -839,44 +840,39 @@ api_document() {
     # here — always try in tier order. LAST_ROUTE_DOC records the outcome for
     # diagnostics but does not influence FAST or POLL routing.
 
-    if [ "$policy" != "direct" ]; then
-        res=$(_do_curl_doc "-x socks5h://${m_ip}:${m_port}")
+    if [ "$_t_policy" != "direct" ]; then
+        res=$(_do_curl_doc "-x socks5h://${_t_ip}:${_t_port}")
         _is_telegram_response "$res" && {
             unset -f _do_curl_doc
             LAST_ROUTE_DOC="tier1"; return 0
         }
-        # fallback_socks for doc — only when policy allows SOCKS
-        local _fb_raw _n=0 _fb
-        _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-        if [ -n "$_fb_raw" ]; then
-            set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
-            for _fb in "$@"; do
-                _n=$((_n + 1))
-                res=$(_do_curl_doc "-x $_fb")
-                _is_telegram_response "$res" && {
-                    unset -f _do_curl_doc
-                    LAST_ROUTE_DOC="tier2_${_n}"; return 0
-                }
-            done
-        fi
-        # custom_url — only when policy allows SOCKS/custom
-        if [ -n "$custom_url" ]; then
-            res=$(_do_curl_doc "$if_flag -x $custom_url")
+        # fallback_socks for doc — all tiers from _load_transport_ctx (incl. auto-sections)
+        local _n=0 _fb
+        for _fb in $_t_fb_socks; do
+            _n=$((_n + 1))
+            res=$(_do_curl_doc "-x $_fb")
+            _is_telegram_response "$res" && {
+                unset -f _do_curl_doc
+                LAST_ROUTE_DOC="tier2_${_n}"; return 0
+            }
+        done
+        if [ -n "$_t_custom" ]; then
+            res=$(_do_curl_doc "$_t_ifflag -x $_t_custom")
             _is_telegram_response "$res" && {
                 unset -f _do_curl_doc
                 LAST_ROUTE_DOC="tier3"; return 0
             }
         fi
     fi
-    if [ "$policy" != "socks" ]; then
-        res=$(_do_curl_doc "$if_flag")
+    if [ "$_t_policy" != "socks" ]; then
+        res=$(_do_curl_doc "$_t_ifflag")
         _is_telegram_response "$res" && {
             unset -f _do_curl_doc
             LAST_ROUTE_DOC="tier4"; return 0
         }
         local _eip
         for _eip in $TG_EMERGENCY_IPS; do
-            res=$(_do_curl_doc "$if_flag --resolve api.telegram.org:443:${_eip}")
+            res=$(_do_curl_doc "$_t_ifflag --resolve api.telegram.org:443:${_eip}")
             _is_telegram_response "$res" && {
                 unset -f _do_curl_doc
                 LAST_ROUTE_DOC="tier5"; return 0
@@ -1287,7 +1283,7 @@ is_list_enabled() {
     local sec="$1" tag="$2" item raw_list
     raw_list=$(uci -q show podkop.${sec}.community_lists 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 1
-    set -f; set -- $(uci_list_clean "$raw_list"); set +f
+    eval "set -- $(uci_list_clean \"$raw_list\")"
     for item in "$@"; do [ "$item" = "$tag" ] && return 0; done
     return 1
 }
@@ -1323,7 +1319,7 @@ build_uci_links_cache() {
     tmp=$(mktemp /tmp/podkop_uci_links.XXXXXX)
     raw_list=$(uci -q show podkop.${sec}.${_key} 2>/dev/null | cut -d= -f2-)
     if [ -n "$raw_list" ]; then
-        set -f; set -- $(uci_list_clean "$raw_list"); set +f
+        eval "set -- $(uci_list_clean \"$raw_list\")"
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
     fi
     mv "$tmp" "$UCI_LINKS_CACHE"
@@ -1343,7 +1339,7 @@ build_tag_name_cache() {
     for uci_key in selector_proxy_links urltest_proxy_links; do
         raw_list=$(uci -q show podkop.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
         [ -z "$raw_list" ] && continue
-        set -f; set -- $(uci_list_clean "$raw_list"); set +f
+        eval "set -- $(uci_list_clean \"$raw_list\")"
         for link in "$@"; do
             # Extract #fragment
             case "$link" in *#?*) frag="${link##*#}" ;; *) continue ;; esac
@@ -1403,7 +1399,7 @@ get_urltest_proxy_links() {
     local sec="$1" raw_list
     raw_list=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 0
-    set -f; set -- $(uci_list_clean "$raw_list"); set +f
+    eval "set -- $(uci_list_clean \"$raw_list\")"
     for link in "$@"; do printf '%s\n' "$link"; done
 }
 
@@ -2153,7 +2149,7 @@ check_health() {
     # Pattern: same as refresh_public_ip_cache() and cmd_all_delay_test.
     local _fb_raw _fb_list="" _tier2_results="" _tier2=none
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-    [ -n "$_fb_raw" ] && { set -f; set -- $(uci_list_clean "$_fb_raw"); set +f; _fb_list="$*"; }
+    [ -n "$_fb_raw" ] && { eval "set -- $(uci_list_clean \"$_fb_raw\")"; _fb_list="$*"; }
 
     local _lan_ip; _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
 
@@ -2425,7 +2421,7 @@ start_health_daemon() {
                     local _fb_raw _fb _fb_ok=0 _fb_alive=""
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
-                        set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+                        eval "set -- $(uci_list_clean \"$_fb_raw\")"
                         for _fb in "$@"; do
                             local _fb_ip _fb_port
                             _fb_ip=$(echo "$_fb" | sed 's|socks5h\?://||' | cut -d: -f1)
@@ -3174,7 +3170,7 @@ EOF
                         local _raw_uci
                         _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                         if [ -n "$_raw_uci" ]; then
-                            set -f; set -- $(uci_list_clean "$_raw_uci"); set +f
+                            eval "set -- $(uci_list_clean \"$_raw_uci\")"
                             for _link in "$@"; do
                                 case "$_link" in
                                     *"@${_srv_port}"*|*"@${_srv_port}/"*|*"@${_srv_port}#"*|\
@@ -3226,10 +3222,13 @@ EOF
                             "@${_srv_port}[/?#]\|@${_srv_port}$\|://${_srv_port}[/?#]\|://${_srv_port}$" \
                             "$UCI_LINKS_CACHE" 2>/dev/null)
                         if [ -z "$raw_link" ]; then
-                            local _raw_uci
-                            _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                            local _raw_uci _pmode
+                            _pmode=$(uci -q get podkop.${_sec}.proxy_config_type 2>/dev/null || echo "selector")
+                            [ "$_pmode" = "urltest" ] && \
+                                _raw_uci=$(uci -q show podkop.${_sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-) || \
+                                _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                             if [ -n "$_raw_uci" ]; then
-                                set -f; set -- $(uci_list_clean "$_raw_uci"); set +f
+                                eval "set -- $(uci_list_clean \"$_raw_uci\")"
                                 for _link in "$@"; do
                                     case "$_link" in
                                         *"@${_srv_port}"*|*"://${_srv_port}"*)
@@ -3242,13 +3241,31 @@ EOF
                 fi
             fi
 
+            # Also check urltest_proxy_links if selector search failed
+            if [ -z "$raw_link" ]; then
+                local _raw_uci_ut
+                _raw_uci_ut=$(uci -q show podkop.${_sec:-$(get_active_section)}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+                if [ -n "$_raw_uci_ut" ]; then
+                    eval "set -- $(uci_list_clean \"$_raw_uci_ut\")"
+                    for _link in "$@"; do
+                        case "$_link" in
+                            *"@${_srv_port}"*|*"://${_srv_port}"*)
+                                raw_link="$_link"; break ;;
+                        esac
+                    done
+                fi
+            fi
+
             if [ -z "$raw_link" ]; then
                 send_or_edit "$mid" "$(printf '%s <b>Delete failed!</b>\nCould not resolve link. Try Reload Podkop.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
                 return
             fi
             [ -n "$p_idx" ] && ret_page=$(( p_idx / per_page ))
-            uci del_list podkop.${sec}.selector_proxy_links="$raw_link"
+            local _del_sec; _del_sec=$(get_active_section)
+            local _del_mode; _del_mode=$(uci -q get podkop.${_del_sec}.proxy_config_type 2>/dev/null || echo "selector")
+            local _del_key; [ "$_del_mode" = "urltest" ] && _del_key="urltest_proxy_links" || _del_key="selector_proxy_links"
+            uci del_list podkop.${_del_sec}.${_del_key}="$raw_link"
             uci_commit_safe podkop
             send_or_edit "$mid" "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
             safe_reload_podkop "force"; sleep 1
@@ -3596,7 +3613,7 @@ EOF
             case "$target_mode" in
                 urltest)
                     local _utl_count
-                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { set -f; set -- $(uci_list_clean "$_utl_raw"); set +f; _utl_count=$#; }
+                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { eval "set -- $(uci_list_clean \"$_utl_raw\")"; _utl_count=$#; }
                     if [ "${_utl_count:-0}" -eq 0 ]; then
                         warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
                     else
@@ -3619,7 +3636,7 @@ EOF
             local _kb_extra=""
             if [ "$target_mode" = "urltest" ]; then
                 local _utl_c _sel_c
-                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { set -f; set -- $(uci_list_clean "$_utl_raw2"); set +f; _utl_c=$#; }
+                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { eval "set -- $(uci_list_clean \"$_utl_raw2\")"; _utl_c=$#; }
                 # Use Clash API count — captures ALL proxies, not just those added via bot
                 _sel_c=$(clash_request "/proxies" 2>/dev/null | \
                     jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
@@ -3869,8 +3886,8 @@ _handle_section_extras() {
             ut_url=$(uci -q get podkop.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
             ut_interval=$(uci -q get podkop.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
             ut_tol=$(uci -q get podkop.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
-            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { set -f; set -- $(uci_list_clean "$_utl_lraw"); set +f; ut_links_count=$#; }
-            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { set -f; set -- $(uci_list_clean "$_sel_lraw"); set +f; sel_links_count=$#; }
+            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { eval "set -- $(uci_list_clean \"$_utl_lraw\")"; ut_links_count=$#; }
+            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { eval "set -- $(uci_list_clean \"$_sel_lraw\")"; sel_links_count=$#; }
             local _clone_btn=""
             if [ "${sel_links_count:-0}" -gt 0 ]; then
                 _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
@@ -4090,7 +4107,7 @@ EOF
                     local _raw_uci
                     _raw_uci=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_raw_uci" ]; then
-                        set -f; set -- $(uci_list_clean "$_raw_uci"); set +f
+                        eval "set -- $(uci_list_clean \"$_raw_uci\")"
                         for _l in "$@"; do
                             case "$_l" in *"@${_srv_port}"*|*"://${_srv_port}"*)
                                 _full_link="$_l"; break ;;
@@ -4444,7 +4461,7 @@ EOF
             r_dom_text=""
             if [ "$r_dom_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for list_url in "$@"; do
+                [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_dom_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_dom_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
                 done
@@ -4455,7 +4472,7 @@ EOF
             r_sub_text=""
             if [ "$r_sub_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.remote_subnet_lists 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for list_url in "$@"; do
+                [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_sub_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_sub_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
                 done
@@ -4466,7 +4483,7 @@ EOF
             fr_ips_text=""
             if [ "$fr_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for ip in "$@"; do
+                [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for ip in "$@"; do
                     fr_ips_text=$(printf '%s\n• <code>%s</code>' "$fr_ips_text" "$ip")
                 done
             else
@@ -4558,7 +4575,7 @@ EOF
             text=$(printf '%s <b>Manage %s</b> [<code>%s</code>]\n\n' "$E_FILE" "$human_type" "$sec")
             raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
-                set -f; set -- $(uci_list_clean "$raw"); set +f
+                eval "set -- $(uci_list_clean \"$raw\")"
                 for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     text=$(printf '%s<b>[%d]</b> <a href="%s">%s</a>\n' "$text" "$i" "$(html_escape "$list_url")" "$(html_escape "$filename")")
@@ -4582,7 +4599,7 @@ EOF
             fi
             raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
-                set -f; set -- $(uci_list_clean "$raw"); set +f
+                eval "set -- $(uci_list_clean \"$raw\")"
                 for url in "$@"; do
                     if [ "$i" -eq "$idx" ]; then list_url="$url"; break; fi
                     i=$((i + 1))
@@ -4600,11 +4617,11 @@ EOF
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb
             raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
-            [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for ip in "$@"; do
+            [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_frip_${ip}\"}],"
             done
             local fr_count=0
-            [ -n "$raw" ] && { set -f; set -- $(uci_list_clean "$raw"); set +f; fr_count=$#; }
+            [ -n "$raw" ] && { eval "set -- $(uci_list_clean \"$raw\")"; fr_count=$#; }
             text=$(cat <<EOF
 ${E_FILE} <b>Fully Routed IPs</b> [<code>${sec}</code>]
 ${fr_count} entries
@@ -4632,10 +4649,10 @@ EOF
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb excl_count=0
             raw=$(uci -q show podkop.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
-            [ -n "$raw" ] && set -f; set -- $(uci_list_clean "$raw"); set +f && for ip in "$@"; do
+            [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_excl_${ip}\"}],"
             done
-            [ -n "$raw" ] && { set -f; set -- $(uci_list_clean "$raw"); set +f; excl_count=$#; }
+            [ -n "$raw" ] && { eval "set -- $(uci_list_clean \"$raw\")"; excl_count=$#; }
             text=$(cat <<EOF
 ${E_FILE} <b>Routing Excluded IPs</b> [<code>global</code>]
 ${excl_count} entries
@@ -4794,6 +4811,38 @@ _handle_fallback_socks() {
 
     if [ "$cmd" = "STATE_INPUT" ]; then
         rm -f "$STATE_FILE"
+        if [ "$state" = "wait_admin_id" ]; then
+            delete_message "$mid"
+            local safe_id
+            safe_id=$(printf "%s" "$text" | tr -d '\r\n\t ')
+            local _primary_chat; _primary_chat=$(uci -q get podkop_bot.settings.chat_id 2>/dev/null)
+            if ! echo "$safe_id" | grep -qE '^-?[0-9]+$'; then
+                send_message "$(printf '%s <b>Invalid ID!</b>\nUser ID must be numeric.\nExample: <code>123456789</code>' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"admins_menu\"}]]}"
+            elif [ "$safe_id" = "$_primary_chat" ]; then
+                send_message "$(printf '%s This is the primary admin (chat_id) — already has full access.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"admins_menu\"}]]}"
+            else
+                local _existing_aids _dup=0
+                _existing_aids=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
+                if [ -n "$_existing_aids" ]; then
+                    eval "set -- $(uci_list_clean \"$_existing_aids\")"
+                    for _e in "$@"; do
+                        [ "$_e" = "$safe_id" ] && _dup=1 && break
+                    done
+                fi
+                if [ "$_dup" = "1" ]; then
+                    send_message "$(printf '%s <b>Duplicate!</b>\n<code>%s</code> already in admin list.' "$E_WARN" "$safe_id")" \
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"admins_menu\"}]]}"
+                else
+                    uci add_list podkop_bot.settings.admin_ids="$safe_id"
+                    uci_commit_safe podkop_bot
+                    ADMIN_IDS=$(uci -q get podkop_bot.settings.admin_ids 2>/dev/null)
+                    _handle_bot "admins_menu" "" "" ""
+                fi
+            fi
+        fi
+
         if [ "$state" = "wait_fb_socks_add" ]; then
             delete_message "$mid"
             local safe_fb
@@ -4807,7 +4856,7 @@ _handle_fallback_socks() {
                 # Normalize to host:port for duplicate check (socks5:// and socks5h:// same endpoint)
                 local _new_hp; _new_hp=$(echo "$safe_fb" | sed 's|^socks5h\?://||')
                 if [ -n "$_existing" ]; then
-                    set -f; set -- $(uci_list_clean "$_existing"); set +f
+                    eval "set -- $(uci_list_clean \"$_existing\")"
                     for _e in "$@"; do
                         local _e_hp; _e_hp=$(echo "$_e" | sed 's|^socks5h\?://||')
                         [ "$_e_hp" = "$_new_hp" ] && _dup=1 && break
@@ -4834,7 +4883,7 @@ _handle_fallback_socks() {
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             rows=""; list_text=""
             if [ -n "$_fb_raw" ]; then
-                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+                eval "set -- $(uci_list_clean \"$_fb_raw\")"
                 for _fb in "$@"; do
                     list_text=$(printf '%s\n<code>[%s]</code> %s' "$list_text" "$n" "$_fb")
                     rows="${rows}[{\"text\":\"${E_DEL} [${n}] ${_fb}\",\"callback_data\":\"ask_del_fb_${n}\"}],"
@@ -4849,12 +4898,103 @@ _handle_fallback_socks() {
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
+        "admins_menu")
+            rm -f "$STATE_FILE"
+            local rows="" list_text="" n=0 _aid
+            local _primary_chat; _primary_chat=$(uci -q get podkop_bot.settings.chat_id 2>/dev/null)
+            local _aids_raw
+            _aids_raw=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
+            # Always show primary chat_id first (protected)
+            list_text="<code>[primary]</code> <b>${_primary_chat}</b> 🔒"
+            if [ -n "$_aids_raw" ]; then
+                eval "set -- $(uci_list_clean \"$_aids_raw\")"
+                for _aid in "$@"; do
+                    list_text=$(printf '%s\n<code>[%s]</code> %s' "$list_text" "$n" "$_aid")
+                    rows="${rows}[{\"text\":\"${E_DEL} [${n}] ${_aid}\",\"callback_data\":\"ask_del_admin_${n}\"}],"
+                    n=$((n + 1))
+                done
+            fi
+            [ "$n" -eq 0 ] && list_text=$(printf '%s\n\n<i>No additional admins.</i>' "$list_text")
+            local _anon; _anon=$(uci -q get podkop_bot.settings.allow_anonymous_admins 2>/dev/null || echo "0")
+            local _anon_icon; [ "$_anon" = "1" ] && _anon_icon="$E_ON" || _anon_icon="$E_RED"
+            local text
+            text=$(printf '👤 <b>Bot Admins</b>\n\nThese users can control the bot.\nPrimary admin (chat_id) cannot be removed.\n\n%s' "$list_text")
+            local kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_ADD} Add Admin\",\"callback_data\":\"cmd_admin_add\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"admins_menu\"}],[{\"text\":\"${_anon_icon} Anon group admins\",\"callback_data\":\"toggle_anon_admins\"}],[{\"text\":\"🤖 Bot Info & Invite\",\"callback_data\":\"cmd_bot_invite_info\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"bot_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "cmd_bot_invite_info")
+            load_bot_identity
+            local _uname="${BOT_USERNAME:-unknown}"
+            local _bid="${BOT_ID:-unknown}"
+            send_or_edit "$mid" "$(printf '🤖 <b>Bot Identity</b>\n\nUsername: <code>@%s</code>\nBot ID: <code>%s</code>\nVersion: <code>%s</code>\n\n<b>To add bot to a group/channel:</b>\n1. Open the group or channel\n2. Add <code>@%s</code> as member\n3. Grant admin rights if needed\n4. Get the chat ID (use @userinfobot or check logs)\n5. Add the chat ID via <b>Add Admin</b>\n\n<i>The bot will accept commands from any chat ID listed as admin.</i>' \
+                "$_uname" "$_bid" "$BOT_VERSION" "$_uname")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"admins_menu\"}]]}"
+            ;;
+
+        "toggle_anon_admins")
+            toggle_uci_bool "podkop_bot.settings" "allow_anonymous_admins"
+            ALLOW_ANON_ADMINS=$(uci -q get podkop_bot.settings.allow_anonymous_admins 2>/dev/null)
+            _handle_bot "admins_menu" "$mid" "" ""
+            ;;
+
+        "cmd_admin_add")
+            echo "wait_admin_id" > "$STATE_FILE"
+            send_or_edit "$mid" "$(printf '👤 <b>Add Admin</b>\n\nSend the Telegram <b>User ID</b> (numeric) of the new admin.\n\nExample: <code>123456789</code>\n\n<i>User must start a chat with the bot first.</i>')" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"admins_menu\"}]]}"
+            ;;
+
+        "ask_del_admin_"*)
+            local idx="${cmd#ask_del_admin_}" aid_to_del="" n=0 _aid
+            local _aids_raw
+            _aids_raw=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
+            if [ -n "$_aids_raw" ]; then
+                eval "set -- $(uci_list_clean \"$_aids_raw\")"
+                for _aid in "$@"; do
+                    [ "$n" -eq "$idx" ] && aid_to_del="$_aid" && break
+                    n=$((n + 1))
+                done
+            fi
+            [ -z "$aid_to_del" ] && {
+                send_or_edit "$mid" "$(printf '%s Admin not found.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"admins_menu\"}]]}"
+                return
+            }
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Remove admin?</b>\n\n<code>%s</code>' "$E_WARN" "$aid_to_del")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Remove\",\"callback_data\":\"do_del_admin_${idx}\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"admins_menu\"}]]}"
+            ;;
+
+        "do_del_admin_"*)
+            local idx="${cmd#do_del_admin_}" aid_to_del="" n=0 _aid
+            local _aids_raw
+            _aids_raw=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
+            if [ -n "$_aids_raw" ]; then
+                eval "set -- $(uci_list_clean \"$_aids_raw\")"
+                for _aid in "$@"; do
+                    [ "$n" -eq "$idx" ] && aid_to_del="$_aid" && break
+                    n=$((n + 1))
+                done
+            fi
+            [ -z "$aid_to_del" ] && {
+                _handle_bot "admins_menu" "$mid" "" ""
+                return
+            }
+            uci del_list podkop_bot.settings.admin_ids="$aid_to_del"
+            uci_commit_safe podkop_bot
+            # Reload ADMIN_IDS in memory
+            ADMIN_IDS=$(uci -q get podkop_bot.settings.admin_ids 2>/dev/null)
+            send_or_edit "$mid" "$(printf '%s Removed admin <code>%s</code>.' "$E_OK" "$aid_to_del")" ""
+            sleep 1
+            _handle_bot "admins_menu" "$mid" "" ""
+            ;;
+
         "ask_del_fb_"*)
             local idx="${cmd#ask_del_fb_}" fb_to_del="" n=0 _fb
             local _fb_raw
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+                eval "set -- $(uci_list_clean \"$_fb_raw\")"
                 for _fb in "$@"; do
                     [ "$n" -eq "$idx" ] && fb_to_del="$_fb" && break
                     n=$((n + 1))
@@ -4875,7 +5015,7 @@ _handle_fallback_socks() {
             local _fb_raw
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+                eval "set -- $(uci_list_clean \"$_fb_raw\")"
                 # Find value by index, delete by value (most reliable on all OpenWrt builds)
                 local _del_val=""
                 for _fb in "$@"; do
@@ -4904,11 +5044,8 @@ _handle_fallback_socks() {
 
         "cmd_test_fb_socks")
             send_or_edit "$mid" "$(printf '%s Testing SOCKS endpoints...' "$E_TIME")" ""
-            local _fb_raw n=0 _fb result_text=""
-            local sec m_ip m_port
-            sec=$(get_active_section)
-            m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
-            m_ip=$(get_proxy_ip)
+            _load_transport_ctx
+            local n=0 _fb result_text=""
             # Short timeouts for interactive test (3s connect / 5s total per endpoint)
             _probe_fast() {
                 local _url="$1" _out _code _time
@@ -4924,21 +5061,17 @@ _handle_fallback_socks() {
                     echo "timeout"
                 fi
             }
-            local lat; lat=$(_probe_fast "socks5h://${m_ip}:${m_port}")
+            local lat; lat=$(_probe_fast "socks5h://${_t_ip}:${_t_port}")
             case "$lat" in timeout|fail) result_text="${result_text}${E_ERR} tier1 Podkop: <code>$lat</code>\n" ;;
                 *) result_text="${result_text}${E_ON} tier1 Podkop: <code>$lat</code>\n" ;; esac
-            _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-            if [ -n "$_fb_raw" ]; then
-                set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
-                for _fb in "$@"; do
-                    n=$((n + 1))
-                    lat=$(_probe_fast "$_fb")
-                    case "$lat" in timeout|fail)
-                        result_text="${result_text}${E_ERR} tier2_${n}: <code>$lat</code> <i>${_fb}</i>\n" ;;
-                        *) result_text="${result_text}${E_ON} tier2_${n}: <code>$lat</code> <i>${_fb}</i>\n" ;;
-                    esac
-                done
-            fi
+            for _fb in $_t_fb_socks; do
+                n=$((n + 1))
+                lat=$(_probe_fast "$_fb")
+                case "$lat" in timeout|fail)
+                    result_text="${result_text}${E_ERR} tier2_${n}: <code>$lat</code> <i>${_fb}</i>\n" ;;
+                    *) result_text="${result_text}${E_ON} tier2_${n}: <code>$lat</code> <i>${_fb}</i>\n" ;;
+                esac
+            done
             unset -f _probe_fast
             [ -z "$result_text" ] && result_text="<i>No endpoints configured.</i>"
             send_or_edit "$mid" \
@@ -5335,7 +5468,7 @@ EOF
                     _s_sel=$(printf '%s' "$th_proxies" | jq -r \
                         --arg s "$_s" \
                         '[ .proxies | to_entries[] |
-                           select(.key | startswith($s)) |
+                           select(.key == ($s + "-out") or (.key | startswith($s + "-"))) |
                            select(.value.type == "Selector" or .value.type == "URLTest") ]
                          | sort_by(.value.all | length) | last | .key // empty' 2>/dev/null)
                     # Get delay — from selector or direct outbound
@@ -5489,7 +5622,7 @@ EOF
                 _tier=$((_tier + 1))
                 _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_fb_raw" ]; then
-                    set -f; set -- $(uci_list_clean "$_fb_raw"); set +f
+                    eval "set -- $(uci_list_clean \"$_fb_raw\")"
                     local _fn=1
                     for _fb in "$@"; do
                         _fb_esc=$(html_escape "$_fb")
@@ -5561,6 +5694,7 @@ $(_fmt_tier "tier5" "Emergency IPs")"
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"Transport: ${tr_disp}\",\"callback_data\":\"ask_set_tr_menu\"},{\"text\":\"Health: ${hi}s\",\"callback_data\":\"set_bot_hi_${next_hi}\"}],
                 [{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"},{\"text\":\"${E_TEST} Test Fallback\",\"callback_data\":\"cmd_test_fb_socks\"}],
+                [{\"text\":\"👤 Admins\",\"callback_data\":\"admins_menu\"}],
                 [${cp_btn},${bi_btn}],
                 [{\"text\":\"${st_icon} Startup Notify\",\"callback_data\":\"toggle_bot_st\"},{\"text\":\"${al_icon} Alert Notify\",\"callback_data\":\"toggle_bot_al\"}],
                 [{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
@@ -6350,6 +6484,7 @@ handle_command() {
                 _handle_dns "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_custom_proxy|wait_bind_iface|wait_restart_router_confirm)
                 _handle_bot "STATE_INPUT" "$mid" "$cmd" "$state" ;;
+            wait_admin_id|\
             wait_fb_socks_add)
                 _handle_fallback_socks "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_urltest_url|wait_urltest_interval|wait_urltest_tolerance|\
@@ -6418,6 +6553,7 @@ handle_command() {
         ask_set_tr_menu|ask_set_tr_*|do_set_tr_*)
             _handle_bot "$cmd" "$mid" "" "" ;;
 
+        admins_menu|cmd_admin_add|ask_del_admin_*|do_del_admin_*|toggle_anon_admins|cmd_bot_invite_info|\
         fallback_socks_menu|cmd_fb_socks_add|cmd_test_fb_socks|ask_del_fb_*|do_del_fb_*)
             _handle_fallback_socks "$cmd" "$mid" "" "" ;;
 
