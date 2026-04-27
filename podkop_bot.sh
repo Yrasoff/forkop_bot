@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.14.0
+# Podkop Telegram Bot v0.14.1
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -24,7 +24,11 @@
 
 export LC_ALL=C
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
-BOT_VERSION="0.14.0"
+# All bot runtime state files live under one directory for easy cleanup.
+BOT_DIR="/tmp/podkop_bot"
+mkdir -p "$BOT_DIR"
+
+BOT_VERSION="0.14.1"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -43,9 +47,9 @@ ADMIN_SENDER_CHAT_IDS=$(uci -q get podkop_bot.settings.admin_sender_chat_ids 2>/
 ALLOW_ANON_ADMINS=$(uci -q get podkop_bot.settings.allow_anonymous_admins 2>/dev/null)
 [ -z "$ALLOW_ANON_ADMINS" ] && ALLOW_ANON_ADMINS="1"
 
-BOT_USERNAME_FILE="/tmp/podkop_bot_username"
+BOT_USERNAME_FILE="${BOT_DIR}/username"
 BOT_USERNAME=""
-BOT_ID_FILE="/tmp/podkop_bot_id"
+BOT_ID_FILE="${BOT_DIR}/id"
 BOT_ID=""
 
 TARGET_CHAT_ID="$ADMIN_ID"
@@ -53,21 +57,21 @@ TARGET_MESSAGE_ID=""
 TARGET_CHAT_TYPE=""
 TARGET_REPLY_THREAD_ID=""
 
-TAG_URI_CACHE="/tmp/podkop_tag_uri_cache.txt"
-UCI_LINKS_CACHE="/tmp/podkop_uci_links_cache.txt"
+TAG_URI_CACHE="${BOT_DIR}/tag_uri_cache.txt"
+UCI_LINKS_CACHE="${BOT_DIR}/uci_links_cache.txt"
 # tag → human name extracted from #fragment in UCI links (selector + urltest)
-TAG_NAME_CACHE="/tmp/podkop_tag_name_cache.txt"
-ACTIVE_SECTION_FILE="/tmp/podkop_bot_active_section"
-RELOAD_TS_FILE="/tmp/podkop_bot_last_reload_ts"
+TAG_NAME_CACHE="${BOT_DIR}/tag_name_cache.txt"
+ACTIVE_SECTION_FILE="${BOT_DIR}/active_section"
+RELOAD_TS_FILE="${BOT_DIR}/last_reload_ts"
 
 # Community lists: GitHub API cache with 1h TTL (60 req/hr rate limit protection)
 COMMUNITY_LISTS_FALLBACK="anime block cloudflare cloudfront digitalocean discord geoblock google_ai google_meet google_play hdrezka hetzner hodca meta news ovh porn roblox russia_inside russia_outside telegram tiktok twitter ukraine_inside youtube"
-CL_CACHE_FILE="/tmp/podkop_cl_cache.txt"
-CL_CACHE_TS="/tmp/podkop_cl_cache_ts"
+CL_CACHE_FILE="${BOT_DIR}/cl_cache.txt"
+CL_CACHE_TS="${BOT_DIR}/cl_cache_ts"
 
 # Public IP cache: updated in background, read instantly in Status screen.
 # Three sources: ipinfo.io, ifconfig.me (foreign) + yandex.ru (Russian, works under RKN).
-PUBIP_CACHE="/tmp/podkop_pubip_cache.txt"
+PUBIP_CACHE="${BOT_DIR}/pubip_cache.txt"
 PUBIP_CACHE_TTL=300  # 5 minutes — balance between freshness and traffic
 
 if [ -z "$TOKEN" ] || { [ -z "$ADMIN_ID" ] && [ -z "$ADMIN_IDS" ]; }; then
@@ -84,22 +88,22 @@ fi
 API_URL="https://api.telegram.org/bot${TOKEN}"
 TG_EMERGENCY_IPS="149.154.167.220 149.154.166.110 91.108.4.249"
 
-OFFSET_FILE="/tmp/podkop_bot_offset"
-STATE_FILE="/tmp/podkop_bot_state"
-RELOAD_LOCK="/tmp/podkop_bot_reload_ts"
-HEALTH_STATE_FILE="/tmp/podkop_bot_health_state"
+OFFSET_FILE="${BOT_DIR}/offset"
+STATE_FILE="${BOT_DIR}/state"
+RELOAD_LOCK="${BOT_DIR}/reload_ts"
+HEALTH_STATE_FILE="${BOT_DIR}/health_state"
 # Structured SOCKS/TG state: written by watchdog, read by status/tunnel screens
-SOCKS_STATE_FILE="/tmp/podkop_bot_socks_state"
+SOCKS_STATE_FILE="${BOT_DIR}/socks_state"
 # Periodic SOCKS latency probe results: key=value per endpoint, written by watchdog
-SOCKS_PROBE_FILE="/tmp/podkop_bot_socks_probe"
+SOCKS_PROBE_FILE="${BOT_DIR}/socks_probe"
 # Timestamp of last SOCKS re-probe from degraded tier4/tier5 sticky path
-SOCKS_REPROBE_TS_FILE="/tmp/podkop_bot_socks_reprobe_ts"
+SOCKS_REPROBE_TS_FILE="${BOT_DIR}/socks_reprobe_ts"
 # Main process writes current route name here so watchdog subshell can read it
-MAIN_ROUTE_FILE="/tmp/podkop_bot_main_route"
+MAIN_ROUTE_FILE="${BOT_DIR}/main_route"
 # Main process writes current route KEY here (tier1/tier2_N/tier3/tier4/tier5/fail).
 # Separate from MAIN_ROUTE_FILE (which holds human-readable name).
 # Watchdog reads this for per-cycle nudge logic — never writes to it.
-MAIN_ROUTE_KEY_FILE="/tmp/podkop_bot_main_route_key"
+MAIN_ROUTE_KEY_FILE="${BOT_DIR}/main_route_key"
 
 # Write both route name and route key atomically from main process.
 # Called at every successful tier resolution so watchdog always reads fresh data.
@@ -112,14 +116,14 @@ _write_main_route() {
     printf '%s' "$_key"  > "${MAIN_ROUTE_KEY_FILE}.tmp" && \
         mv "${MAIN_ROUTE_KEY_FILE}.tmp" "$MAIN_ROUTE_KEY_FILE" 2>/dev/null
 }
-ROUTE_CMD_FILE="/tmp/podkop_bot_route_cmd"
-LAST_CMD_FILE="/tmp/podkop_bot_last_cmd"
-UNAUTH_FILE="/tmp/podkop_bot_unauth"
+ROUTE_CMD_FILE="${BOT_DIR}/route_cmd"
+LAST_CMD_FILE="${BOT_DIR}/last_cmd"
+UNAUTH_FILE="${BOT_DIR}/unauth"
 # Menu/alert interleaving fix: track last menu msg_id and last health alert msg_id.
 # send_or_edit uses these to detect when an alert has pushed the menu up and
 # re-sends the menu as a new message (delete old + send new) to keep it current.
-LAST_MENU_MSG_FILE="/tmp/podkop_bot_last_menu_msg"
-LAST_ALERT_MSG_FILE="/tmp/podkop_bot_last_alert_msg"
+LAST_MENU_MSG_FILE="${BOT_DIR}/last_menu_msg"
+LAST_ALERT_MSG_FILE="${BOT_DIR}/last_alert_msg"
 
 # Dynamically resolve Clash API endpoint from sing-box config
 CLASH_API_ADDR=$(jq -r '.experimental.clash_api.external_controller // empty' /etc/sing-box/config.json 2>/dev/null)
@@ -244,9 +248,10 @@ json_escape() {
 # uci_list_clean: normalize UCI list output for safe iteration.
 # UCI show returns: key='val1' 'val2' 'val3'
 # After cut -d= -f2- we get: 'val1' 'val2' 'val3'
-# Usage: eval "set -- $(uci_list_clean "$raw")" — preserves spaces in values.
-# The eval pattern is the only reliable way in ash to handle UCI lists where
-# values may contain spaces (e.g. proxy names with spaces in #fragment).
+# CORRECT usage — always 2-step to avoid "Unterminated quoted string" in ash:
+#   _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"
+# WRONG (breaks when values contain single-quotes, which all UCI lists do):
+#   eval "set -- $(uci_list_clean \"$raw\")"  ← ash eval bug!
 uci_list_clean() {
     # Keep single-quotes intact — eval "set --" relies on them for word splitting
     printf '%s' "$1"
@@ -397,7 +402,7 @@ _load_transport_ctx() {
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
     _t_fb_socks=""
     if [ -n "$_fb_raw" ]; then
-        eval "set -- $(uci_list_clean \"$_fb_raw\")"
+        { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
         _t_fb_socks="$*"
     fi
 
@@ -1155,7 +1160,7 @@ get_available_community_lists() {
 #              on POSIX filesystems and the OS cleans nothing — so we add a
 #              5-minute stale-lock timeout to survive OOM kills / crashes.
 # ==============================================================================
-PUBIP_REFRESH_LOCK="/tmp/podkop_pubip_refresh.lockdir"
+PUBIP_REFRESH_LOCK="${BOT_DIR}/pubip_refresh.lockdir"
 
 _validate_ip() {
     echo "$1" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
@@ -1283,7 +1288,7 @@ is_list_enabled() {
     local sec="$1" tag="$2" item raw_list
     raw_list=$(uci -q show podkop.${sec}.community_lists 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 1
-    eval "set -- $(uci_list_clean \"$raw_list\")"
+    { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
     for item in "$@"; do [ "$item" = "$tag" ] && return 0; done
     return 1
 }
@@ -1319,7 +1324,7 @@ build_uci_links_cache() {
     tmp=$(mktemp /tmp/podkop_uci_links.XXXXXX)
     raw_list=$(uci -q show podkop.${sec}.${_key} 2>/dev/null | cut -d= -f2-)
     if [ -n "$raw_list" ]; then
-        eval "set -- $(uci_list_clean \"$raw_list\")"
+        { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
     fi
     mv "$tmp" "$UCI_LINKS_CACHE"
@@ -1339,7 +1344,7 @@ build_tag_name_cache() {
     for uci_key in selector_proxy_links urltest_proxy_links; do
         raw_list=$(uci -q show podkop.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
         [ -z "$raw_list" ] && continue
-        eval "set -- $(uci_list_clean \"$raw_list\")"
+        { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
         for link in "$@"; do
             # Extract #fragment
             case "$link" in *#?*) frag="${link##*#}" ;; *) continue ;; esac
@@ -1399,7 +1404,7 @@ get_urltest_proxy_links() {
     local sec="$1" raw_list
     raw_list=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 0
-    eval "set -- $(uci_list_clean \"$raw_list\")"
+    { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
     for link in "$@"; do printf '%s\n' "$link"; done
 }
 
@@ -2149,7 +2154,7 @@ check_health() {
     # Pattern: same as refresh_public_ip_cache() and cmd_all_delay_test.
     local _fb_raw _fb_list="" _tier2_results="" _tier2=none
     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
-    [ -n "$_fb_raw" ] && { eval "set -- $(uci_list_clean \"$_fb_raw\")"; _fb_list="$*"; }
+    [ -n "$_fb_raw" ] && { { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }; _fb_list="$*"; }
 
     local _lan_ip; _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
 
@@ -2421,7 +2426,7 @@ start_health_daemon() {
                     local _fb_raw _fb _fb_ok=0 _fb_alive=""
                     _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_fb_raw" ]; then
-                        eval "set -- $(uci_list_clean \"$_fb_raw\")"
+                        { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
                         for _fb in "$@"; do
                             local _fb_ip _fb_port
                             _fb_ip=$(echo "$_fb" | sed 's|socks5h\?://||' | cut -d: -f1)
@@ -2537,7 +2542,7 @@ start_health_daemon() {
                         *)
                             logger -t podkop-bot "[Watchdog] Route stuck on ${_wd_cur_route}. SOCKS alive, forcing reconnect..."
                             printf 'up' > "$ROUTE_CMD_FILE"
-                            printf '%s' "$(date +%s)" > "/tmp/podkop_bot_last_nudge"
+                            printf '%s' "$(date +%s)" > "${BOT_DIR}/last_nudge"
                             ;;
                     esac
                 fi
@@ -2669,11 +2674,11 @@ start_health_daemon() {
                     *)
                         local _now_nudge _last_nudge
                         _now_nudge=$(date +%s)
-                        _last_nudge=$(cat "/tmp/podkop_bot_last_nudge" 2>/dev/null || echo 0)
+                        _last_nudge=$(cat "${BOT_DIR}/last_nudge" 2>/dev/null || echo 0)
                         if [ $((_now_nudge - _last_nudge)) -ge 120 ]; then
                             logger -t podkop-bot "[Watchdog] Route stuck on ${_wd_cur_route}. SOCKS alive, forcing reconnect..."
                             printf 'up' > "$ROUTE_CMD_FILE"
-                            printf '%s' "$_now_nudge" > "/tmp/podkop_bot_last_nudge"
+                            printf '%s' "$_now_nudge" > "${BOT_DIR}/last_nudge"
                         fi
                         ;;
                 esac
@@ -3170,7 +3175,7 @@ EOF
                         local _raw_uci
                         _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                         if [ -n "$_raw_uci" ]; then
-                            eval "set -- $(uci_list_clean \"$_raw_uci\")"
+                            { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                             for _link in "$@"; do
                                 case "$_link" in
                                     *"@${_srv_port}"*|*"@${_srv_port}/"*|*"@${_srv_port}#"*|\
@@ -3228,7 +3233,7 @@ EOF
                                 _raw_uci=$(uci -q show podkop.${_sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-) || \
                                 _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                             if [ -n "$_raw_uci" ]; then
-                                eval "set -- $(uci_list_clean \"$_raw_uci\")"
+                                { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                                 for _link in "$@"; do
                                     case "$_link" in
                                         *"@${_srv_port}"*|*"://${_srv_port}"*)
@@ -3246,7 +3251,7 @@ EOF
                 local _raw_uci_ut
                 _raw_uci_ut=$(uci -q show podkop.${_sec:-$(get_active_section)}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_raw_uci_ut" ]; then
-                    eval "set -- $(uci_list_clean \"$_raw_uci_ut\")"
+                    { _ucl=$(uci_list_clean "$_raw_uci_ut"); eval "set -- $_ucl"; }
                     for _link in "$@"; do
                         case "$_link" in
                             *"@${_srv_port}"*|*"://${_srv_port}"*)
@@ -3613,7 +3618,7 @@ EOF
             case "$target_mode" in
                 urltest)
                     local _utl_count
-                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { eval "set -- $(uci_list_clean \"$_utl_raw\")"; _utl_count=$#; }
+                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; }; _utl_count=$#; }
                     if [ "${_utl_count:-0}" -eq 0 ]; then
                         warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
                     else
@@ -3636,7 +3641,7 @@ EOF
             local _kb_extra=""
             if [ "$target_mode" = "urltest" ]; then
                 local _utl_c _sel_c
-                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { eval "set -- $(uci_list_clean \"$_utl_raw2\")"; _utl_c=$#; }
+                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { { _ucl=$(uci_list_clean "$_utl_raw2"); eval "set -- $_ucl"; }; _utl_c=$#; }
                 # Use Clash API count — captures ALL proxies, not just those added via bot
                 _sel_c=$(clash_request "/proxies" 2>/dev/null | \
                     jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
@@ -3886,8 +3891,8 @@ _handle_section_extras() {
             ut_url=$(uci -q get podkop.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
             ut_interval=$(uci -q get podkop.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
             ut_tol=$(uci -q get podkop.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
-            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { eval "set -- $(uci_list_clean \"$_utl_lraw\")"; ut_links_count=$#; }
-            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { eval "set -- $(uci_list_clean \"$_sel_lraw\")"; sel_links_count=$#; }
+            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
+            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
             local _clone_btn=""
             if [ "${sel_links_count:-0}" -gt 0 ]; then
                 _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
@@ -4107,7 +4112,7 @@ EOF
                     local _raw_uci
                     _raw_uci=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_raw_uci" ]; then
-                        eval "set -- $(uci_list_clean \"$_raw_uci\")"
+                        { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                         for _l in "$@"; do
                             case "$_l" in *"@${_srv_port}"*|*"://${_srv_port}"*)
                                 _full_link="$_l"; break ;;
@@ -4461,7 +4466,7 @@ EOF
             r_dom_text=""
             if [ "$r_dom_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for list_url in "$@"; do
+                [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_dom_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_dom_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
                 done
@@ -4472,7 +4477,7 @@ EOF
             r_sub_text=""
             if [ "$r_sub_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.remote_subnet_lists 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for list_url in "$@"; do
+                [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_sub_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_sub_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
                 done
@@ -4483,7 +4488,7 @@ EOF
             fr_ips_text=""
             if [ "$fr_count" -gt 0 ]; then
                 raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
-                [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for ip in "$@"; do
+                [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
                     fr_ips_text=$(printf '%s\n• <code>%s</code>' "$fr_ips_text" "$ip")
                 done
             else
@@ -4575,7 +4580,7 @@ EOF
             text=$(printf '%s <b>Manage %s</b> [<code>%s</code>]\n\n' "$E_FILE" "$human_type" "$sec")
             raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
-                eval "set -- $(uci_list_clean \"$raw\")"
+                { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; }
                 for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     text=$(printf '%s<b>[%d]</b> <a href="%s">%s</a>\n' "$text" "$i" "$(html_escape "$list_url")" "$(html_escape "$filename")")
@@ -4599,7 +4604,7 @@ EOF
             fi
             raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
-                eval "set -- $(uci_list_clean \"$raw\")"
+                { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; }
                 for url in "$@"; do
                     if [ "$i" -eq "$idx" ]; then list_url="$url"; break; fi
                     i=$((i + 1))
@@ -4617,11 +4622,11 @@ EOF
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb
             raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
-            [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for ip in "$@"; do
+            [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_frip_${ip}\"}],"
             done
             local fr_count=0
-            [ -n "$raw" ] && { eval "set -- $(uci_list_clean \"$raw\")"; fr_count=$#; }
+            [ -n "$raw" ] && { { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; }; fr_count=$#; }
             text=$(cat <<EOF
 ${E_FILE} <b>Fully Routed IPs</b> [<code>${sec}</code>]
 ${fr_count} entries
@@ -4649,10 +4654,10 @@ EOF
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb excl_count=0
             raw=$(uci -q show podkop.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
-            [ -n "$raw" ] && eval "set -- $(uci_list_clean \"$raw\")" && for ip in "$@"; do
+            [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_excl_${ip}\"}],"
             done
-            [ -n "$raw" ] && { eval "set -- $(uci_list_clean \"$raw\")"; excl_count=$#; }
+            [ -n "$raw" ] && { { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; }; excl_count=$#; }
             text=$(cat <<EOF
 ${E_FILE} <b>Routing Excluded IPs</b> [<code>global</code>]
 ${excl_count} entries
@@ -4826,7 +4831,7 @@ _handle_fallback_socks() {
                 local _existing_aids _dup=0
                 _existing_aids=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_existing_aids" ]; then
-                    eval "set -- $(uci_list_clean \"$_existing_aids\")"
+                    { _ucl=$(uci_list_clean "$_existing_aids"); eval "set -- $_ucl"; }
                     for _e in "$@"; do
                         [ "$_e" = "$safe_id" ] && _dup=1 && break
                     done
@@ -4856,7 +4861,7 @@ _handle_fallback_socks() {
                 # Normalize to host:port for duplicate check (socks5:// and socks5h:// same endpoint)
                 local _new_hp; _new_hp=$(echo "$safe_fb" | sed 's|^socks5h\?://||')
                 if [ -n "$_existing" ]; then
-                    eval "set -- $(uci_list_clean \"$_existing\")"
+                    { _ucl=$(uci_list_clean "$_existing"); eval "set -- $_ucl"; }
                     for _e in "$@"; do
                         local _e_hp; _e_hp=$(echo "$_e" | sed 's|^socks5h\?://||')
                         [ "$_e_hp" = "$_new_hp" ] && _dup=1 && break
@@ -4883,7 +4888,7 @@ _handle_fallback_socks() {
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             rows=""; list_text=""
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $(uci_list_clean \"$_fb_raw\")"
+                { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
                 for _fb in "$@"; do
                     list_text=$(printf '%s\n<code>[%s]</code> %s' "$list_text" "$n" "$_fb")
                     rows="${rows}[{\"text\":\"${E_DEL} [${n}] ${_fb}\",\"callback_data\":\"ask_del_fb_${n}\"}],"
@@ -4907,7 +4912,7 @@ _handle_fallback_socks() {
             # Always show primary chat_id first (protected)
             list_text="<code>[primary]</code> <b>${_primary_chat}</b> 🔒"
             if [ -n "$_aids_raw" ]; then
-                eval "set -- $(uci_list_clean \"$_aids_raw\")"
+                { _ucl=$(uci_list_clean "$_aids_raw"); eval "set -- $_ucl"; }
                 for _aid in "$@"; do
                     list_text=$(printf '%s\n<code>[%s]</code> %s' "$list_text" "$n" "$_aid")
                     rows="${rows}[{\"text\":\"${E_DEL} [${n}] ${_aid}\",\"callback_data\":\"ask_del_admin_${n}\"}],"
@@ -4949,7 +4954,7 @@ _handle_fallback_socks() {
             local _aids_raw
             _aids_raw=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
             if [ -n "$_aids_raw" ]; then
-                eval "set -- $(uci_list_clean \"$_aids_raw\")"
+                { _ucl=$(uci_list_clean "$_aids_raw"); eval "set -- $_ucl"; }
                 for _aid in "$@"; do
                     [ "$n" -eq "$idx" ] && aid_to_del="$_aid" && break
                     n=$((n + 1))
@@ -4970,7 +4975,7 @@ _handle_fallback_socks() {
             local _aids_raw
             _aids_raw=$(uci -q show podkop_bot.settings.admin_ids 2>/dev/null | cut -d= -f2-)
             if [ -n "$_aids_raw" ]; then
-                eval "set -- $(uci_list_clean \"$_aids_raw\")"
+                { _ucl=$(uci_list_clean "$_aids_raw"); eval "set -- $_ucl"; }
                 for _aid in "$@"; do
                     [ "$n" -eq "$idx" ] && aid_to_del="$_aid" && break
                     n=$((n + 1))
@@ -4994,7 +4999,7 @@ _handle_fallback_socks() {
             local _fb_raw
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $(uci_list_clean \"$_fb_raw\")"
+                { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
                 for _fb in "$@"; do
                     [ "$n" -eq "$idx" ] && fb_to_del="$_fb" && break
                     n=$((n + 1))
@@ -5015,7 +5020,7 @@ _handle_fallback_socks() {
             local _fb_raw
             _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
             if [ -n "$_fb_raw" ]; then
-                eval "set -- $(uci_list_clean \"$_fb_raw\")"
+                { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
                 # Find value by index, delete by value (most reliable on all OpenWrt builds)
                 local _del_val=""
                 for _fb in "$@"; do
@@ -5622,7 +5627,7 @@ EOF
                 _tier=$((_tier + 1))
                 _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_fb_raw" ]; then
-                    eval "set -- $(uci_list_clean \"$_fb_raw\")"
+                    { _ucl=$(uci_list_clean "$_fb_raw"); eval "set -- $_ucl"; }
                     local _fn=1
                     for _fb in "$@"; do
                         _fb_esc=$(html_escape "$_fb")
@@ -5883,7 +5888,7 @@ EOF
             # Extract back target encoded in callback_data
             local _back="${cmd#cmd_probe_outbound_back_}"
             # Cooldown: not more than once per 2 minutes
-            local _probe_ts_file="/tmp/podkop_probe_ts"
+            local _probe_ts_file="${BOT_DIR}/probe_ts"
             local _now; _now=$(date +%s)
             local _last; _last=$(cat "$_probe_ts_file" 2>/dev/null || echo 0)
             if [ $((_now - _last)) -lt 120 ]; then
@@ -6577,8 +6582,8 @@ handle_command() {
 # Kill any orphaned watchdog processes from a previous instance that survived
 # SIGKILL (procd can leave subshells running). The watchdog itself does not
 # hold the lock so it won't be blocked — only the main loop holds it.
-BOT_LOCK_FILE="/tmp/podkop_bot.lock"
-BOT_PID_FILE="/tmp/podkop_bot.pid"
+BOT_LOCK_FILE="${BOT_DIR}/bot.lock"
+BOT_PID_FILE="${BOT_DIR}/bot.pid"
 if [ -f "$BOT_PID_FILE" ]; then
     _old_pid=$(cat "$BOT_PID_FILE" 2>/dev/null)
     if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
@@ -6665,11 +6670,9 @@ EOF
     exit 0
 }
 
-send_startup_notification_async &
-start_health_daemon
 
-# Initialize active section file if missing — default to first configured section
-# (not always "main" — user may have renamed or use antiz/vpn/etc as primary)
+# Initialize active section file BEFORE launching daemons so build_all_caches
+# inside send_startup_notification_async uses the correct section.
 if [ ! -f "$ACTIVE_SECTION_FILE" ]; then
     _first_sec=$(uci -q show podkop 2>/dev/null \
         | grep "^podkop\.[^.]*=section$" \
@@ -6677,7 +6680,10 @@ if [ ! -f "$ACTIVE_SECTION_FILE" ]; then
     echo "${_first_sec:-main}" > "$ACTIVE_SECTION_FILE"
 fi
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE" "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$BOT_USERNAME_FILE" "$BOT_ID_FILE" "$TAG_NAME_CACHE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE" "$BOT_PID_FILE" "/tmp/podkop_bot_last_nudge"; rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null; rm -rf "$PUBIP_REFRESH_LOCK"; exit' INT TERM QUIT
+send_startup_notification_async &
+start_health_daemon
+
+trap 'kill "$HEALTH_PID" 2>/dev/null; rm -rf "$BOT_DIR"; rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null; exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
