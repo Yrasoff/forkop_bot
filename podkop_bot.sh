@@ -1313,10 +1313,15 @@ build_tag_uri_cache() {
 # Build UCI proxy links cache using eval "set --" (uci get option N is broken on BusyBox)
 # One link per line, preserving original UCI order.
 build_uci_links_cache() {
-    local tmp sec raw_list
+    local tmp sec raw_list _mode _key
     sec=$(get_active_section)
+    _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+    case "$_mode" in
+        urltest) _key="urltest_proxy_links" ;;
+        *)       _key="selector_proxy_links" ;;
+    esac
     tmp=$(mktemp /tmp/podkop_uci_links.XXXXXX)
-    raw_list=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+    raw_list=$(uci -q show podkop.${sec}.${_key} 2>/dev/null | cut -d= -f2-)
     if [ -n "$raw_list" ]; then
         set -f; set -- $(uci_list_clean "$raw_list"); set +f
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
