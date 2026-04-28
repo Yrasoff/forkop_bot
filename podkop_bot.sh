@@ -3625,7 +3625,18 @@ EOF
                         warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n%s <b>%s</b> URLTest link(s) ready.\n\nSection: <code>%s</code>' "$E_WARN" "$E_OK" "$_utl_count" "$sec")
                     fi
                     ;;
-                selector) warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' "$E_WARN" "$sec") ;;
+                selector)
+                    local _sel_count _utl_count_back
+                    _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; _sel_count=$#; }
+                    _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count_back=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; _utl_count_back=$#; }
+                    if [ "${_sel_count:-0}" -eq 0 ] && [ "${_utl_count_back:-0}" -gt 0 ]; then
+                        warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\n%s <b>Selector Proxy Links is empty!</b>\nURLTest has %s link(s) that can be cloned.\n\nSection: <code>%s</code>' \
+                            "$E_WARN" "$E_WARN" "$_utl_count_back" "$sec")
+                    else
+                        warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' \
+                            "$E_WARN" "$sec")
+                    fi
+                    ;;
                 url)
                     local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
                     if [ -z "$_ps" ]; then
@@ -3647,6 +3658,15 @@ EOF
                     jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
                 if [ "${_utl_c:-0}" -eq 0 ] && [ "${_sel_c:-0}" -gt 0 ]; then
                     _kb_extra="[{\"text\":\"${E_RST} Clone ${_sel_c} links from Selector first\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
+                fi
+            fi
+            # For selector: add clone button when urltest has links but selector is empty
+            if [ "$target_mode" = "selector" ]; then
+                local _sel_c2 _utl_c2
+                _sel_lraw2=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_c2=0; [ -n "$_sel_lraw2" ] && { { _ucl=$(uci_list_clean "$_sel_lraw2"); eval "set -- $_ucl"; }; _sel_c2=$#; }
+                _utl_lraw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c2=0; [ -n "$_utl_lraw2" ] && { { _ucl=$(uci_list_clean "$_utl_lraw2"); eval "set -- $_ucl"; }; _utl_c2=$#; }
+                if [ "${_sel_c2:-0}" -eq 0 ] && [ "${_utl_c2:-0}" -gt 0 ]; then
+                    _kb_extra="[{\"text\":\"${E_RST} Clone ${_utl_c2} links from URLTest first\",\"callback_data\":\"cmd_clone_utl_to_sel\"}],"
                 fi
             fi
             kb="{\"inline_keyboard\":[${_kb_extra}[{\"text\":\"${E_OK} Yes, Switch\",\"callback_data\":\"do_switch_mode_${target_mode}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_mode_menu\"}]]}"
@@ -4142,6 +4162,36 @@ EOF
             [ "$_not_found" -gt 0 ] && _result=$(printf '%s\n<i>%s proxy/proxies not in UCI (added outside bot) — skipped.</i>' "$_result" "$_not_found")
             send_or_edit "$mid" "$_result" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_GLOB} View URLTest Links\",\"callback_data\":\"urltest_links_menu\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
+            ;;
+
+        "cmd_clone_utl_to_sel")
+            # Clone all urltest_proxy_links into selector_proxy_links.
+            # Symmetric counterpart of cmd_clone_sel_to_utl.
+            local _added=0 _skipped=0
+            local _utl_raw_c _item_c
+            _utl_raw_c=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+            if [ -z "$_utl_raw_c" ]; then
+                send_or_edit "$mid" "$(printf '%s URLTest Proxy Links is empty — nothing to clone.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
+                return
+            fi
+            { _ucl=$(uci_list_clean "$_utl_raw_c"); eval "set -- $_ucl"; }
+            for _item_c in "$@"; do
+                [ -z "$_item_c" ] && continue
+                if uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | grep -qF "'${_item_c}'"; then
+                    _skipped=$((_skipped + 1))
+                else
+                    uci add_list podkop.${sec}.selector_proxy_links="$_item_c"
+                    _added=$((_added + 1))
+                fi
+            done
+            uci_commit_safe podkop
+            build_all_caches
+            local _result2
+            _result2=$(printf '%s <b>Cloned %s link(s)</b> from URLTest.' "$E_OK" "$_added")
+            [ "$_skipped" -gt 0 ] && _result2=$(printf '%s\n<i>%s duplicate(s) skipped.</i>' "$_result2" "$_skipped")
+            send_or_edit "$mid" "$_result2" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Switch to Selector\",\"callback_data\":\"do_switch_mode_selector\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_mode_menu\"}]]}"
             ;;
 
         "cmd_utl_add")
@@ -6540,7 +6590,7 @@ handle_command() {
 
         urltest_settings|cmd_set_ut_url|cmd_set_ut_interval|cmd_set_ut_tolerance|\
         urltest_links_menu|urltest_links_p_*|cmd_utl_add|ask_del_utl_*|do_del_utl_*|\
-        cmd_clone_sel_to_utl|\
+        cmd_clone_sel_to_utl|cmd_clone_utl_to_sel|\
         cmd_set_mixed_port|cmd_set_outbound_iface|\
         domain_resolver_settings|do_toggle_dr|set_dr_type_*|cmd_set_dr_server|\
         badwan_details|cmd_set_bw_ifaces|cmd_set_bw_delay)
