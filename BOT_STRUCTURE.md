@@ -517,7 +517,7 @@ URLTest Links: 4
 ────────────────────
 Fallback Chain:
 1. SOCKS5 (192.168.2.1:2080) ◀ active
-2. Fallback SOCKS (socks5h://192.168.2.238:18088)
+2. Fallback SOCKS (socks5h://192.168.2.8:18088)
 3. Custom (http://...)          ← если задан
 4. Direct                       ← если transport ≠ socks
 5. Emergency IPs
@@ -583,8 +583,8 @@ Unauthorized Attempts:
 
 | Строка | Что означает |
 |--------|--------------|
-| `[primary] 123456789 🔒` | Основной admin (chat_id из UCI). Нельзя удалить |
-| `[N] 987654321` | Дополнительный admin из `admin_ids` |
+| `[primary] 123456123 🔒` | Основной admin (chat_id из UCI). Нельзя удалить |
+| `[N] 987654123` | Дополнительный admin из `admin_ids` |
 
 | Кнопка | Действие |
 |--------|----------|
