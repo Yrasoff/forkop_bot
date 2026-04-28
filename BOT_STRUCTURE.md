@@ -677,7 +677,7 @@ Takes 20–40 sec. Traffic ~1.3 MB.
 ────────────────────
 🌐 LV-hysteria2 (main-1-out) | Hysteria2
 ────────────────────
-🗺 Exit IP: 37.128.205.246
+🗺 Exit IP: 37.128.123.123
 🗺 GeoIP: LV Latvia
 🏢 SIA VEESP
 🗺 Cloudflare: LV
