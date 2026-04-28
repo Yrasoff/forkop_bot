@@ -57,7 +57,7 @@
 ```
 🖥 Podkop Manager
 ────────────────────
-Host: AX6000_Himki
+Host: AX6000
 Podkop: v0.7.14-r1 | Bot: v0.14.1
 [Section: main]            ← только при >1 секции
 Active Route: LV-hysteria2 (main-1-out)
@@ -93,10 +93,10 @@ Transport: Podkop (SOCKS5:192.168.2.1:2080)
 ```
 📊 System & Podkop Status
 ────────────────────
-🖥 AX6000_Himki | 5d 3h 12m
+🖥 AX6000| 5d 3h 12m
 🐧 OS: OpenWrt 24.10.5
 🌐 WAN: 192.168.1.3
-🌐 Public IP: 95.165.135.96    ← только если WAN ≠ Public IP (NAT)
+🌐 Public IP: 95.165.123.123    ← только если WAN ≠ Public IP (NAT)
 🔗 LAN: 192.168.2.1
 🌐 Tailscale (tailscale0): 100.x.x.x   ← если есть VPN-интерфейс
 🧠 Load: 0.18, 0.10, 0.08
@@ -602,7 +602,7 @@ Unauthorized Attempts:
 ```
 ℹ️ System Information
 
-Hostname: AX6000_Himki
+Hostname: AX6000
 LAN IP: 192.168.2.1
 Podkop: v0.7.14-r1
 Sing-box: 1.10.3
