@@ -3692,6 +3692,9 @@ EOF
             fi
             uci set podkop.${sec}.proxy_config_type="$target_mode"
             uci_commit_safe podkop
+            # Invalidate caches: mode switch changes which links list is active,
+            # stale TAG_NAME_CACHE/UCI_LINKS_CACHE would show old proxy names.
+            rm -f "$TAG_NAME_CACHE" "$UCI_LINKS_CACHE" "$TAG_URI_CACHE"
             send_or_edit "$mid" "$(printf '%s Applying mode switch to <code>%s</code>...' "$E_RST" "$target_mode")" ""
             safe_reload_podkop "force"; sleep 1
             _handle_settings "advanced_settings" "$mid" "" ""
@@ -4188,8 +4191,13 @@ EOF
             uci_commit_safe podkop
             build_all_caches
             local _result2
-            _result2=$(printf '%s <b>Cloned %s link(s)</b> from URLTest.' "$E_OK" "$_added")
-            [ "$_skipped" -gt 0 ] && _result2=$(printf '%s\n<i>%s duplicate(s) skipped.</i>' "$_result2" "$_skipped")
+            if [ "$_added" -eq 0 ] && [ "$_skipped" -gt 0 ]; then
+                # All were duplicates — selector already has these links
+                _result2=$(printf '%s <b>Selector Proxy Links already up to date.</b>\n\n<i>All %s link(s) from URLTest already exist in Selector — nothing to add.</i>' "$E_OK" "$_skipped")
+            else
+                _result2=$(printf '%s <b>Cloned %s link(s)</b> from URLTest.' "$E_OK" "$_added")
+                [ "$_skipped" -gt 0 ] && _result2=$(printf '%s\n<i>%s duplicate(s) skipped.</i>' "$_result2" "$_skipped")
+            fi
             send_or_edit "$mid" "$_result2" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Switch to Selector\",\"callback_data\":\"do_switch_mode_selector\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_mode_menu\"}]]}"
             ;;
@@ -6283,7 +6291,7 @@ EOF
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | cut -d'-' -f1)
             latest=$(curl -s --connect-timeout 5 --max-time 10 \
                 "https://api.github.com/repos/itdoginfo/podkop/releases/latest" \
-                | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
+                | jq -r '.tag_name' 2>/dev/null | sed 's/^v//' | cut -d'-' -f1)
             if [ -z "$latest" ] || [ "$latest" = "null" ]; then
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
