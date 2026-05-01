@@ -6466,6 +6466,12 @@ EOF
             mv "$bot_tmp" "$BOT_PATH"
             logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Restarting..."
 
+            # Preserve offset outside BOT_DIR before restart.
+            # The trap (INT/TERM/QUIT) runs rm -rf "$BOT_DIR" which would wipe
+            # OFFSET_FILE, causing offset=0 on next start and replaying old callbacks.
+            # Copy to legacy flat path — startup migration block picks it up.
+            cp "$OFFSET_FILE" "/tmp/podkop_bot_offset" 2>/dev/null || true
+
             # Kill watchdog by saved PID first (clean)
             kill "$HEALTH_PID" 2>/dev/null
             sleep 1
@@ -6767,7 +6773,13 @@ fi
 send_startup_notification_async &
 start_health_daemon
 
-trap 'kill "$HEALTH_PID" 2>/dev/null; rm -rf "$BOT_DIR"; rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null; exit' INT TERM QUIT
+trap 'kill "$HEALTH_PID" 2>/dev/null
+    # Remove volatile runtime state but preserve persistent files:
+    # OFFSET_FILE (offset survives restart), ACTIVE_SECTION_FILE (user choice),
+    # BOT_USERNAME_FILE / BOT_ID_FILE (identity cache).
+    rm -f "$STATE_FILE" "$HEALTH_STATE_FILE" "$SOCKS_STATE_FILE" "$SOCKS_PROBE_FILE"         "$SOCKS_REPROBE_TS_FILE" "$ROUTE_CMD_FILE" "$MAIN_ROUTE_FILE" "$MAIN_ROUTE_KEY_FILE"         "$LAST_MENU_MSG_FILE" "$LAST_ALERT_MSG_FILE" "$LAST_CMD_FILE" "$UNAUTH_FILE"         "${BOT_DIR}/last_nudge" "${BOT_DIR}/probe_ts" "${BOT_DIR}/pubip_refresh.lockdir"         "$PUBIP_CACHE" "$TAG_URI_CACHE" "$UCI_LINKS_CACHE" "$TAG_NAME_CACHE"         "$RELOAD_TS_FILE" "$RELOAD_LOCK" "$BOT_PID_FILE"
+    rm -f /tmp/podkop_updates.* /tmp/podkop_req.* /tmp/podkop_clash.*         /tmp/podkop_ip[123].* /tmp/podkop_pubip.* /tmp/podkop_bot_update.* 2>/dev/null
+    exit' INT TERM QUIT
 
 offset=$(cat "$OFFSET_FILE" 2>/dev/null || echo "0")
 
