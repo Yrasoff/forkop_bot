@@ -9,7 +9,18 @@
 #     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
 #   ash /tmp/install_podkop_bot.sh
 #
-# INSTALLER_VERSION="1.7.0"
+# INSTALLER_VERSION="1.8.0"
+#
+# CHANGELOG v1.8.0:
+# - FIXED: safe_stop_bot() now reads PID from /tmp/podkop_bot/bot.pid (new BOT_DIR
+#          path since v0.14.1), with fallback to legacy /tmp/podkop_bot.pid for
+#          older installs. Previously always missed the PID and relied solely on
+#          killall -9 as a safety net.
+# - FIXED: cleanup_bot_runtime_files() rewritten to cover both new BOT_DIR paths
+#          (/tmp/podkop_bot/*) and legacy flat paths (/tmp/podkop_bot_*) so it
+#          works correctly after upgrade, downgrade, or fresh install.
+# - FIXED: Uninstall (option 4) now also removes /tmp/podkop_bot/ directory,
+#          leaving no artifacts after complete removal.
 #
 # CHANGELOG v1.7.0:
 # - NEW:  Option 4 — full uninstall with double confirmation (type "YES" then
@@ -119,7 +130,8 @@ uci_get() { uci -q get "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
 #   3. killall -9  — catch any remaining processes matching the script name
 #   4. Short sleep — let the OS reap zombie entries
 safe_stop_bot() {
-    local _pid_file="/tmp/podkop_bot.pid"
+    local _pid_file="/tmp/podkop_bot/bot.pid"
+    local _pid_file_legacy="/tmp/podkop_bot.pid"
     local _stopped=0
 
     # Step 1: procd-managed stop
@@ -131,9 +143,11 @@ safe_stop_bot() {
         _stopped=1
     fi
 
-    # Step 2: kill by PID file (main loop PID written by bot at startup)
-    if [ -f "$_pid_file" ]; then
-        _main_pid=$(cat "$_pid_file" 2>/dev/null)
+    # Step 2: kill by PID file (main loop PID written by bot at startup).
+    # Check new BOT_DIR path first, then legacy flat path for pre-v0.14.1 installs.
+    for _pid_file_try in "$_pid_file" "$_pid_file_legacy"; do
+        [ -f "$_pid_file_try" ] || continue
+        _main_pid=$(cat "$_pid_file_try" 2>/dev/null)
         if [ -n "$_main_pid" ] && kill -0 "$_main_pid" 2>/dev/null; then
             printf "  Killing main PID %s... " "$_main_pid"
             kill "$_main_pid" 2>/dev/null
@@ -141,8 +155,8 @@ safe_stop_bot() {
             kill -9 "$_main_pid" 2>/dev/null
             echo "done"
         fi
-        rm -f "$_pid_file"
-    fi
+        rm -f "$_pid_file_try"
+    done
 
     # Step 3: killall -9 by script name — catches watchdog subshells, any
     #         leftover ash processes running podkop_bot that survived above.
@@ -164,45 +178,57 @@ safe_stop_bot() {
 }
 
 cleanup_bot_runtime_files() {
-    local _files="
-        /tmp/podkop_bot_state
-        /tmp/podkop_bot_health_state
-        /tmp/podkop_bot_socks_state
-        /tmp/podkop_bot_socks_probe
-        /tmp/podkop_bot_socks_reprobe_ts
-        /tmp/podkop_bot_route_cmd
-        /tmp/podkop_bot_last_menu_msg
-        /tmp/podkop_bot_last_alert_msg
-        /tmp/podkop_bot_username
-        /tmp/podkop_bot_id
-        /tmp/podkop_bot_tag_name_cache
-        /tmp/podkop_bot_main_route
-        /tmp/podkop_bot_main_route_key
-        /tmp/podkop_bot.pid
-        /tmp/podkop_bot_last_nudge
-        /tmp/podkop_bot_unauth
-        /tmp/podkop_bot_last_cmd
-        /tmp/podkop_bot_offset
-        /tmp/podkop_bot_active_section
-        /tmp/podkop_bot_last_reload_ts
-        /tmp/podkop_pubip_cache.txt
-    "
     local _removed=0
-    for _f in $_files; do
-        if [ -f "$_f" ]; then
-            rm -f "$_f"
-            _removed=$((_removed + 1))
-        fi
+
+    # v0.14.1+: all state lives under /tmp/podkop_bot/ — wipe volatile files,
+    # preserve offset and active_section (bot needs them across restarts).
+    if [ -d "/tmp/podkop_bot" ]; then
+        for _f in \
+            /tmp/podkop_bot/state           /tmp/podkop_bot/health_state \
+            /tmp/podkop_bot/socks_state     /tmp/podkop_bot/socks_probe \
+            /tmp/podkop_bot/socks_reprobe_ts /tmp/podkop_bot/route_cmd \
+            /tmp/podkop_bot/last_menu_msg   /tmp/podkop_bot/last_alert_msg \
+            /tmp/podkop_bot/username        /tmp/podkop_bot/id \
+            /tmp/podkop_bot/tag_name_cache.txt /tmp/podkop_bot/tag_uri_cache.txt \
+            /tmp/podkop_bot/uci_links_cache.txt /tmp/podkop_bot/main_route \
+            /tmp/podkop_bot/main_route_key  /tmp/podkop_bot/last_nudge \
+            /tmp/podkop_bot/unauth          /tmp/podkop_bot/last_cmd \
+            /tmp/podkop_bot/last_reload_ts  /tmp/podkop_bot/reload_ts \
+            /tmp/podkop_bot/pubip_cache.txt /tmp/podkop_bot/cl_cache.txt \
+            /tmp/podkop_bot/cl_cache_ts     /tmp/podkop_bot/probe_ts \
+            /tmp/podkop_bot/bot.pid \
+        ; do
+            [ -f "$_f" ] || continue
+            rm -f "$_f" && _removed=$((_removed + 1))
+        done
+        rm -rf /tmp/podkop_bot/pubip_refresh.lockdir 2>/dev/null || true
+    fi
+
+    # Legacy flat paths (pre-v0.14.1) — clean on older installs / downgrade.
+    for _f in \
+        /tmp/podkop_bot_state           /tmp/podkop_bot_health_state \
+        /tmp/podkop_bot_socks_state     /tmp/podkop_bot_socks_probe \
+        /tmp/podkop_bot_socks_reprobe_ts /tmp/podkop_bot_route_cmd \
+        /tmp/podkop_bot_last_menu_msg   /tmp/podkop_bot_last_alert_msg \
+        /tmp/podkop_bot_username        /tmp/podkop_bot_id \
+        /tmp/podkop_bot_main_route      /tmp/podkop_bot_main_route_key \
+        /tmp/podkop_bot.pid             /tmp/podkop_bot_last_nudge \
+        /tmp/podkop_bot_unauth          /tmp/podkop_bot_last_cmd \
+        /tmp/podkop_bot_last_reload_ts  /tmp/podkop_pubip_cache.txt \
+        /tmp/podkop_cl_cache.txt        /tmp/podkop_cl_cache_ts \
+        /tmp/podkop_tag_uri_cache.txt   /tmp/podkop_uci_links_cache.txt \
+        /tmp/podkop_tag_name_cache.txt \
+    ; do
+        [ -f "$_f" ] || continue
+        rm -f "$_f" && _removed=$((_removed + 1))
     done
-    # Community list cache (TTL-based, must be invalidated on update)
-    rm -f /tmp/podkop_cl_cache.txt /tmp/podkop_cl_cache_ts 2>/dev/null || true
-    # Tag/URI caches (section-specific, may be stale after version change)
-    rm -f /tmp/podkop_tag_uri_cache.txt /tmp/podkop_uci_links_cache.txt 2>/dev/null || true
-    # Remove any leftover temp request files
-    rm -f /tmp/podkop_req.* /tmp/podkop_bot_update.* /tmp/podkop_updates.* 2>/dev/null || true
-    # Remove pubip refresh lock if somehow stuck
     rm -rf /tmp/podkop_pubip_refresh.lockdir 2>/dev/null || true
-    [ "$_removed" -gt 0 ] && info "Cleaned up ${_removed} runtime files from /tmp."
+
+    # Leftover mktemp-based temp files (any version)
+    rm -f /tmp/podkop_req.* /tmp/podkop_bot_update.* /tmp/podkop_updates.* \
+        /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* 2>/dev/null || true
+
+    [ "$_removed" -gt 0 ] && info "Cleaned up ${_removed} runtime files."
 }
 
 # Validate socks5[h]://host:port — format + port must be 1-65535
@@ -418,6 +444,8 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
             fi
             step "Cleaning up runtime files..."
             cleanup_bot_runtime_files
+            # Remove BOT_DIR entirely (v0.14.1+)
+            rm -rf /tmp/podkop_bot 2>/dev/null || true
             echo ""
             echo "==========================================="
             echo "  Uninstall complete."
