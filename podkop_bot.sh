@@ -5671,6 +5671,11 @@ EOF
                     fi
                     _s_delay=$(printf '%s' "$th_proxies" | jq -r \
                         --arg n "$_s_leaf" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
+                    # Fallback: if leaf has no delay history, try the selector/urltest group node
+                    if [ -z "$_s_delay" ] || [ "$_s_delay" = "0" ]; then
+                        _s_delay=$(printf '%s' "$th_proxies" | jq -r \
+                            --arg n "$_s_sel" '.proxies[$n].history[-1].delay // 0' 2>/dev/null)
+                    fi
                     _s_name=$(html_escape "$(display_proxy_name "$_s_leaf")")
                     [ -z "$_s_name" ] && _s_name="$_s_leaf"
                     if [ -z "$_s_delay" ] || [ "$_s_delay" = "0" ]; then
@@ -5679,8 +5684,13 @@ EOF
                     elif [ "$_s_delay" -lt 500 ]; then _s_icon="$E_YLW"
                     else _s_icon="$E_RED"; fi
                     [ "$_s_delay" != "N/A" ] && _s_delay="${_s_delay}ms"
-                    # TG reachability for this section from SOCKS_STATE_FILE
-                    _s_tg=$(grep "^tg_sec_${_s}=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+                    # TG reachability: primary section → use tg_transport (already checked by check_health A2)
+                    # Non-primary sections → use tg_sec_<name> (per-section probe from A3)
+                    if [ "$_s" = "$(_resolve_primary_section)" ]; then
+                        _s_tg=$(grep "^tg_transport=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+                    else
+                        _s_tg=$(grep "^tg_sec_${_s}=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+                    fi
                     [ "$_s_tg" = "ok" ] && _s_tg_icon="$E_OK" || { [ -n "$_s_tg" ] && _s_tg_icon="$E_ERR" || _s_tg_icon="…"; }
                     _sec_ob_lines="${_sec_ob_lines}${_s_icon} [${_s}] <code>${_s_name}</code> ${_s_delay} | TG: ${_s_tg_icon}\n"
                 done
@@ -5744,7 +5754,7 @@ ${E_NET} <b>WAN iface:</b> <code>${wan_iface}</code>
 ${E_GLOB} <b>Active proxy:</b> <code>${th_active_display}</code>
 <code>────────────────────</code>
 ${tgd_icon} <b>TG direct:</b> <code>${wd_tg_direct:-?}</code> <i>(no proxy, 2/3 DC)</i>
-${tunnel_icon} <b>TG tunnel SOCKS5:</b> <code>${wd_tg_transport:-?}</code> / SOCKS <code>${wd_socks:-?}</code>
+${tunnel_icon} <b>TG tunnel:</b> <code>${wd_tg_transport:-?}</code>$([ "${wd_socks}" != "up" ] && printf " <i>(SOCKS %s)</i>" "${wd_socks:-?}")
 $([ -n "$tier2_line" ] && printf '%s' "$tier2_line")
 ${E_SHLD} <b>Bot transport:</b> <code>${LAST_ROUTE_NAME}</code>
 ${E_NET} <b>Poll route:</b> <code>${LAST_ROUTE_POLL}</code> | <b>Fast:</b> <code>${LAST_ROUTE_FAST}</code>${probe_section}
