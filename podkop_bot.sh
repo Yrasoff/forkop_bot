@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.14.1
+# Podkop Telegram Bot v0.14.3
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -28,7 +28,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 BOT_DIR="/tmp/podkop_bot"
 mkdir -p "$BOT_DIR"
 
-BOT_VERSION="0.14.1"
+BOT_VERSION="0.14.3"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -3516,7 +3516,7 @@ EOF
             conn_type=$(uci -q get podkop.${sec}.connection_type || echo "proxy")
             mixed_en=$(get_uci_bool_emoji "podkop.${sec}" "mixed_proxy_enabled")
             mixed_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
-            outbound_iface=$(uci -q get podkop.${sec}.outbound_interface 2>/dev/null || echo "auto")
+            outbound_iface=$(uci -q get podkop.settings.output_network_interface 2>/dev/null || echo "auto")
 
             next_log="info"
             [ "$log_lvl" = "info" ]  && next_log="warn"
@@ -3562,7 +3562,7 @@ ${E_SET} <b>Core Settings</b> [<code>${sec}</code>]
 <b>Mode:</b> <code>${proxy_mode}</code>  ${mode_hint}
 <code>────────────────────</code>
 <b>Mixed Proxy:</b> ${mixed_en} port <code>${mixed_port}</code>
-<b>Outbound iface:</b> <code>${outbound_iface}</code>
+<b>Outbound iface:</b> <code>${outbound_iface}</code> <i>(global)</i>
 <code>────────────────────</code>
 <b>Log:</b> <code>${log_lvl}</code> | <b>Update:</b> ${interval}
 <b>Bad WAN:</b> ${wan} | <b>Excl. NTP:</b> ${excl_ntp}
@@ -3675,21 +3675,47 @@ EOF
 
         "do_switch_mode_"*)
             local target_mode="${cmd#do_switch_mode_}"
-            # Safety: switching to URL mode without a proxy_string kills podkop.
-            # Delay reload — save the mode, ask for the URL first.
-            if [ "$target_mode" = "url" ]; then
-                local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
-                if [ -z "$_ps" ]; then
-                    uci set podkop.${sec}.proxy_config_type="url"
-                    uci_commit_safe podkop
-                    echo "wait_url_link" > "$STATE_FILE"
-                    send_or_edit "$mid" \
-                        "$(printf '%s <b>URL mode set.</b>\n\n%s <b>Reload is held</b> until you send a proxy URL.\nSend the link now (vless://, hy2://, trojan://, ss://, ...).\n\nTo cancel and revert to Selector, tap the button below.' \
-                            "$E_WARN" "$E_ERR")" \
-                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel — revert to Selector\",\"callback_data\":\"do_switch_mode_selector\"}]]}"
-                    return
-                fi
-            fi
+            # Defense-in-depth: re-check list non-empty at do-stage (not only ask-stage).
+            # If user ignored the warning and pressed "Yes, Switch" anyway on an empty list
+            # podkop would fatal abort on reload and drop the entire tunnel.
+            # url mode uses a state-machine delay (wait_url_link) — same pattern here.
+            case "$target_mode" in
+                url)
+                    local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+                    if [ -z "$_ps" ]; then
+                        uci set podkop.${sec}.proxy_config_type="url"
+                        uci_commit_safe podkop
+                        echo "wait_url_link" > "$STATE_FILE"
+                        send_or_edit "$mid" \
+                            "$(printf '%s <b>URL mode set.</b>\n\n%s <b>Reload is held</b> until you send a proxy URL.\nSend the link now (vless://, hy2://, trojan://, ss://, ...).\n\nTo cancel and revert to Selector, tap the button below.' \
+                                "$E_WARN" "$E_ERR")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel — revert to Selector\",\"callback_data\":\"do_switch_mode_selector\"}]]}"
+                        return
+                    fi
+                    ;;
+                urltest)
+                    local _utl_raw _utl_c=0
+                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+                    [ -n "$_utl_raw" ] && { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; _utl_c=$#; }
+                    if [ "$_utl_c" -eq 0 ]; then
+                        send_or_edit "$mid" \
+                            "$(printf '%s <b>Refused: URLTest list is empty.</b>\n\nSwitching now would crash podkop on reload.\nAdd links first via URLTest Settings, or clone from Selector.' "$E_ERR")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_RST} URLTest Settings\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
+                        return
+                    fi
+                    ;;
+                selector)
+                    local _sel_raw _sel_c=0
+                    _sel_raw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                    [ -n "$_sel_raw" ] && { _ucl=$(uci_list_clean "$_sel_raw"); eval "set -- $_ucl"; _sel_c=$#; }
+                    if [ "$_sel_c" -eq 0 ]; then
+                        send_or_edit "$mid" \
+                            "$(printf '%s <b>Refused: Selector list is empty.</b>\n\nSwitching now would crash podkop on reload.\nAdd links first, or clone from URLTest.' "$E_ERR")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
+                        return
+                    fi
+                    ;;
+            esac
             uci set podkop.${sec}.proxy_config_type="$target_mode"
             uci_commit_safe podkop
             # Invalidate caches: mode switch changes which links list is active,
@@ -3736,6 +3762,25 @@ EOF
             ;;
         "do_set_conn_"*)
             local new_ct="${cmd#do_set_conn_}"
+            # VPN guard: podkop aborts if connection_type=vpn and interface is not set.
+            # Mirror the url-mode guard: save the type, hold reload, ask for interface.
+            if [ "$new_ct" = "vpn" ]; then
+                local _vpn_iface; _vpn_iface=$(uci -q get podkop.${sec}.interface 2>/dev/null)
+                if [ -z "$_vpn_iface" ]; then
+                    uci set podkop.${sec}.connection_type="vpn"
+                    uci_commit_safe podkop
+                    echo "wait_vpn_iface" > "$STATE_FILE"
+                    send_or_edit "$mid"                         "$(printf '%s <b>VPN mode set.</b>
+
+%s <b>Reload is held</b> until you set a VPN interface.
+Send the UCI interface name now (e.g. <code>wg0</code>, <code>tun0</code>, <code>tailscale0</code>).
+
+Without this, podkop will abort on reload with "VPN interface is not set".
+
+To cancel and revert to Proxy, tap below.'                             "$E_WARN" "$E_ERR")"                         "{"inline_keyboard":[[{"text":"${E_BACK} Cancel — revert to Proxy","callback_data":"do_set_conn_proxy"}]]}"
+                    return
+                fi
+            fi
             uci set podkop.${sec}.connection_type="$new_ct"
             uci_commit_safe podkop
             send_or_edit "$mid" "$(printf '%s Applying connection type <code>%s</code>...' "$E_RST" "$new_ct")" ""
@@ -3879,14 +3924,32 @@ _handle_section_extras() {
                 delete_message "$mid"
                 local val; val=$(printf '%s' "$text" | tr -d '\r\n\t ')
                 if [ -z "$val" ]; then
-                    uci delete podkop.${sec}.outbound_interface 2>/dev/null
+                    uci delete podkop.settings.output_network_interface 2>/dev/null
+                    uci set podkop.settings.enable_output_network_interface="0"
                 else
-                    uci set podkop.${sec}.outbound_interface="$val"
+                    uci set podkop.settings.output_network_interface="$val"
+                    uci set podkop.settings.enable_output_network_interface="1"
                 fi
                 uci_commit_safe podkop
                 send_message "$(printf '%s Interface set to: %s. Applying...' "$E_OK" "${val:-auto}")" ""
                 safe_reload_podkop "force"; sleep 1
                 _handle_settings "advanced_settings" "" "" "" ;;
+            wait_vpn_iface)
+                delete_message "$mid"
+                local val; val=$(printf '%s' "$text" | tr -d '
+	 ')
+                if [ -z "$val" ]; then
+                    send_message "$(printf '%s Interface name cannot be empty. Send the UCI interface name (e.g. wg0, tun0) or tap Cancel.' "$E_ERR")"                         "{"inline_keyboard":[[{"text":"${E_BACK} Cancel — revert to Proxy","callback_data":"do_set_conn_proxy"}]]}"
+                    # Keep state — wait for valid input
+                else
+                    uci set podkop.${sec}.interface="$val"
+                    uci_commit_safe podkop
+                    send_message "$(printf '%s VPN interface set to <code>%s</code>. Applying...' "$E_OK" "$val")" ""
+                    safe_reload_podkop "force"; sleep 1
+                    _handle_settings "advanced_settings" "" "" ""
+                fi
+                ;;
+
             wait_utl_link)
                 delete_message "$mid"
                 local safe_link; safe_link=$(printf "%s" "$text" | tr -d '\r\n' | sed 's/[[:space:]]//g')
@@ -4044,8 +4107,8 @@ _handle_section_extras() {
         "cmd_set_outbound_iface")
             echo "wait_outbound_iface" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Set Outbound Interface</b>\n\nCurrent: <code>%s</code>\n\nEnter UCI interface name (e.g. <code>wan</code>, <code>wwan0</code>).\nLeave blank to reset to auto.' \
-                    "$E_EDIT" "$(uci -q get podkop.${sec}.outbound_interface || echo "auto")")" \
+                "$(printf '%s <b>Set Outbound Interface</b>\n\nCurrent: <code>%s</code>\n\n<i>Global setting — applies to all podkop sections.</i>\nEnter UCI interface name (e.g. <code>wan</code>, <code>wwan0</code>).\nLeave blank to reset to auto.' \
+                    "$E_EDIT" "$(uci -q get podkop.settings.output_network_interface || echo "auto")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
             ;;
 
@@ -5377,6 +5440,26 @@ EOF
         "cmd_runtime")
             local conn_data curr_conn total_dl total_ul dl_fmt ul_fmt text kb
             local proxies selector active_proxy active_proxy_display p_delay_raw p_delay p_type active_leaf
+            local sb_uptime_str sb_pid_rt
+            sb_pid_rt=$(pidof sing-box 2>/dev/null)
+            if [ -n "$sb_pid_rt" ]; then
+                local _now _lrr _diff _sb_start _tps _boot
+                _now=$(date +%s)
+                _lrr=0
+                [ -f "$RELOAD_TS_FILE" ] && _lrr=$(cat "$RELOAD_TS_FILE" 2>/dev/null || echo 0)
+                if [ "$_lrr" -eq 0 ]; then
+                    _sb_start=$(awk '{print $22}' /proc/"$sb_pid_rt"/stat 2>/dev/null || echo 0)
+                    _tps=$(getconf CLK_TCK 2>/dev/null || echo 100)
+                    _boot=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)
+                    _lrr=$((_now - _boot + _sb_start / _tps))
+                fi
+                _diff=$((_now - _lrr))
+                if   [ "$_diff" -lt 60 ];   then sb_uptime_str="${_diff}s"
+                elif [ "$_diff" -lt 3600 ]; then sb_uptime_str="$((  _diff/60))m"
+                else sb_uptime_str="$((_diff/3600))h $((_diff%3600/60))m"; fi
+            else
+                sb_uptime_str="stopped"
+            fi
 
             conn_data=$(clash_request "/connections")
             curr_conn=$(echo "$conn_data" | jq -r '.connections | length // 0' 2>/dev/null)
@@ -5423,6 +5506,7 @@ ${E_SCAN} <b>Runtime Info</b>
 ${E_PRX} <b>Connections:</b> ${curr_conn}
 ${E_DWN} <b>Downloaded:</b> ${dl_fmt}
 ${E_UP} <b>Uploaded:</b> ${ul_fmt}
+⏱ <b>Session:</b> ${sb_uptime_str}
 <code>────────────────────</code>
 ${E_GLOB} <b>Active proxy:</b> <code>${active_proxy_display}</code>
 ${E_SET} <b>Type:</b> ${p_type} | <b>Delay:</b> ${p_delay}
@@ -5447,7 +5531,7 @@ EOF
 
             sec=$(get_active_section)
             proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "unknown")
-            wan_iface=$(uci -q get podkop.${sec}.outbound_interface 2>/dev/null || echo "auto")
+            wan_iface=$(uci -q get podkop.settings.output_network_interface 2>/dev/null || echo "auto")
 
             # nftables podkop rules count
             nft_raw=$(nft list ruleset 2>/dev/null | grep -i podkop | wc -l)
@@ -5757,10 +5841,9 @@ $(_fmt_tier "tier5" "Emergency IPs")"
             kb="{\"inline_keyboard\":[
                 [{\"text\":\"Transport: ${tr_disp}\",\"callback_data\":\"ask_set_tr_menu\"},{\"text\":\"Health: ${hi}s\",\"callback_data\":\"set_bot_hi_${next_hi}\"}],
                 [{\"text\":\"${E_NET} Fallback SOCKS\",\"callback_data\":\"fallback_socks_menu\"},{\"text\":\"${E_TEST} Test Fallback\",\"callback_data\":\"cmd_test_fb_socks\"}],
-                [{\"text\":\"👤 Admins\",\"callback_data\":\"admins_menu\"}],
                 [${cp_btn},${bi_btn}],
                 [{\"text\":\"${st_icon} Startup Notify\",\"callback_data\":\"toggle_bot_st\"},{\"text\":\"${al_icon} Alert Notify\",\"callback_data\":\"toggle_bot_al\"}],
-                [{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"👤 Admins\",\"callback_data\":\"admins_menu\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
             ]}"
 
             text=$(cat <<EOF
@@ -6574,7 +6657,7 @@ handle_command() {
                 _handle_fallback_socks "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_urltest_url|wait_urltest_interval|wait_urltest_tolerance|\
             wait_dr_server|wait_badwan_ifaces|wait_badwan_delay|\
-            wait_mixed_port|wait_outbound_iface|wait_utl_link)
+            wait_mixed_port|wait_outbound_iface|wait_vpn_iface|wait_utl_link)
                 _handle_section_extras "STATE_INPUT" "$mid" "$cmd" "$state" ;;
         esac
         return
