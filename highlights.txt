@@ -1,1 +1,1 @@
-Critical fixes: proxy names, startup notify, update loop, force update, podkop version check; new: VPN/URL/Selector mode guards, outbound_interface corrected to global UCI key, session uptime in Runtime Info, clone links bidirectional with defense-in-depth.
+Critical fixes: proxy names, startup notify, update loop, force update, podkop version check; new: VPN/URL/Selector mode guards, outbound_interface corrected to global UCI key, session uptime in Runtime Info, clone links bidirectional with defense-in-depth, GitHub fetch via SOCKS fallover.
