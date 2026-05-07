@@ -2,9 +2,9 @@
 
 ## v0.14.3
 
-- **NEW:** Runtime Info — добавлена строка `⏱ Session: Xh Xm` между блоком трафика и блоком прокси. Показывает время работы текущей сессии sing-box — контекст для цифр Downloaded/Uploaded. Источник тот же что в Tunnel Health: `RELOAD_TS_FILE`, fallback на `/proc/PID/stat`. Без дополнительных curl-запросов.
-- **UX:** Bot Settings — кнопка `👤 Admins` перенесена из отдельной строки в нижнюю строку рядом с `🏠 Menu`. Убирает визуальный разрыв между функциональными кнопками (Fallback SOCKS, Custom Proxy, Notify) и служебной навигацией.
-
+- **NEW:** Runtime Info — added `⏱ Session: Xh Xm` line between traffic and proxy blocks. Shows current sing-box session uptime as context for Downloaded/Uploaded figures. Source: `RELOAD_TS_FILE`, fallback to `/proc/PID/stat`. No extra curl calls.
+- **UX:** Bot Settings — `👤 Admins` button moved from its own row to the bottom row next to `🏠 Menu`. Removes the visual gap between functional buttons (Fallback SOCKS, Custom Proxy, Notify) and navigation.
+- **NEW:** GitHub fetch fallover via SOCKS — version check and self-update now use `_curl_via_best_socks`: tries direct first, then tier1 (Podkop SOCKS), then each tier2_N fallback in order. Prevents "Cannot reach GitHub" errors when raw.githubusercontent.com is blocked by ISP. Route is shown in the result card when a proxy was used (direct = silent).
 ---
 
 ## v0.14.2
