@@ -9,7 +9,17 @@
 #     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
 #   ash /tmp/install_podkop_bot.sh
 #
-# INSTALLER_VERSION="1.8.0"
+# INSTALLER_VERSION="1.9.0"
+#
+# CHANGELOG v1.9.0:
+# - NEW: _get_socks_endpoints() reads tier1 (podkop mixed_proxy) and fallback_socks
+#        from UCI — works before bot starts, no bot variables needed.
+# - NEW: _curl_socks_fallover() wraps curl with automatic SOCKS fallover:
+#        direct → tier1 → each tier2_N. Used by version check and token validation.
+# - NEW: download_file() now tries SOCKS tiers after direct wget/curl fail.
+#        Prints "Downloaded via socks5h://..." when proxy was used.
+# - NEW: Token validation (getMe) uses _curl_socks_fallover — works behind ISP blocks.
+# - NEW: Version check uses _curl_socks_fallover instead of separate wget/curl fallback.
 #
 # CHANGELOG v1.8.0:
 # - FIXED: safe_stop_bot() now reads PID from /tmp/podkop_bot/bot.pid (new BOT_DIR
@@ -112,14 +122,93 @@ section() { echo ""; echo "-------------------------------------------"; echo " 
 
 download_file() {
     local url="$1" dest="$2"
+    # Try direct (wget, then curl), then SOCKS fallover.
     # BusyBox wget hangs indefinitely without -T on slow/broken WAN.
-    # curl fallback mirrors the same budget: 10s connect, 30s total.
-    wget -q -T 15 -O "$dest" "$url" 2>/dev/null \
-        || curl -s --connect-timeout 10 --max-time 30 -o "$dest" "$url" 2>/dev/null \
-        || die "Failed to download $url — check internet connection."
+    wget -q -T 15 -O "$dest" "$url" 2>/dev/null && return 0
+    curl -s --connect-timeout 10 --max-time 30 -o "$dest" "$url" 2>/dev/null && return 0
+
+    # Direct failed — GitHub/Telegram may be blocked by ISP.
+    printf "\n  [!!] Direct connection failed (GitHub may be blocked by your ISP).\n"
+
+    local _socks_list; _socks_list=$(_get_socks_endpoints)
+    if [ -z "$_socks_list" ]; then
+        printf "  [!!] No SOCKS proxy configured — cannot try fallover.\n"
+        printf "  To fix: enable Mixed Proxy in podkop (LuCI → Podkop → Mixed Proxy Port),\n"
+        printf "  then re-run this installer.\n\n"
+        die "Failed to download $url — direct blocked, no SOCKS available."
+    fi
+
+    printf "  Trying via SOCKS tiers...\n"
+    local _ep
+    for _ep in $_socks_list; do
+        printf "    → %s ... " "$_ep"
+        if curl -s --connect-timeout 6 --max-time 30 -x "$_ep" -o "$dest" "$url" 2>/dev/null; then
+            printf "OK\n"
+            return 0
+        fi
+        printf "failed\n"
+    done
+
+    printf "\n  [!!] All SOCKS tiers failed.\n"
+    printf "  Check that podkop is running and Mixed Proxy is enabled:\n"
+    printf "    uci show podkop | grep mixed_proxy\n"
+    printf "  Or add a fallback SOCKS proxy and retry.\n\n"
+    die "Failed to download $url — no working transport (direct or SOCKS)."
 }
 
 uci_get() { uci -q get "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
+
+# _get_socks_endpoints: read tier1 and fallback_socks from UCI for use before bot starts.
+# Outputs space-separated list: "socks5h://IP:PORT" entries (tier1 first, then fallbacks).
+_get_socks_endpoints() {
+    local _results=""
+    # tier1: primary proxy section mixed_proxy
+    local _primary_sec _port _lan_ip
+    _primary_sec=$(uci -q show podkop 2>/dev/null         | grep "^podkop\.[^.]*=section$"         | while IFS='=' read -r _k _v; do
+            _s=$(printf '%s' "$_k" | cut -d. -f2)
+            _ct=$(uci -q get podkop.${_s}.connection_type 2>/dev/null)
+            _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null)
+            [ "$_ct" = "proxy" ] && [ "$_me" = "1" ] && echo "$_s" && break
+        done | head -1)
+    if [ -n "$_primary_sec" ]; then
+        _port=$(uci -q get podkop.${_primary_sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+        _lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
+        _results="socks5h://${_lan_ip}:${_port}"
+    fi
+    # fallback_socks from bot UCI config
+    local _fb_raw _fb
+    _fb_raw=$(uci -q show podkop_bot.settings.fallback_socks 2>/dev/null | cut -d= -f2-)
+    if [ -n "$_fb_raw" ]; then
+        eval "set -- $_fb_raw" 2>/dev/null
+        for _fb in "$@"; do
+            [ -n "$_fb" ] && _results="${_results:+$_results }${_fb}"
+        done
+    fi
+    printf '%s' "$_results"
+}
+
+# _curl_socks_fallover: curl with automatic SOCKS fallover.
+# Tries direct first, then each SOCKS endpoint from _get_socks_endpoints.
+# $1=max_time, remaining args passed to curl.
+# On success sets _last_socks_route="" (direct) or "socks5h://..." (proxy used).
+_curl_socks_fallover() {
+    local _max="${1:-15}"; shift
+    local _ct=6
+    _last_socks_route=""
+    # 1. Direct
+    if curl -s --connect-timeout "$_ct" --max-time "$_max" "$@" 2>/dev/null; then
+        return 0
+    fi
+    # 2. SOCKS tiers
+    local _ep
+    for _ep in $(_get_socks_endpoints); do
+        if curl -s --connect-timeout "$_ct" --max-time "$_max" -x "$_ep" "$@" 2>/dev/null; then
+            _last_socks_route="$_ep"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ── Safe bot stop: kills main process AND orphaned watchdog subshells ──────────
 # procd sends SIGTERM→SIGKILL to the main loop but watchdog subshells can
@@ -377,11 +466,11 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
     echo "  Chat ID  : $EXISTING_CHAT"
     echo "  Version  : ${INSTALLED_VER}"
     echo ""
-    echo "Choose an option:"
-    echo "  1) Update script from GitHub, keep config  [default]"
-    echo "  2) Reinstall with new settings"
+    echo "What would you like to do?"
+    echo "  1) Update podkop_bot to latest version, keep settings  [default]"
+    echo "  2) Reinstall podkop_bot with new settings (token, chat ID, etc.)"
     echo "  3) Exit without changes"
-    echo "  4) Uninstall bot completely"
+    echo "  4) Uninstall podkop_bot completely"
     printf "Enter 1, 2, 3 or 4: "
     read -r CHOICE
     echo ""
@@ -459,9 +548,7 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
         1|*)
             # ── Update flow ────────────────────────────────────────────────────
             step "Checking for updates..."
-            REMOTE_VER=$(wget -q -O - "$VERSION_URL" 2>/dev/null | head -1 | tr -d '\r\n\t ')
-            [ -z "$REMOTE_VER" ] && \
-                REMOTE_VER=$(curl -s "$VERSION_URL" 2>/dev/null | head -1 | tr -d '\r\n\t ')
+            REMOTE_VER=$(_curl_socks_fallover 10 "$VERSION_URL" | head -1 | tr -d '\r\n\t ')
             [ -z "$REMOTE_VER" ] && REMOTE_VER="unknown"
 
             echo ""
@@ -507,7 +594,7 @@ if [ -f "$BOT_PATH" ] && [ -n "$EXISTING_TOKEN" ] && [ -n "$EXISTING_CHAT" ]; th
                 echo "OK"
             else
                 rm -f "$_init_tmp"
-                info "init.d script not updated (repo version not available)."
+                : # init.d script unchanged (no repo update available)
             fi
 
             ok "Updated to v${REMOTE_VER}."
@@ -564,17 +651,26 @@ read -r BOT_TOKEN
 [ -z "$BOT_TOKEN" ] && die "Bot token cannot be empty."
 
 printf "  Verifying token... "
-TG_CHECK=$(curl -s --connect-timeout 8 \
-    "https://api.telegram.org/bot${BOT_TOKEN}/getMe" 2>/dev/null)
+TG_CHECK=$(_curl_socks_fallover 10 "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
 if ! echo "$TG_CHECK" | grep -q '"ok":true'; then
     echo "FAILED"
-    warn "Could not verify token (network issue or invalid token)."
+    if [ -z "$(_get_socks_endpoints)" ]; then
+        warn "Could not reach Telegram API — direct connection failed."
+        warn "If Telegram is blocked by your ISP, enable Mixed Proxy in podkop first:"
+        warn "  LuCI → Podkop → Mixed Proxy Port → enable, then re-run installer."
+    else
+        warn "Could not verify token (network issue, invalid token, or all SOCKS tiers failed)."
+    fi
     printf "Continue with this token anyway? (y/N): "
     read -r CONT
     [ "$CONT" != "y" ] && [ "$CONT" != "Y" ] && die "Installation aborted."
 else
     BOT_NAME=$(echo "$TG_CHECK" | jq -r '.result.username // "unknown"' 2>/dev/null)
-    echo "OK — @${BOT_NAME}"
+    if [ -n "$_last_socks_route" ]; then
+        echo "OK — @${BOT_NAME} (via ${_last_socks_route})"
+    else
+        echo "OK — @${BOT_NAME}"
+    fi
 fi
 
 # ── Chat ID ───────────────────────────────────────────────────────────────────
