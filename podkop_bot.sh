@@ -453,6 +453,47 @@ _try_socks_tiers() {
     return 1
 }
 
+# _curl_via_best_socks: like curl but with automatic SOCKS fallover.
+# Tries direct first; if that fails — tier1, then each tier2_N in order.
+# Usage: _curl_via_best_socks <max_time> <extra_curl_args...>
+# Returns 0 and writes body to stdout on first success.
+_curl_via_best_socks() {
+    local _max="${1:-15}"; shift
+    local _args="$*"
+    local _ct=5
+    # Caller reads _last_fetch_route for user-facing display
+    _last_fetch_route=""
+
+    # 1. Direct
+    if curl -s --connect-timeout "$_ct" --max-time "$_max" $_args 2>/dev/null; then
+        _last_fetch_route="direct"
+        return 0
+    fi
+
+    # 2. tier1 — primary Podkop SOCKS
+    if [ -n "$_t_ip" ] && [ -n "$_t_port" ] && [ "$_t_policy" != "direct" ]; then
+        if curl -s --connect-timeout "$_ct" --max-time "$_max" \
+                -x "socks5h://${_t_ip}:${_t_port}" $_args 2>/dev/null; then
+            _last_fetch_route="Podkop SOCKS (${_t_ip}:${_t_port})"
+            logger -t podkop-bot "[GH fetch] via tier1 SOCKS ${_t_ip}:${_t_port}"
+            return 0
+        fi
+    fi
+
+    # 3. tier2_N — fallback_socks in order
+    local _fb
+    for _fb in $_t_fb_socks; do
+        if curl -s --connect-timeout "$_ct" --max-time "$_max" \
+                -x "${_fb}" $_args 2>/dev/null; then
+            _last_fetch_route="Fallback SOCKS (${_fb})"
+            logger -t podkop-bot "[GH fetch] via fallback SOCKS ${_fb}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # _try_all_tiers: full cascade including custom/direct/emergency.
 # Sets ROUTE_KEY and ROUTE_NAME on success.
 _try_all_tiers() {
@@ -6446,17 +6487,21 @@ EOF
             #   line 1: version number (e.g. 0.13.96)
             #   line 2: highlights, comma-separated (e.g. "Probe Outbound, DNS check, Gemini")
             local version_raw
-            version_raw=$(curl -s --connect-timeout 5 --max-time 8 \
-                "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" \
-                2>/dev/null)
+            version_raw=$(_curl_via_best_socks 8 \
+                "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt")
             remote_ver=$(printf '%s' "$version_raw" | head -1 | tr -d '\r\n\t ')
+            local _check_route="$_last_fetch_route"
             # highlights.txt is a separate file for forward/backward compatibility
             # Old versions (pre-0.13.96) used version.txt with tr -d '[:space:]' —
             # putting highlights in version.txt broke their update loop.
             local _hl_raw
-            _hl_raw=$(curl -s --connect-timeout 5 --max-time 8 \
+            _hl_raw=$(_curl_via_best_socks 8 \
                 "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/highlights.txt" \
-                2>/dev/null | head -1 | tr -d '\r')
+                | head -1 | tr -d '\r')
+            # Show route only when GitHub was reached via proxy (direct = normal, not noteworthy)
+            local _via_note=""
+            [ -n "$_check_route" ] && [ "$_check_route" != "direct" ] && \
+                _via_note=$(printf '\n<i>Fetched via %s</i>' "$(html_escape "$_check_route")")
             # Discard if response looks like HTML (404 page) or is empty
             case "$_hl_raw" in
                 ''|'<'*|'{'*) highlights="" ;;
@@ -6473,21 +6518,21 @@ EOF
 
             if [ "$remote_ver" = "$BOT_VERSION" ]; then
                 if [ -n "$highlights" ]; then
-                    text=$(printf '%s Bot is up to date: <b>v%s</b>\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>' \
-                        "$E_OK" "$BOT_VERSION" "$(html_escape "$highlights")" "$changelog_link")
+                    text=$(printf '%s Bot is up to date: <b>v%s</b>\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>%s' \
+                        "$E_OK" "$BOT_VERSION" "$(html_escape "$highlights")" "$changelog_link" "$_via_note")
                 else
-                    text=$(printf '%s Bot is up to date: <b>v%s</b>' "$E_OK" "$BOT_VERSION")
+                    text=$(printf '%s Bot is up to date: <b>v%s</b>%s' "$E_OK" "$BOT_VERSION" "$_via_note")
                 fi
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_force_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             else
                 if [ -n "$highlights" ]; then
-                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>' \
+                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<i>%s</i>\n\n<a href="%s">Full changelog</a>%s' \
                         "$E_NEW" "$BOT_VERSION" "$remote_ver" \
-                        "$(html_escape "$highlights")" "$changelog_link")
+                        "$(html_escape "$highlights")" "$changelog_link" "$_via_note")
                 else
-                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<a href="%s">Full changelog</a>' \
-                        "$E_NEW" "$BOT_VERSION" "$remote_ver" "$changelog_link")
+                    text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<a href="%s">Full changelog</a>%s' \
+                        "$E_NEW" "$BOT_VERSION" "$remote_ver" "$changelog_link" "$_via_note")
                 fi
                 kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
@@ -6515,7 +6560,7 @@ EOF
 
             send_or_edit "$mid" "$(printf '%s <b>Downloading bot v%s...</b>' "$E_TIME" "$target_ver")" ""
 
-            if ! curl -s --connect-timeout 5 --max-time 15 -o "$bot_tmp" "$bot_url" 2>/dev/null; then
+            if ! _curl_via_best_socks 30 -o "$bot_tmp" "$bot_url"; then
                 rm -f "$bot_tmp"
                 send_message "$(printf '%s Download failed. Check connectivity.' "$E_ERR")" "$kb_err"
                 return
@@ -6542,9 +6587,12 @@ EOF
 
             chmod +x "$bot_tmp"
 
+            local _dl_route_note=""
+            [ -n "$_last_fetch_route" ] && [ "$_last_fetch_route" != "direct" ] && \
+                _dl_route_note=$(printf ' <i>(via %s)</i>' "$(html_escape "$_last_fetch_route")")
             send_message \
-                "$(printf '%s <b>Bot updating to v%s</b>\nRestarting now — startup notification will confirm when back online.' \
-                    "$E_RST" "${new_ver:-$target_ver}")" ""
+                "$(printf '%s <b>Bot updating to v%s</b>%s\nRestarting now — startup notification will confirm when back online.' \
+                    "$E_RST" "${new_ver:-$target_ver}" "$_dl_route_note")" ""
 
             mv "$bot_tmp" "$BOT_PATH"
             logger -t podkop-bot "[Self-update] Updated to v${new_ver}. Restarting..."
