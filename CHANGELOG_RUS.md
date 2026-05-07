@@ -1,5 +1,23 @@
 # История изменений
 
+## v0.14.3
+
+- **NEW:** Runtime Info — добавлена строка `⏱ Session: Xh Xm` между блоком трафика и блоком прокси. Показывает время работы текущей сессии sing-box — контекст для цифр Downloaded/Uploaded. Источник тот же что в Tunnel Health: `RELOAD_TS_FILE`, fallback на `/proc/PID/stat`. Без дополнительных curl-запросов.
+- **UX:** Bot Settings — кнопка `👤 Admins` перенесена из отдельной строки в нижнюю строку рядом с `🏠 Menu`. Убирает визуальный разрыв между функциональными кнопками (Fallback SOCKS, Custom Proxy, Notify) и служебной навигацией.
+
+---
+
+## v0.14.2
+
+- **ИСПРАВЛЕНО:** `outbound_interface` — бот читал и писал `podkop.${sec}.outbound_interface` (поле в секции), которое podkop 0.7.x не читает. Реальные поля: `podkop.settings.output_network_interface` (глобальное) и `podkop.settings.enable_output_network_interface`. Исправлено во всех 5 местах: при сохранении выставляется `enable=1`, при сбросе — `enable=0`. Карточка и подсказка помечены `(global)`.
+- **ИСПРАВЛЕНО:** `connection_type=vpn` без заданного `interface` — podkop завершался с «VPN interface is not set. Aborted» при reload. Добавлен гард в `do_set_conn_vpn`: если `podkop.${sec}.interface` не задан, бот сохраняет тип в UCI, ставит `wait_vpn_iface` и **держит reload** до ввода имени интерфейса. Симметрично защите `url`-режима. Кнопка «Cancel — revert to Proxy» откатывает без reload.
+- **ИСПРАВЛЕНО:** Defense-in-depth при переключении режима прокси — `do_switch_mode_urltest` и `do_switch_mode_selector` теперь повторно проверяют список ссылок **на стадии выполнения** (не только на стадии ask). При пустом списке — «Refused» с контекстными кнопками, reload не выполняется, podkop не падает. Ранее пользователь мог проигнорировать предупреждение и вызвать fatal abort.
+- **ИСПРАВЛЕНО:** Сравнение версий podkop (`cmd_check_update`) — GitHub-теги вида `0.7.14-r1` не очищались от суффикса, `[ "14-r1" -gt "10" ]` давал «Illegal number», бот всегда показывал «Up to date» даже при устаревшей версии. Исправлено `| cut -d'-' -f1` для `latest`.
+- **ИСПРАВЛЕНО:** После клонирования URLTest→Selector при `_added=0` и `_skipped>0` — сообщение заменено на явное «already up to date» вместо «Cloned 0 links».
+- **ИСПРАВЛЕНО:** После смены режима прокси явно удаляются все три кэша перед `safe_reload_podkop` — устаревшие имена прокси больше не отображаются.
+
+---
+
 ## v0.14.1
 
 - **КРИТИЧЕСКИЙ ФИКС:** `eval "set -- $(uci_list_clean \"$var\")"` — все 33 вхождения этого паттерна заменены на двухшаговый `{ _ucl=$(uci_list_clean "$var"); eval "set -- $_ucl"; }`. Встроенная форма `$(...)` вызывала ошибку `sh: eval: Syntax error: Unterminated quoted string` в ash при любом UCI-списке, содержащем значения в одинарных кавычках (а все списки `*_proxy_links` именно так и выглядят). Сбой eval аварийно завершал весь subshell с кодом 2, что приводило к: (1) `build_tag_name_cache` не заполнялся → пустые имена прокси в Outbounds, алертах, уведомлении о запуске; (2) subshell `send_startup_notification_async` умирал до отправки уведомления; (3) добавление/удаление/подсчёт прокси молча падало в режиме URLTest.
