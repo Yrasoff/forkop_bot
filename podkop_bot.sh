@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.14.3
+# Podkop Telegram Bot v0.14.4
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -28,7 +28,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 BOT_DIR="/tmp/podkop_bot"
 mkdir -p "$BOT_DIR"
 
-BOT_VERSION="0.14.3"
+BOT_VERSION="0.14.4"
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -5312,8 +5312,8 @@ _handle_bot() {
                 _stop_start="{\"text\":\"${E_ON} Start Podkop\",\"callback_data\":\"cmd_start\"}"
 
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
+            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
             # Pass cached proxies to avoid extra clash_request
             local proxies; proxies=$(clash_request "/proxies")
             active_proxy=$(get_active_proxy_name "$proxies")
@@ -6280,8 +6280,8 @@ EOF
             send_or_edit "$mid" "$(printf '%s Collecting support bundle...' "$E_TIME")" ""
             local sec; sec=$(get_active_section)
             local hostname; hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            local p_ver; p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
+            local p_ver; p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
             local sb_ver; sb_ver=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
             {
                 echo "=== Podkop Support Bundle ==="
@@ -6399,8 +6399,8 @@ EOF
             local hostname lan_ip p_ver y_en sb_ver text kb
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             lan_ip=$(uci -q get network.lan.ipaddr || echo "Unknown")
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
+            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
             sb_ver=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
             y_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
             text=$(cat <<EOF
@@ -6421,14 +6421,22 @@ EOF
         "cmd_check_update")
             local p_ver latest text kb
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | cut -d'-' -f1)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | cut -d'-' -f1)
-            latest=$(curl -s --connect-timeout 5 --max-time 10 \
+            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+            latest=$(_curl_socks_fallover 10 \
                 "https://api.github.com/repos/itdoginfo/podkop/releases/latest" \
                 | jq -r '.tag_name' 2>/dev/null | sed 's/^v//' | cut -d'-' -f1)
             if [ -z "$latest" ] || [ "$latest" = "null" ]; then
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                return
+            fi
+            # If p_ver is empty (package manager returned nothing — unusual pkg name or not installed),
+            # treat as unknown: show latest and offer update rather than falsely claiming "up to date".
+            if [ -z "$p_ver" ]; then
+                text=$(printf '%s <b>Cannot detect installed podkop version.</b>\n\nLatest on GitHub: <b>%s</b>\n\n<i>opkg/apk returned no version info.</i>' "$E_WARN" "$latest")
+                send_or_edit "$mid" "$text" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Install/Update\",\"callback_data\":\"do_update_podkop\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]]}"
                 return
             fi
             # Compare versions without sort -V (not guaranteed on BusyBox).
@@ -6876,8 +6884,8 @@ send_startup_notification_async() {
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
                 logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-                p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//')
+                p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
                 active_proxy=$(get_active_proxy_display "")
                 tg_lat=$(get_tg_latency)
                 sec=$(get_active_section)
