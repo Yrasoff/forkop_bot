@@ -2,7 +2,9 @@
 
 ## v0.14.4
 
+- **FIXED:** `cmd_check_update` (Check Podkop Update) called `_curl_socks_fallover` which does not exist — the function was renamed to `_curl_via_best_socks` in v0.14.3. The undefined call returned empty output, `latest` was always empty, and the handler immediately exited with "❌ Cannot reach GitHub" without ever making a network request. Fixed by replacing the call with `_curl_via_best_socks`, consistent with every other GitHub fetch in the bot.
 - **FIXED:** `opkg` on some firmware builds returns version strings with a `v`-prefix (e.g. `v0.7.14-r1`). The pipeline stripped the `-r1` suffix via `cut -d'-' -f1` but left the `v`, producing `v0.7.14`. Arithmetic comparison of `v0` vs `0` triggered `sh: Illegal number`, `_upd` stayed 0, and the bot always reported "Up to date" regardless of actual version. Fixed by inserting `sed 's/^v//'` into both the `opkg` and `apk` pipelines. The same strip was already applied in `cmd_check_update` (introduced in v0.14.2) but was missing from the four other `p_ver` read sites: `_handle_status` (Status screen), `cmd_info` (Info screen), `cmd_diag` (Diagnostics export), and the startup notification. All five sites are now consistent.
+- **FIXED:** `cmd_check_update` called `_curl_socks_fallover` — a name that does not exist. The only curl wrapper is `_curl_via_best_socks` (introduced in v0.14.3). The call returned empty output immediately, `latest` was always empty, and the handler bailed with "❌ Cannot reach GitHub" before making any network request. **Root cause:** the task description for v0.14.4 contained the typo `_curl_socks_fallover` instead of `_curl_via_best_socks`; the code was written verbatim from that description. Fixed by correcting the function name to `_curl_via_best_socks`, consistent with `cmd_check_update_bot` and the self-update download (lines 6508, 6516, 6581).
 
 ## v0.14.3
 
