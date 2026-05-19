@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.14.4
+
+- **FIXED:** `opkg` on some firmware builds returns version strings with a `v`-prefix (e.g. `v0.7.14-r1`). The pipeline stripped the `-r1` suffix via `cut -d'-' -f1` but left the `v`, producing `v0.7.14`. Arithmetic comparison of `v0` vs `0` triggered `sh: Illegal number`, `_upd` stayed 0, and the bot always reported "Up to date" regardless of actual version. Fixed by inserting `sed 's/^v//'` into both the `opkg` and `apk` pipelines. The same strip was already applied in `cmd_check_update` (introduced in v0.14.2) but was missing from the four other `p_ver` read sites: `_handle_status` (Status screen), `cmd_info` (Info screen), `cmd_diag` (Diagnostics export), and the startup notification. All five sites are now consistent.
+
 ## v0.14.3
 
 - **NEW:** Runtime Info — added `⏱ Session: Xh Xm` line between traffic and proxy blocks. Shows current sing-box session uptime as context for Downloaded/Uploaded figures. Source: `RELOAD_TS_FILE`, fallback to `/proc/PID/stat`. No extra curl calls.
