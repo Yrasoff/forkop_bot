@@ -6423,7 +6423,7 @@ EOF
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
             p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
-            latest=$(_curl_socks_fallover 10 \
+            latest=$(_curl_via_best_socks 10 \
                 "https://api.github.com/repos/itdoginfo/podkop/releases/latest" \
                 | jq -r '.tag_name' 2>/dev/null | sed 's/^v//' | cut -d'-' -f1)
             if [ -z "$latest" ] || [ "$latest" = "null" ]; then
