@@ -1,1 +1,1 @@
-Fix: opkg/apk v-prefix broke version comparison (Illegal number) on all screens; _curl_socks_fallover typo caused "Cannot reach GitHub" on every podkop update check.
+Fix: opkg/apk v-prefix broke version comparison; _curl_socks_fallover typo → "Cannot reach GitHub"; do_update_podkop hung forever (wget direct + background exec + log never sent).
