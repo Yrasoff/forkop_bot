@@ -1,1 +1,1 @@
-Fix: opkg/apk v-prefix in version string broke update check across all screens (status, info, diag, startup); now stripped uniformly in all 5 read sites.
+Fix: opkg/apk v-prefix broke version comparison (Illegal number) on all screens; _curl_socks_fallover typo caused "Cannot reach GitHub" on every podkop update check.
