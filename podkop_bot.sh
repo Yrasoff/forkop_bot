@@ -6474,13 +6474,38 @@ EOF
             ;;
 
         "do_update_podkop")
+            local _upd_tmp="/tmp/podkop_update.sh"
+            local _upd_log="/tmp/podkop_update.log"
+            local _upd_url="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
             send_or_edit "$mid" "$(printf '%s Downloading update...' "$E_TIME")" ""
-            wget -qO /tmp/podkop_update.sh "https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
-            if grep -q "^#!" /tmp/podkop_update.sh; then
-                sh /tmp/podkop_update.sh >/tmp/podkop_update.log 2>&1 &
-            else
-                send_message "$(printf '%s Downloaded script is invalid.' "$E_ERR")" ""
+            rm -f "$_upd_tmp" "$_upd_log"
+            if ! _curl_via_best_socks 30 -o "$_upd_tmp" "$_upd_url"; then
+                send_or_edit "$mid" "$(printf '%s Cannot reach GitHub — install.sh not downloaded.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                return
             fi
+            if ! grep -q "^#!" "$_upd_tmp" 2>/dev/null; then
+                send_or_edit "$mid" "$(printf '%s Downloaded script is invalid (no shebang).' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                return
+            fi
+            send_or_edit "$mid" "$(printf '%s Installing podkop...\n\n<i>This may take up to 60 seconds.</i>' "$E_TIME")" ""
+            sh "$_upd_tmp" >"$_upd_log" 2>&1
+            local _exit=$?
+            # Tail of log — last 20 non-empty lines
+            local _log_tail; _log_tail=$(grep -v '^[[:space:]]*$' "$_upd_log" 2>/dev/null | tail -20)
+            if [ "$_exit" -eq 0 ]; then
+                local _new_ver; _new_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+                [ -z "$_new_ver" ] && _new_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+                send_or_edit "$mid" "$(printf '%s Podkop updated successfully.\n\n<b>Version:</b> %s\n\n<pre>%s</pre>' \
+                    "$E_OK" "${_new_ver:-unknown}" "$(html_escape "$_log_tail")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            else
+                send_or_edit "$mid" "$(printf '%s Installation failed (exit %s).\n\n<pre>%s</pre>' \
+                    "$E_ERR" "$_exit" "$(html_escape "$_log_tail")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+            fi
+            rm -f "$_upd_tmp" "$_upd_log"
             ;;
 
         # ------------------------------------------------------------------
