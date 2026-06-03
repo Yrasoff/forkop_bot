@@ -57,7 +57,7 @@
 
 ---
 
-##  **v0.15.0 - добавлен дектект и частичная поддержка функционала форков - Podkop Plus, Evolution. **
+## v0.15.0 - добавлен дектект и частичная поддержка функционала форков - Podkop Plus, Evolution. 
 
 - **НОВОЕ:** `_detect_podkop_variant()` — автодетект original/evolution/plus; устанавливает `PODKOP_VARIANT`, `PODKOP_UCI`, `PODKOP_BIN`, `PODKOP_INIT`, `PODKOP_PKG`, `PODKOP_GITHUB_REPO`, `PODKOP_DISPLAY_NAME`.
 - **НОВОЕ:** `set_section_action()` — пишет `action` (Plus) или `connection_type` (original/evolution); маппит `exclusion→direct` для Plus.
