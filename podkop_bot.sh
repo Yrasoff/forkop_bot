@@ -1,6 +1,9 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.14.4
+# Podkop Telegram Bot v0.15.2
+# Variant-aware (original / evolution / plus), OpenWrt/BusyBox ash.
+# ==============================================================================
+
 #
 # ARCHITECTURE OVERVIEW:
 # Stateless long-polling Telegram bot for OpenWrt routers managing the
@@ -28,7 +31,162 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 BOT_DIR="/tmp/podkop_bot"
 mkdir -p "$BOT_DIR"
 
-BOT_VERSION="0.14.4"
+BOT_VERSION="0.15.2"
+
+# ==============================================================================
+# PODKOP VARIANT AUTO-DETECTION
+# Must run before any UCI/binary access. Sets PODKOP_UCI, PODKOP_BIN, etc.
+# Three variants: original (itdoginfo/podkop), evolution (subscription support
+# via 'subscription_update' CLI), plus (podkop-plus binary, action= field).
+# NOTE: paths here are intentionally hardcoded — PODKOP_* vars not yet set.
+# ==============================================================================
+_detect_podkop_variant() {
+    if [ -f /usr/bin/podkop-plus ]; then
+        echo "plus"
+        return
+    fi
+    if [ -f /usr/bin/podkop ]; then
+        if grep -q "subscription_update" /usr/bin/podkop 2>/dev/null; then
+            echo "evolution"
+            return
+        fi
+    fi
+    echo "original"
+}
+
+PODKOP_VARIANT=$(_detect_podkop_variant)
+
+case "$PODKOP_VARIANT" in
+    plus)
+        PODKOP_UCI="podkop-plus"
+        PODKOP_BIN="/usr/bin/podkop-plus"
+        PODKOP_INIT="/etc/init.d/podkop-plus"
+        PODKOP_PKG="podkop-plus"
+        PODKOP_GITHUB_REPO="ushan0v/podkop-plus"
+        PODKOP_DISPLAY_NAME="Podkop Plus"
+        ;;
+    evolution)
+        PODKOP_UCI="podkop"
+        PODKOP_BIN="/usr/bin/podkop"
+        PODKOP_INIT="/etc/init.d/podkop"
+        PODKOP_PKG="podkop"
+        PODKOP_GITHUB_REPO="yandexru45/podkop-evolution"
+        PODKOP_DISPLAY_NAME="Podkop Evolution"
+        ;;
+    *)
+        PODKOP_UCI="podkop"
+        PODKOP_BIN="/usr/bin/podkop"
+        PODKOP_INIT="/etc/init.d/podkop"
+        PODKOP_PKG="podkop"
+        PODKOP_GITHUB_REPO="itdoginfo/podkop"
+        PODKOP_DISPLAY_NAME="Podkop"
+        ;;
+esac
+
+# Helper: does this variant support subscriptions?
+_variant_has_subscription() {
+    case "$PODKOP_VARIANT" in
+        plus|evolution) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# _plus_has_cmd: check if podkop-plus CLI supports a given command.
+# show_help is incomplete (get_outbound_link_states, close_all_connections absent),
+# so we grep the CLI dispatcher directly — commands appear as "    <cmd>)" lines.
+# Falls back to show_help output for stripped/old builds.
+_plus_has_cmd() {
+    [ "$PODKOP_VARIANT" = "plus" ] || return 1
+    if [ -r "$PODKOP_BIN" ] &&        grep -qE "^[[:space:]]*${1}\)" "$PODKOP_BIN" 2>/dev/null; then
+        return 0
+    fi
+    ${PODKOP_BIN} 2>&1 | grep -qF "$1"
+}
+
+# _plus_json: call a podkop-plus CLI command, return JSON via stdout.
+# Returns empty + non-zero if not Plus or command unavailable.
+_plus_json() {
+    local _cmd="$1"; shift
+    [ "$PODKOP_VARIANT" = "plus" ] || return 1
+    _plus_has_cmd "$_cmd" || return 1
+    ${PODKOP_BIN} "$_cmd" "$@" 2>/dev/null
+}
+
+# _plus_format_sub_meta: format subscription metadata JSON to human-readable string.
+# Input: JSON array from get_subscription_metadata <section>
+# Output: "3.2/50 GB · exp 15.07.2025" or empty if no traffic data.
+_plus_format_sub_meta() {
+    # Schema: [{"traffic":{"used":N,"total":N,"isUnlimited":bool},"expire":epoch}, ...]
+    local _json="$1"
+    [ -z "$_json" ] || [ "$_json" = "{}" ] || [ "$_json" = "[]" ] && return 0
+    local _used _total _unlimited _expire _used_gb _total_gb _expire_str
+    # Check traffic object exists
+    _used=$(printf '%s' "$_json" | jq -r '.[0].traffic.used // null' 2>/dev/null)
+    [ -z "$_used" ] || [ "$_used" = "null" ] && return 0
+    _total=$(printf '%s' "$_json" | jq -r '.[0].traffic.total // null' 2>/dev/null)
+    _unlimited=$(printf '%s' "$_json" | jq -r '.[0].traffic.isUnlimited // false' 2>/dev/null)
+    _expire=$(printf '%s' "$_json" | jq -r '.[0].expire // null' 2>/dev/null)
+    _used_gb=$(awk "BEGIN{printf \"%.1f\", ${_used:-0}/1073741824}")
+    if [ "$_unlimited" = "true" ]; then
+        printf '%s GB / ∞' "$_used_gb"
+    elif [ -n "$_total" ] && [ "$_total" != "null" ] && [ "$_total" != "0" ]; then
+        _total_gb=$(awk "BEGIN{printf \"%.1f\", ${_total}/1073741824}")
+        printf '%s/%s GB' "$_used_gb" "$_total_gb"
+    else
+        printf '%s GB used' "$_used_gb"
+    fi
+    if [ -n "$_expire" ] && [ "$_expire" != "null" ] && [ "$_expire" != "0" ]; then
+        _expire_str=$(date -d "@${_expire}" "+%d.%m.%Y" 2>/dev/null ||             awk -v ts="$_expire" 'BEGIN{print strftime("%d.%m.%Y",ts)}')
+        [ -n "$_expire_str" ] && printf ' · exp %s' "$_expire_str"
+    fi
+}
+
+# _utf_postcheck_warn: post-apply check for urltest filter wiping all servers.
+# Returns warning string (with leading \n\n) if URLTest group is now empty,
+# empty string if OK. Uses Clash /proxies after reload — counts real survivors.
+_utf_postcheck_warn() {
+    local _sec="$1" _mode _proxies _grp _alive
+    _mode=$(uci -q get ${PODKOP_UCI}.${_sec}.urltest_filter_mode 2>/dev/null || echo "disabled")
+    [ "$_mode" = "disabled" ] && return 0
+    _proxies=$(clash_request "/proxies" 2>/dev/null)
+    [ -z "$_proxies" ] && return 0
+    # Resolve URLTest group OF THIS SECTION — not first selector globally.
+    # Mirrors get_selector_tag: exact key → "<sec>-out" → startswith match.
+    _grp=$(printf '%s' "$_proxies" | jq -r --arg s "$_sec" '
+        (if .proxies[$s] then $s
+         elif .proxies[$s + "-out"] then ($s + "-out")
+         else (.proxies | to_entries
+               | map(select(
+                   (.value.type == "Selector" or .value.type == "URLTest")
+                   and (.key | startswith($s))))
+               | sort_by(.value.all | length) | last | .key)
+         end) as $selkey
+        | if $selkey == null then empty
+          elif (.proxies[$selkey].type == "URLTest") then $selkey
+          else (.proxies[$selkey].all[]?
+                | select(.proxies[.].type == "URLTest"))
+          end' 2>/dev/null | head -1)
+    [ -z "$_grp" ] && return 0
+    _alive=$(printf '%s' "$_proxies" | jq -r --arg g "$_grp"         '[.proxies[$g].all[]?] | length' 2>/dev/null)
+    case "$_alive" in ''|*[!0-9]*) _alive=0 ;; esac
+    [ "$_alive" -eq 0 ] && printf '\n\n%s <b>Warning:</b> the urltest filter removed all servers — this section has no outbound. Remove or adjust the filter.' "$E_WARN"
+    return 0
+}
+
+# set_section_action: variant-aware write of the connection/action field.
+# Plus uses `action` (proxy|outbound|vpn|byedpi|zapret|direct|block).
+# original/evolution use `connection_type` (proxy|vpn|block|exclusion).
+# Maps bot UI vocabulary onto whatever the installed variant expects.
+set_section_action() {
+    local _sec="$1" _val="$2"
+    if [ "$PODKOP_VARIANT" = "plus" ]; then
+        # Plus has no `exclusion` action; equivalent is `direct`.
+        [ "$_val" = "exclusion" ] && _val="direct"
+        uci set ${PODKOP_UCI}.${_sec}.action="$_val"
+    else
+        uci set ${PODKOP_UCI}.${_sec}.connection_type="$_val"
+    fi
+}
 # Path to this script — used by self-update (mv + exec/restart).
 # Resolved at startup: follows symlinks, falls back to hardcoded installer path.
 BOT_PATH=$(readlink -f "$0" 2>/dev/null || echo "/usr/bin/podkop_bot")
@@ -63,6 +221,7 @@ UCI_LINKS_CACHE="${BOT_DIR}/uci_links_cache.txt"
 TAG_NAME_CACHE="${BOT_DIR}/tag_name_cache.txt"
 ACTIVE_SECTION_FILE="${BOT_DIR}/active_section"
 RELOAD_TS_FILE="${BOT_DIR}/last_reload_ts"
+REPLY_KB_INSTALLED_FILE="${BOT_DIR}/reply_kb_installed"
 
 # Community lists: GitHub API cache with 1h TTL (60 req/hr rate limit protection)
 COMMUNITY_LISTS_FALLBACK="anime block cloudflare cloudfront digitalocean discord geoblock google_ai google_meet google_play hdrezka hetzner hodca meta news ovh porn roblox russia_inside russia_outside telegram tiktok twitter ukraine_inside youtube"
@@ -87,6 +246,10 @@ fi
 
 API_URL="https://api.telegram.org/bot${TOKEN}"
 TG_EMERGENCY_IPS="149.154.167.220 149.154.166.110 91.108.4.249"
+# Seed IPs above used as fallback if DoH discovery fails.
+# _EMERGENCY_IPS_LAST_REFRESH: epoch of last successful DoH refresh (0 = never)
+_EMERGENCY_IPS_LAST_REFRESH=0
+_EMERGENCY_IPS_REFRESH_INTERVAL=21600  # 6 hours
 
 OFFSET_FILE="${BOT_DIR}/offset"
 STATE_FILE="${BOT_DIR}/state"
@@ -200,6 +363,174 @@ HEALTH_PID=""
 CB_ANSWER_TEXT=""
 
 # ==============================================================================
+# SECTION 0.5: Podkop Abstraction Helpers
+# Variant-aware helpers that replace hardcoded UCI/binary calls.
+# All functions depend on PODKOP_VARIANT / PODKOP_UCI set at startup.
+# ==============================================================================
+
+# get_section_type: returns section type accounting for variant differences.
+# Plus uses 'action' field; original/evolution use 'connection_type'.
+# For proxy sections, appends proxy_config_type as subtype: "proxy:selector",
+# "proxy:urltest", "proxy:url", "proxy:subscription".
+get_section_type() {
+    local sec="$1"
+    local ct
+    if [ "$PODKOP_VARIANT" = "plus" ]; then
+        ct=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null)
+        [ -z "$ct" ] && ct="proxy"
+        if [ "$ct" = "proxy" ]; then
+            # Plus uses flags instead of proxy_config_type:
+            #   urltest_enabled=1  → proxy:urltest  (may also have subscription)
+            #   subscription_urls present → proxy:subscription
+            #   otherwise → proxy:selector
+            local _ut _sub
+            _ut=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_enabled 2>/dev/null)
+            _sub=$(uci -q show ${PODKOP_UCI}.${sec}.subscription_urls 2>/dev/null | grep -c "=")
+            if [ "$_ut" = "1" ]; then
+                printf 'proxy:urltest'
+            elif [ "${_sub:-0}" -gt 0 ]; then
+                printf 'proxy:subscription'
+            else
+                printf 'proxy:selector'
+            fi
+            return
+        fi
+        printf '%s' "$ct"
+        return
+    fi
+    # original / evolution: use connection_type + proxy_config_type
+    ct=$(uci -q get ${PODKOP_UCI}.${sec}.connection_type 2>/dev/null)
+    ct="${ct:-proxy}"
+    if [ "$ct" = "proxy" ]; then
+        local pct
+        pct=$(uci -q get ${PODKOP_UCI}.${sec}.proxy_config_type 2>/dev/null)
+        printf 'proxy:%s' "${pct:-selector}"
+        return
+    fi
+    printf '%s' "$ct"
+}
+
+# Convenience predicates
+section_is_proxy()        { case "$(get_section_type "$1")" in proxy:*) return 0;; esac; return 1; }
+# section_is_subscription: true when section is managed via subscription URL(s).
+# In plus, urltest+subscription coexist — check subscription_urls directly.
+section_is_subscription() {
+    _variant_has_subscription || return 1
+    if [ "$PODKOP_VARIANT" = "plus" ]; then
+        # uci -q get on a list field may return empty on BusyBox ash;
+        # use uci show which reliably lists all entries
+        uci -q show ${PODKOP_UCI}.${1}.subscription_urls 2>/dev/null | grep -q "=" && return 0
+        return 1
+    fi
+    [ "$(get_section_type "$1")" = "proxy:subscription" ]
+}
+# section_has_links: true when proxy links are manually managed (not subscription)
+section_has_links() {
+    section_is_subscription "$1" && return 1
+    section_is_proxy "$1"
+}
+
+# Icon for section type in list views
+_section_type_icon() {
+    local stype; stype=$(get_section_type "$1")
+    case "$stype" in
+        proxy:subscription) printf '📡' ;;
+        proxy:urltest)      printf '⚡' ;;
+        proxy:selector)     printf '🔗' ;;
+        proxy:url)          printf '🔗' ;;
+        vpn)                printf '🌐' ;;
+        outbound)           printf '📤' ;;
+        byedpi)             printf '🛡' ;;
+        zapret)             printf '🛡' ;;
+        block)              printf '🚫' ;;
+        exclusion)          printf '↪'  ;;
+        *)                  printf '⚙'  ;;
+    esac
+}
+
+# _get_wan_interface: returns WAN interface name for SO_BINDTODEVICE.
+# Used by direct Telegram/GitHub checks to bypass fakeip/tproxy routing.
+_get_wan_interface() {
+    local _if
+    _if=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    [ -z "$_if" ] && _if=$(uci -q get network.wan.ifname 2>/dev/null || \
+                           uci -q get network.wan.device 2>/dev/null)
+    printf '%s' "${_if:-}"
+}
+
+# get_singbox_version_display: returns full sing-box version string (e.g. "1.13.11-extended")
+get_singbox_version_display() {
+    local ver; ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $NF}')
+    printf '%s' "${ver:-unknown}"
+}
+
+# is_singbox_extended: returns 0 if running sing-box-extended build
+is_singbox_extended() {
+    get_singbox_version_display | grep -q "extended"
+}
+
+# reply_keyboard_main: persistent bottom navigation keyboard JSON
+reply_keyboard_main() {
+    printf '{"keyboard":[[{"text":"\xf0\x9f\x8f\xa0 Menu"},{"text":"\xf0\x9f\x93\x8a Status"}]],"resize_keyboard":true,"one_time_keyboard":false}'
+}
+
+# install_reply_keyboard: send the bottom navigation keyboard to admin chat
+install_reply_keyboard() {
+    local _payload
+    _payload=$(jq -n -c         --arg cid "$TARGET_CHAT_ID"         --arg txt "$(printf '%s Navigation ready.' "$E_OK")"         --argjson kb "$(reply_keyboard_main)"         '{chat_id:$cid,text:$txt,parse_mode:"HTML",reply_markup:$kb}')
+    api_request "sendMessage" "$_payload" >/dev/null
+}
+
+# install_reply_keyboard_once: install only if not already installed this session
+install_reply_keyboard_once() {
+    [ -f "$REPLY_KB_INSTALLED_FILE" ] && return 0
+    install_reply_keyboard
+    date +%s > "$REPLY_KB_INSTALLED_FILE"
+}
+
+# normalize_reply_button: map persistent keyboard button text to command
+normalize_reply_button() {
+    case "$1" in
+        "🏠 Menu"|"Menu"|"Меню")       printf '/menu' ;;
+        "📊 Status"|"Status"|"Статус") printf 'cmd_status' ;;
+        *)                              printf '%s' "$1" ;;
+    esac
+}
+
+# format_age: convert timestamp to human-readable "Ns ago" / "Nm ago" / "Nh Nm ago"
+# Returns "unknown" if timestamp is 0 or empty.
+# Appends " ⚠ stale" if older than $2 seconds (default: 300).
+format_age() {
+    local ts="$1" stale_thresh="${2:-300}"
+    [ -z "$ts" ] || [ "$ts" = "0" ] && { printf 'unknown'; return; }
+    local now diff
+    now=$(date +%s)
+    diff=$((now - ts))
+    local age_str
+    if   [ "$diff" -lt 60 ];   then age_str="${diff}s ago"
+    elif [ "$diff" -lt 3600 ]; then age_str="$((diff/60))m ago"
+    else age_str="$((diff/3600))h $((diff%3600/60))m ago"; fi
+    if [ "$diff" -gt "$stale_thresh" ]; then
+        printf '%s ⚠ stale' "$age_str"
+    else
+        printf '%s' "$age_str"
+    fi
+}
+
+# _status_severity: returns "ok"|"warn"|"degraded"|"fail" based on service state.
+# Args: $1=podkop_running(0/1) $2=sb_running(0/1) $3=tg_transport(ok/fail/?)
+#       $4=socks(up/down/?) $5=LAST_ROUTE(tier1/tier2_N/tier4/tier5/...)
+_status_severity() {
+    # $1=podkop_running $2=sb_running $3=tg_transport $4=socks $5=LAST_ROUTE
+    # socks=down triggers degraded; socks=unknown (no data) does NOT
+    local pk="$1" sb="$2" tgt="$3" socks="$4"
+    if   [ "$pk" = "0" ] || [ "$sb" = "0" ]; then echo "fail"
+    elif [ "$socks" = "down" ]; then echo "degraded"
+    elif [ "$tgt" = "fail" ];   then echo "warn"
+    else echo "ok"; fi
+}
+
+# ==============================================================================
 # SECTION 1: Input Validation & Escaping Helpers
 # ==============================================================================
 
@@ -306,9 +637,15 @@ url_decode() {
 get_proxy_ip() {
     local m_port sb_ip lan_ip sec
     sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
+    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
     if [ -f "/etc/sing-box/config.json" ]; then
         sb_ip=$(jq -r --arg p "$m_port" \
+            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
+             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
+             .listen // empty' \
+            /etc/sing-box/config.json 2>/dev/null | head -n 1)
+        # Fallback: match any inbound on that port regardless of type
+        [ -z "$sb_ip" ] && sb_ip=$(jq -r --arg p "$m_port" \
             '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
             /etc/sing-box/config.json 2>/dev/null | head -n 1)
         if [ -n "$sb_ip" ]; then
@@ -341,20 +678,20 @@ _try_curl() {
     return 1
 }
 
-# _resolve_primary_section: find first podkop section with connection_type=proxy
-# and mixed_proxy_enabled=1. This is the section whose mixed_proxy the bot uses
-# as tier1 transport to Telegram — independent of active UI section.
+# _resolve_primary_section: find first podkop section with proxy type
+# and mixed_proxy_enabled=1. Uses get_section_type() for variant compat.
+# (Plus uses 'action', original/evolution use 'connection_type'.)
 # Returns section name via stdout; falls back to active section then "main".
 _resolve_primary_section() {
-    local _s _ct _me _sec=""
+    local _s _me _sec=""
     local _all
-    _all=$(uci -q show podkop 2>/dev/null \
-        | grep -E '^podkop\.[^.=]+=section$' \
-        | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+    _all=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+        | grep -E '^[^.]+\.[^.=]+=section$' \
+        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
     for _s in $_all; do
-        _ct=$(uci -q get podkop.${_s}.connection_type 2>/dev/null || echo "proxy")
-        _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
-        if [ "$_ct" = "proxy" ] && [ "$_me" = "1" ]; then
+        section_is_proxy "$_s" || continue
+        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "1")
+        if [ "$_me" = "1" ]; then
             _sec="$_s"; break
         fi
     done
@@ -375,17 +712,22 @@ _load_transport_ctx() {
     # Find primary section via shared helper
     local _primary_sec; _primary_sec=$(_resolve_primary_section)
     local _all_secs
-    _all_secs=$(uci -q show podkop 2>/dev/null \
-        | grep -E '^podkop\.[^.=]+=section$' \
-        | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+    _all_secs=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+        | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
+        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
 
     _t_sec="$_primary_sec"
-    _t_port=$(uci -q get podkop."${_t_sec}".mixed_proxy_port || echo "2080")
+    _t_port=$(uci -q get ${PODKOP_UCI}."${_t_sec}".mixed_proxy_port || echo "2080")
     _t_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
     # Resolve actual listen IP from config.json for tier1
     if [ -f "/etc/sing-box/config.json" ]; then
         local _sb_ip
         _sb_ip=$(jq -r --arg p "$_t_port" \
+            '.inbounds[]? | select(.listen_port==($p|tonumber)) |
+             select(.type=="mixed" or .type=="socks" or .type=="socks5") |
+             .listen // empty' \
+            /etc/sing-box/config.json 2>/dev/null | head -1)
+        [ -z "$_sb_ip" ] && _sb_ip=$(jq -r --arg p "$_t_port" \
             '.inbounds[]? | select(.listen_port==($p|tonumber)) | .listen // empty' \
             /etc/sing-box/config.json 2>/dev/null | head -1)
         if [ -n "$_sb_ip" ]; then
@@ -413,8 +755,8 @@ _load_transport_ctx() {
     for _s in $_all_secs; do
         [ "$_s" = "$_t_sec" ] && continue  # skip primary, already tier1
         local _me _mp _ct
-        _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
-        _mp=$(uci -q get podkop.${_s}.mixed_proxy_port 2>/dev/null || echo "")
+        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
+        _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
         [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_t_port" ] || continue
         local _auto_fb="socks5h://${_lan_ip}:${_mp}"
         # Only add if not already in explicit fallback list — match by IP:PORT to
@@ -464,8 +806,9 @@ _curl_via_best_socks() {
     # Caller reads _last_fetch_route for user-facing display
     _last_fetch_route=""
 
-    # 1. Direct
-    if curl -s --connect-timeout "$_ct" --max-time "$_max" $_args 2>/dev/null; then
+    # 1. Direct (force IPv4: podkop's DNS redirect stalls AAAA, so without -4
+    #    this leg burns the whole --max-time on every fetch before SOCKS fallover)
+    if curl -4 -s --connect-timeout "$_ct" --max-time "$_max" $_args 2>/dev/null; then
         _last_fetch_route="direct"
         return 0
     fi
@@ -494,6 +837,180 @@ _curl_via_best_socks() {
     return 1
 }
 
+# ──────────────────────────────────────────────────────────────────────────
+# Package-manager DNS workaround.
+#
+# podkop redirects the system resolver to sing-box (dnsmasq server=127.0.0.42),
+# where the router's own AAAA lookups stall — so opkg/apk and the podkop
+# install.sh (all musl getaddrinfo) time out resolving downloads.openwrt.org /
+# raw.githubusercontent.com even though direct egress works. The bot can't pass
+# -4 to opkg/apk, so for the duration of an install we point the ROUTER's own
+# /etc/resolv.conf at public IPv4 DNS. This affects only router-originated
+# resolution; LAN clients keep using dnsmasq (127.0.0.1:53), untouched. State is
+# saved and always restored. Validated safe on this setup: `nft … dport 53`
+# showed no :53 redirect and `nslookup … 1.1.1.1` resolves instantly.
+_RESOLV_STATE="/tmp/podkop_resolv_state.$$"
+
+_resolv_v4_override() {
+    rm -f "$_RESOLV_STATE" "${_RESOLV_STATE}.bak"
+    if [ -L /etc/resolv.conf ]; then
+        # Preserve the symlink target; do NOT write through it (leaves the
+        # target file, e.g. /tmp/resolv.conf, untouched).
+        printf 'link %s\n' "$(readlink /etc/resolv.conf)" > "$_RESOLV_STATE"
+    else
+        printf 'file\n' > "$_RESOLV_STATE"
+        cp /etc/resolv.conf "${_RESOLV_STATE}.bak" 2>/dev/null || : > "${_RESOLV_STATE}.bak"
+    fi
+    rm -f /etc/resolv.conf
+    printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+}
+
+_resolv_v4_restore() {
+    [ -f "$_RESOLV_STATE" ] || return 0
+    local _kind _val
+    read -r _kind _val < "$_RESOLV_STATE"
+    rm -f /etc/resolv.conf
+    if [ "$_kind" = "link" ] && [ -n "$_val" ]; then
+        ln -s "$_val" /etc/resolv.conf
+    else
+        cp "${_RESOLV_STATE}.bak" /etc/resolv.conf 2>/dev/null || : > /etc/resolv.conf
+    fi
+    rm -f "$_RESOLV_STATE" "${_RESOLV_STATE}.bak"
+}
+
+# _pkg_net_check: the "проверятор". Verify (over forced IPv4) that the hosts an
+# install needs are reachable: OpenWrt package feed + GitHub raw. Echoes a short
+# human-readable verdict; returns 0 if both reachable, 1 otherwise.
+_pkg_net_check() {
+    local _feed_rc _gh_rc
+    curl -4 -sf -o /dev/null --connect-timeout 5 --max-time 8 \
+        "https://downloads.openwrt.org/" 2>/dev/null; _feed_rc=$?
+    curl -4 -sf -o /dev/null --connect-timeout 5 --max-time 8 \
+        "https://raw.githubusercontent.com/" 2>/dev/null; _gh_rc=$?
+    if [ "$_feed_rc" = "0" ] && [ "$_gh_rc" = "0" ]; then
+        printf 'ok'; return 0
+    fi
+    local _msg="blocked:"
+    [ "$_feed_rc" != "0" ] && _msg="${_msg} openwrt-feed"
+    [ "$_gh_rc"   != "0" ] && _msg="${_msg} github-raw"
+    printf '%s' "$_msg"; return 1
+}
+
+
+# Writes results into variables: _ghc_api_direct, _ghc_api_socks, _ghc_raw_direct,
+# _ghc_raw_socks — each is "ok:<ms>" or "fail" or "timeout".
+# Uses WAN interface for direct probes to bypass fakeip routing.
+run_github_health_check() {
+    # Single curl per probe with -w '%{http_code} %{time_total}'.
+    # Avoids date +%s%3N — BusyBox returns seconds only, giving always 0ms.
+    local _wan_if _if_flag _out _code _tt
+    _wan_if=$(_get_wan_interface)
+    [ -n "$_wan_if" ] && _if_flag="--interface $_wan_if" || _if_flag=""
+
+    _ghc_api_direct="fail"; _ghc_api_socks="fail"
+    _ghc_raw_direct="fail"; _ghc_raw_socks="fail"
+
+    local _api_url="https://api.github.com/repos/${PODKOP_GITHUB_REPO}/releases/latest"
+    local _raw_url="https://raw.githubusercontent.com/${PODKOP_GITHUB_REPO}/refs/heads/main/install.sh"
+    _ghc_ms() { awk -v t="${1:-0}" 'BEGIN{printf "%dms", t*1000}'; }
+
+    # api.github.com — direct
+    _out=$(curl -4 -s -o /dev/null --connect-timeout 5 --max-time 6 \
+        $_if_flag --noproxy '*' -w '%{http_code} %{time_total}' "$_api_url" 2>/dev/null)
+    _code=${_out%% *}; _tt=${_out##* }
+    case "$_code" in 2*|3*) _ghc_api_direct="ok:$(_ghc_ms "$_tt")" ;;
+                     "")    _ghc_api_direct="timeout" ;; esac
+
+    # api.github.com — via SOCKS
+    if [ -n "$_t_ip" ] && [ -n "$_t_port" ]; then
+        _out=$(curl -s -o /dev/null --connect-timeout 6 --max-time 10 \
+            -x "socks5h://${_t_ip}:${_t_port}" -w '%{http_code} %{time_total}' "$_api_url" 2>/dev/null)
+        _code=${_out%% *}; _tt=${_out##* }
+        case "$_code" in 2*|3*) _ghc_api_socks="ok:$(_ghc_ms "$_tt")" ;;
+                         "")    _ghc_api_socks="timeout" ;; esac
+    else
+        _ghc_api_socks="no-socks"
+    fi
+
+    # raw.githubusercontent.com — direct
+    _out=$(curl -4 -s -o /dev/null --connect-timeout 5 --max-time 6 \
+        $_if_flag --noproxy '*' -w '%{http_code} %{time_total}' "$_raw_url" 2>/dev/null)
+    _code=${_out%% *}; _tt=${_out##* }
+    case "$_code" in 2*|3*) _ghc_raw_direct="ok:$(_ghc_ms "$_tt")" ;;
+                     "")    _ghc_raw_direct="timeout" ;; esac
+
+    # raw.githubusercontent.com — via SOCKS
+    if [ -n "$_t_ip" ] && [ -n "$_t_port" ]; then
+        _out=$(curl -s -o /dev/null --connect-timeout 6 --max-time 10 \
+            -x "socks5h://${_t_ip}:${_t_port}" -w '%{http_code} %{time_total}' "$_raw_url" 2>/dev/null)
+        _code=${_out%% *}; _tt=${_out##* }
+        case "$_code" in 2*|3*) _ghc_raw_socks="ok:$(_ghc_ms "$_tt")" ;;
+                         "")    _ghc_raw_socks="timeout" ;; esac
+    else
+        _ghc_raw_socks="no-socks"
+    fi
+}
+
+# _ghc_icon: convert ok:<ms>/fail/timeout/no-socks to emoji + label
+_ghc_icon() {
+    case "$1" in
+        ok:*)     printf '%s %s' "$E_OK"  "${1#ok:}" ;;
+        no-socks) printf '%s' "${E_OFF} no SOCKS" ;;
+        timeout)  printf '%s' "${E_YLW} timeout" ;;
+        *)        printf '%s' "${E_ERR} unreachable" ;;
+    esac
+}
+
+# _in_tg_range: check if IP belongs to known Telegram CIDR prefixes (AS62041).
+# Uses glob-based range matching — no full CIDR arithmetic needed in ash.
+# Telegram prefixes: 91.105.192/23, 91.108.4/22, 91.108.8/22, 91.108.12/22,
+#   91.108.16/22, 91.108.20/22, 91.108.56/22, 95.161.64/20,
+#   149.154.160/20, 185.76.151/24
+_in_tg_range() {
+    case "$1" in
+        91.105.192.*|91.105.193.*)                      return 0 ;;
+        91.108.[4-7].*|91.108.[89].*|91.108.1[0-9].*|91.108.2[0-3].*) return 0 ;;
+        91.108.5[6-9].*|91.108.6[0-3].*)               return 0 ;;
+        95.161.6[4-9].*|95.161.7[0-9].*) return 0 ;;
+        149.154.16[0-9].*|149.154.17[0-5].*)            return 0 ;;
+        185.76.151.*)                                   return 0 ;;
+    esac
+    return 1
+}
+
+# resolve_tg_emergency_ips: resolve api.telegram.org via multiple DoH providers
+# in parallel, validate IPs against Telegram CIDR ranges (anti-poisoning).
+# Returns space-separated IP list via stdout, or empty on failure.
+# Uses --interface WAN + --noproxy to bypass fakeip routing.
+resolve_tg_emergency_ips() {
+    local _wan_if _if_flag _tmpdir _pids=""
+    _wan_if=$(_get_wan_interface)
+    [ -n "$_wan_if" ] && _if_flag="--interface $_wan_if" || _if_flag=""
+    _tmpdir=$(mktemp -d /tmp/tg_doh.XXXXXX 2>/dev/null) || return 1
+
+    # Query three DoH providers in parallel
+    local _host="api.telegram.org"
+    for _doh in         "https://1.1.1.1/dns-query?name=${_host}&type=A"         "https://8.8.8.8/resolve?name=${_host}&type=A"         "https://dns.quad9.net/dns-query?name=${_host}&type=A"; do
+        local _tag; _tag=$(printf '%s' "$_doh" | cut -d/ -f3 | tr '.' '_')
+        ( curl -sf --connect-timeout 4 --max-time 6             $_if_flag --noproxy '*'             -H 'accept: application/dns-json'             "$_doh" 2>/dev/null             | jq -r '.Answer[]? | select(.type==1) | .data' 2>/dev/null             > "${_tmpdir}/${_tag}" ) &
+        _pids="$_pids $!"
+    done
+    wait $_pids 2>/dev/null || true
+
+    # Collect unique IPs that pass range validation
+    local _out="" _ip
+    for _f in "${_tmpdir}"/*; do
+        [ -f "$_f" ] || continue
+        while IFS= read -r _ip; do
+            [ -z "$_ip" ] && continue
+            _in_tg_range "$_ip" || continue
+            case " $_out " in *" $_ip "*) ;; *) _out="$_out $_ip" ;; esac
+        done < "$_f"
+    done
+    rm -rf "$_tmpdir" 2>/dev/null || true
+    printf '%s' "${_out# }"
+}
+
 # _try_all_tiers: full cascade including custom/direct/emergency.
 # Sets ROUTE_KEY and ROUTE_NAME on success.
 _try_all_tiers() {
@@ -517,7 +1034,16 @@ _try_all_tiers() {
             ROUTE_NAME="Direct${_t_biface:+ via $_t_biface}"
             return 0
         fi
-        # tier5: emergency IPs
+        # tier5: emergency IPs — try DoH refresh if IPs may be stale
+        local _now5; _now5=$(date +%s)
+        if [ $((_now5 - _EMERGENCY_IPS_LAST_REFRESH)) -ge "$_EMERGENCY_IPS_REFRESH_INTERVAL" ]; then
+            local _fresh5; _fresh5=$(resolve_tg_emergency_ips)
+            if [ -n "$_fresh5" ]; then
+                TG_EMERGENCY_IPS="$_fresh5"
+                _EMERGENCY_IPS_LAST_REFRESH=$_now5
+                logger -t podkop-bot "[Transport] Emergency IPs refreshed on tier5 entry: ${_fresh5}"
+            fi
+        fi
         local _eip
         for _eip in $TG_EMERGENCY_IPS; do
             if _try_curl "$_t_ifflag --resolve api.telegram.org:443:${_eip}" "$max_time" "$args" "5"; then
@@ -1139,7 +1665,7 @@ delete_message() {
 clash_request() {
     local endpoint="$1" method="${2:-GET}" data="$3"
     local secret tmp_body
-    secret=$(uci -q get podkop.settings.yacd_secret_key)
+    secret=$(uci -q get ${PODKOP_UCI}.settings.yacd_secret_key)
     if [ "$method" = "GET" ]; then
         if [ -n "$secret" ]; then
             curl -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${secret}" "${CLASH_API}${endpoint}"
@@ -1235,18 +1761,25 @@ refresh_public_ip_cache() {
     f2=$(mktemp /tmp/podkop_ip2.XXXXXX 2>/dev/null) || { rm -f "$f1"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
     f3=$(mktemp /tmp/podkop_ip3.XXXXXX 2>/dev/null) || { rm -f "$f1" "$f2"; rm -rf "$PUBIP_REFRESH_LOCK"; return 1; }
 
+    # IMPORTANT: force IPv4 (-4) on all three probes. When podkop redirects DNS
+    # to sing-box (dnsmasq server=127.0.0.42, filter_aaaa=1, cachesize=0), the
+    # router's own AAAA lookups stall/REFUSE while A records still resolve. musl
+    # getaddrinfo waits on both families, so without -4 the lookup times out
+    # ("Could not resolve host") even though direct egress works fine. -4 skips
+    # the AAAA query entirely and returns the real WAN IP via the direct path.
+
     # 1. ipinfo.io — international, plain text IP
-    curl -s --connect-timeout 5 --max-time 8 \
+    curl -4 -s --connect-timeout 5 --max-time 8 \
         "https://ipinfo.io/ip" 2>/dev/null | tr -d '\n\r\t ' > "$f1" &
     local p1=$!
 
     # 2. ifconfig.me — plain text IP, not blocked in RU
-    curl -s --connect-timeout 5 --max-time 8 \
+    curl -4 -s --connect-timeout 5 --max-time 8 \
         "https://ifconfig.me" 2>/dev/null | tr -d '\n\r\t ' > "$f2" &
     local p2=$!
 
     # 3. yandex.ru/internet — Russian service, parse IP from JSON in HTML
-    curl -s --connect-timeout 5 --max-time 8 \
+    curl -4 -s --connect-timeout 5 --max-time 8 \
         "https://yandex.ru/internet" 2>/dev/null \
         | grep -oE '"ip":"[^"]+"' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
         > "$f3" &
@@ -1315,11 +1848,11 @@ get_public_ip_display() {
 
         age=$((now - ts))
         if [ "$age" -gt "$PUBIP_CACHE_TTL" ]; then
-            refresh_public_ip_cache &
+            refresh_public_ip_cache >/dev/null 2>&1 &
         fi
         printf '%s' "$winner"
     else
-        refresh_public_ip_cache &
+        refresh_public_ip_cache >/dev/null 2>&1 &
         printf 'Checking... (open Status again in ~10s)'
     fi
 }
@@ -1327,7 +1860,7 @@ get_public_ip_display() {
 # Check if a community list tag is enabled for the given section
 is_list_enabled() {
     local sec="$1" tag="$2" item raw_list
-    raw_list=$(uci -q show podkop.${sec}.community_lists 2>/dev/null | cut -d= -f2-)
+    raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.community_lists 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 1
     { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
     for item in "$@"; do [ "$item" = "$tag" ] && return 0; done
@@ -1355,15 +1888,23 @@ build_tag_uri_cache() {
 # Build UCI proxy links cache using eval "set --" (uci get option N is broken on BusyBox)
 # One link per line, preserving original UCI order.
 build_uci_links_cache() {
-    local tmp sec raw_list _mode _key
+    local tmp sec raw_list _stype _key
     sec=$(get_active_section)
-    _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
-    case "$_mode" in
-        urltest) _key="urltest_proxy_links" ;;
-        *)       _key="selector_proxy_links" ;;
+    _stype=$(get_section_type "$sec")
+
+    # Subscription sections have no proxy_links — managed via subscription_update CLI
+    if ! section_has_links "$sec"; then
+        : > "$UCI_LINKS_CACHE"
+        logger -t podkop-bot "[Core] Section '${sec}' is ${_stype} — no proxy_links cache"
+        return 0
+    fi
+
+    case "$_stype" in
+        proxy:urltest) _key="urltest_proxy_links" ;;
+        *)             _key="selector_proxy_links" ;;
     esac
     tmp=$(mktemp /tmp/podkop_uci_links.XXXXXX)
-    raw_list=$(uci -q show podkop.${sec}.${_key} 2>/dev/null | cut -d= -f2-)
+    raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.${_key} 2>/dev/null | cut -d= -f2-)
     if [ -n "$raw_list" ]; then
         { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
         for link in "$@"; do printf '%s\n' "$link" >> "$tmp"; done
@@ -1383,7 +1924,7 @@ build_tag_name_cache() {
     tmp=$(mktemp /tmp/podkop_tag_name.XXXXXX)
     # url mode uses proxy_string (plain option, one URL per line) — handle separately
     for uci_key in selector_proxy_links urltest_proxy_links; do
-        raw_list=$(uci -q show podkop.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
+        raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.${uci_key} 2>/dev/null | cut -d= -f2-)
         [ -z "$raw_list" ] && continue
         { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
         for link in "$@"; do
@@ -1403,7 +1944,7 @@ build_tag_name_cache() {
     done
     # Also index fragments from proxy_string (url mode, multiline one-URL-per-line)
     local ps_raw ps_link ps_frag ps_tag ps_srv
-    ps_raw=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+    ps_raw=$(uci -q get ${PODKOP_UCI}.${sec}.proxy_string 2>/dev/null)
     if [ -n "$ps_raw" ]; then
         printf '%s\n' "$ps_raw" | grep -v '^[[:space:]]*$' | while IFS= read -r ps_link; do
             case "$ps_link" in *#?*) ps_frag="${ps_link##*#}" ;; *) continue ;; esac
@@ -1436,14 +1977,14 @@ get_url_proxy_links() {
     # url_proxy_links does NOT exist in podkop UCI schema — this helper now reads
     # proxy_string and emits one non-empty line per URL.
     local sec="$1" raw
-    raw=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+    raw=$(uci -q get ${PODKOP_UCI}.${sec}.proxy_string 2>/dev/null)
     [ -z "$raw" ] && return 0
     printf '%s\n' "$raw" | grep -v '^[[:space:]]*$'
 }
 
 get_urltest_proxy_links() {
     local sec="$1" raw_list
-    raw_list=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+    raw_list=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
     [ -z "$raw_list" ] && return 0
     { _ucl=$(uci_list_clean "$raw_list"); eval "set -- $_ucl"; }
     for link in "$@"; do printf '%s\n' "$link"; done
@@ -1538,18 +2079,75 @@ get_active_proxy_name() {
 # In selector/urltest mode: delegates to display_proxy_name_with_tag.
 # Use this for display only — NOT for tag comparisons.
 get_active_proxy_display() {
-    local proxies="$1" tag _sec _mode _ps
+    local proxies="$1" tag _sec _stype _ps
     tag=$(get_active_proxy_name "$proxies")
     _sec=$(get_active_section)
-    _mode=$(uci -q get podkop.${_sec}.proxy_config_type 2>/dev/null)
-    if [ "$_mode" = "url" ]; then
-        _ps=$(uci -q get podkop.${_sec}.proxy_string 2>/dev/null | head -1)
+    _stype=$(get_section_type "$_sec")
+    # Subscription sections: show server count instead of proxy tag
+    if [ "$_stype" = "proxy:subscription" ]; then
+        local _count; _count=$(get_subscription_server_count "$_sec")
+        printf 'subscription (%s servers)' "$_count"
+        return 0
+    fi
+    if [ "$_stype" = "proxy:url" ]; then
+        _ps=$(uci -q get ${PODKOP_UCI}.${_sec}.proxy_string 2>/dev/null | head -1)
         case "$_ps" in
             *#?*) url_decode "${_ps##*#}"; return 0 ;;
             *@*)  echo "$_ps" | sed 's|.*@||;s|[/?].*||' | cut -c1-25; return 0 ;;
         esac
     fi
     display_proxy_name_with_tag "$tag"
+}
+
+# get_subscription_server_count: count real outbound servers in subscription cache.
+# Excludes meta-outbounds (selector, urltest, direct, dns, block).
+get_subscription_server_count() {
+    local sec="$1"
+    local cache; cache=$(get_subscription_cache_path "$sec")
+    [ -f "$cache" ] || { echo "0"; return; }
+    jq -r '[.outbounds[] | select(
+        .type != "selector" and .type != "urltest" and
+        .type != "direct" and .type != "dns" and .type != "block"
+    )] | length' "$cache" 2>/dev/null || echo "0"
+}
+
+# get_subscription_cache_path: path to outbound list cache for a subscription section.
+get_subscription_cache_path() {
+    local sec="$1"
+    case "$PODKOP_VARIANT" in
+        evolution) printf '/var/run/podkop/subscription/%s.json' "$sec" ;;
+        plus)      printf '/var/run/podkop-plus/subscription-links/%s.json' "$sec" ;;
+        *)         printf '' ;;
+    esac
+}
+
+# get_subscription_metadata_path: path to traffic/expire metadata (Plus only).
+get_subscription_metadata_path() {
+    local sec="$1"
+    case "$PODKOP_VARIANT" in
+        plus) printf '/var/run/podkop-plus/subscription-metadata/%s.json' "$sec" ;;
+        *)    printf '' ;;
+    esac
+}
+
+# get_subscription_urls: list of subscription URLs for the section.
+# Evolution: single URL from subscription_url.
+# Plus: list from subscription_urls.
+get_subscription_urls() {
+    local sec="$1"
+    section_is_subscription "$sec" || return 1
+    if [ "$PODKOP_VARIANT" = "evolution" ]; then
+        local url; url=$(uci -q get ${PODKOP_UCI}.${sec}.subscription_url 2>/dev/null)
+        [ -n "$url" ] && printf '%s\n' "$url"
+    else
+        # uci show for list fields returns one line per item:
+        # podkop-plus.main.subscription_urls='url1'
+        # podkop-plus.main.subscription_urls='url2'
+        # Extract the value part after = and strip single quotes
+        uci -q show ${PODKOP_UCI}.${sec}.subscription_urls 2>/dev/null \
+            | sed "s/^[^=]*=//; s/^'//; s/'$//" \
+            | grep -v "^[[:space:]]*$"
+    fi
 }
 
 _resolve_leaf() {
@@ -1728,7 +2326,7 @@ safe_reload_podkop() {
         echo "$now" > "$RELOAD_TS_FILE"
     fi
 
-    /etc/init.d/podkop reload; rc=$?
+    ${PODKOP_INIT} reload; rc=$?
     # Wait for sing-box config.json to be written and valid before building caches.
     # podkop reload is semi-async: returns before sing-box fully restarts.
     # Building caches too early produces empty TAG_URI/UCI_LINKS/TAG_NAME caches.
@@ -1774,7 +2372,7 @@ podkop_dns_check() {
 probe_geo() {
     local m_ip m_port sec resp
     sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
 
     # Primary: ipapi.co — IP, country, ASN/org
@@ -1809,7 +2407,7 @@ probe_geo() {
 probe_google() {
     local m_ip m_port sec resp
     sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
 
     resp=$(curl -s -k \
@@ -1830,7 +2428,7 @@ probe_google() {
 probe_services() {
     local m_ip m_port sec
     sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
     PROBE_SVC_RESULTS=""
     PROBE_TG_BLOCKED=0
@@ -1956,7 +2554,7 @@ probe_services() {
 probe_throughput() {
     local m_ip m_port sec raw speed_bps size_bytes time_secs
     sec=$(get_active_section)
-    m_port=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
+    m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null || echo "2080")
     m_ip=$(get_proxy_ip)
 
     # Stage 1: 32 KB — detect 16 KB block quickly (РКН pattern: drops after ~16 KB)
@@ -2023,7 +2621,7 @@ probe_throughput() {
 
 do_podkop_stop() {
     local rc pid_list
-    /etc/init.d/podkop stop 2>/dev/null; rc=$?
+    ${PODKOP_INIT} stop 2>/dev/null; rc=$?
     pid_list=$(pidof sing-box 2>/dev/null)
     if [ -n "$pid_list" ]; then
         logger -t podkop-bot "[Stop] Orphaned sing-box PIDs: ${pid_list}, sending SIGTERM"
@@ -2048,10 +2646,10 @@ run_internal_diagnostics() {
         echo "Date: $(date)"; echo "Host: $(cat /proc/sys/kernel/hostname 2>/dev/null || echo Router)"
         echo; echo "--- Bot Version ---"; echo "${BOT_VERSION}"
         echo; echo "--- Core UCI ---"
-        uci -q show podkop.main 2>/dev/null || true
-        uci -q show podkop.main_routing 2>/dev/null || true
-        uci -q show podkop.dns 2>/dev/null || true
-        uci -q show podkop.settings 2>/dev/null || true
+        uci -q show ${PODKOP_UCI}.main 2>/dev/null || true
+        uci -q show ${PODKOP_UCI}.main_routing 2>/dev/null || true
+        uci -q show ${PODKOP_UCI}.dns 2>/dev/null || true
+        uci -q show ${PODKOP_UCI}.settings 2>/dev/null || true
         echo; echo "--- Clash API ---"
         if clash_request "/version" "GET" 2>/dev/null | jq . >/dev/null 2>&1; then echo "OK"
         else echo "FAIL"; rc=1; fi
@@ -2153,35 +2751,47 @@ check_health() {
     local _sec _port _ip
 
     # A1: direct (no proxy) — raw TCP connectivity to Telegram DC IPs
-    # All 3 DCs probed in parallel — max time = one timeout, not three.
-    # Requires 2/3 DCs to respond to report "ok".
-    local _dc_pids="" _dc_dir
-    _dc_dir=$(mktemp -d /tmp/podkop_dc_probes.XXXXXX 2>/dev/null) || _dc_dir="/tmp"
-    for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
-        ( curl -s -k --connect-timeout 4 --max-time 6 \
-            --resolve "api.telegram.org:443:${_dc_ip}" \
-            -X GET "${API_URL}/getMe" 2>/dev/null \
-            | jq -e '.ok == true' >/dev/null 2>&1 \
-            && echo "ok" || echo "fail" ) > "${_dc_dir}/dc_${_dc_ip}" &
-        _dc_pids="$_dc_pids $!"
-    done
-    wait $_dc_pids 2>/dev/null || true
-    local _dc_ok=0
-    for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
-        [ -f "${_dc_dir}/dc_${_dc_ip}" ] && \
-            [ "$(cat "${_dc_dir}/dc_${_dc_ip}")" = "ok" ] && \
-            _dc_ok=$((_dc_ok + 1))
-    done
-    rm -rf "$_dc_dir" 2>/dev/null || true
-    [ "$_dc_ok" -ge 2 ] && _direct=ok
+    # Uses --interface <wan_if> + --noproxy to bypass fakeip/tproxy routing.
+    # Without --interface, curl may go through podkop tunnel and return ok
+    # even when Telegram is blocked — causing false "direct ✅".
+    # Falls back to "unknown" if WAN interface cannot be determined.
+    local _dc_pids="" _dc_dir _wan_if _if_flag=""
+    _wan_if=$(_get_wan_interface)
+    if [ -n "$_wan_if" ]; then
+        _if_flag="--interface $_wan_if"
+    else
+        # WAN interface unknown — cannot do reliable direct check
+        _direct="unknown"
+    fi
+    if [ "$_direct" != "unknown" ]; then
+        _dc_dir=$(mktemp -d /tmp/podkop_dc_probes.XXXXXX 2>/dev/null) || _dc_dir="/tmp"
+        for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
+            ( curl -s -k --connect-timeout 4 --max-time 6 \
+                $_if_flag --noproxy '*' \
+                --resolve "api.telegram.org:443:${_dc_ip}" \
+                -X GET "${API_URL}/getMe" 2>/dev/null \
+                | jq -e '.ok == true' >/dev/null 2>&1 \
+                && echo "ok" || echo "fail" ) > "${_dc_dir}/dc_${_dc_ip}" &
+            _dc_pids="$_dc_pids $!"
+        done
+        wait $_dc_pids 2>/dev/null || true
+        local _dc_ok=0
+        for _dc_ip in "149.154.167.220" "149.154.167.51" "91.108.56.190"; do
+            [ -f "${_dc_dir}/dc_${_dc_ip}" ] && \
+                [ "$(cat "${_dc_dir}/dc_${_dc_ip}")" = "ok" ] && \
+                _dc_ok=$((_dc_ok + 1))
+        done
+        rm -rf "$_dc_dir" 2>/dev/null || true
+        [ "$_dc_ok" -ge 2 ] && _direct=ok || _direct=fail
+    fi
 
     # A2: via primary SOCKS (mixed_proxy / Podkop tier1)
     local _primary_sec; _primary_sec=$(_resolve_primary_section)
     local _all_secs_h
-    _all_secs_h=$(uci -q show podkop 2>/dev/null \
-        | grep -E '^podkop\.[^.=]+=section$' \
-        | sed 's/^podkop\.\([^=]*\)=section$/\1/')
-    _port=$(uci -q get podkop.${_primary_sec}.mixed_proxy_port || echo "2080")
+    _all_secs_h=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+        | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
+        | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
+    _port=$(uci -q get ${PODKOP_UCI}.${_primary_sec}.mixed_proxy_port || echo "2080")
     _ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
     tmp_resp=$(curl -s -k --connect-timeout 5 --max-time 10 \
         --socks5-hostname "${_ip}:${_port}" \
@@ -2219,8 +2829,8 @@ check_health() {
     for _s in $_all_secs_h; do
         [ "$_s" = "$_primary_sec" ] && continue
         local _me _mp
-        _me=$(uci -q get podkop.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
-        _mp=$(uci -q get podkop.${_s}.mixed_proxy_port 2>/dev/null || echo "")
+        _me=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_enabled 2>/dev/null || echo "0")
+        _mp=$(uci -q get ${PODKOP_UCI}.${_s}.mixed_proxy_port 2>/dev/null || echo "")
         [ "$_me" = "1" ] && [ -n "$_mp" ] && [ "$_mp" != "$_port" ] || continue
         # Skip if already in explicit fallback_socks list (duplicate check)
         local _auto_ep="socks5h://${_lan_ip}:${_mp}"
@@ -2293,6 +2903,33 @@ send_health_alert() {
     [ -n "$alert_mid" ] && printf '%s' "$alert_mid" > "$LAST_ALERT_MSG_FILE"
 }
 
+# _flush_autoswitch_summary: send pending URLTest switch summary when the
+# debounce window expires. This is called periodically from the watchdog loop,
+# not only on a new switch, so a single switch followed by silence is not lost.
+_flush_autoswitch_summary() {
+    [ "${_sw_count:-0}" -eq 0 ] && return 0
+    local _now; _now=$(date +%s)
+    # Flush when the debounce window elapsed, or if the buffer grows too much.
+    [ $((_now - _sw_first_ts)) -lt "$_SW_WINDOW" ] && [ "$_sw_count" -lt 10 ] && return 0
+
+    if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" != "1" ]; then
+        _sw_count=0; _sw_pending_to=""; _sw_old_disp=""
+        return 0
+    fi
+
+    local _txt
+    if [ "$_sw_count" -eq 1 ]; then
+        _txt=$(printf '🔀 <code>%s</code> → <code>%s</code> <i>(urltest)</i>'             "$_sw_old_disp" "$_sw_pending_to")
+    else
+        _txt=$(printf '🔀 <b>Proxy switched ×%d</b> in %dm
+now: <code>%s</code> <i>(urltest)</i>'             "$_sw_count" "$(( (_now - _sw_first_ts) / 60 + 1 ))" "$_sw_pending_to")
+    fi
+
+    local _pl; _pl=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_txt"         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+    send_health_alert "$_pl"
+    _sw_count=0; _sw_pending_to=""; _sw_old_disp=""
+}
+
 start_health_daemon() {
     kill "$HEALTH_PID" 2>/dev/null
     (
@@ -2319,9 +2956,13 @@ start_health_daemon() {
         local last_raw_choice="" curr_raw_choice=""
         # Debounce: don't send leaf-change alerts more often than once per 60s
         local last_leaf_alert_ts=0
+        # Auto-switch debounce: batch rapid URLTest flapping into one summary
+        local _sw_count=0 _sw_first_ts=0 _sw_pending_to="" _sw_old_disp=""
+        local _SW_WINDOW=120   # seconds: batch switches within this window
         # Track tier1 SOCKS state separately from effective transport state.
         # Allows alerting when tier1 goes down even if tier2 keeps bot reachable.
         local last_tier1_state="up"
+        local _recovery_ts=0  # timestamp of last "Primary SOCKS recovered" alert
         # Track bot route degradation (tier4/tier5) for alert on degrade/recover.
         local last_bot_route_degraded=0
 
@@ -2344,7 +2985,7 @@ start_health_daemon() {
             fi
 
             sec=$(get_active_section)
-            m_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
+            m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
             m_ip=$(get_proxy_ip)
 
             # ------------------------------------------------------------------
@@ -2356,6 +2997,19 @@ start_health_daemon() {
             # ------------------------------------------------------------------
             check_health
             # check_health writes tg_direct= and tg_transport= to HEALTH_STATE_FILE.
+
+            # Periodically refresh emergency IPs via DoH (every 6h, or if never done)
+            local _now_ts; _now_ts=$(date +%s)
+            if [ $((_now_ts - _EMERGENCY_IPS_LAST_REFRESH)) -ge "$_EMERGENCY_IPS_REFRESH_INTERVAL" ]; then
+                local _fresh_ips; _fresh_ips=$(resolve_tg_emergency_ips)
+                if [ -n "$_fresh_ips" ]; then
+                    TG_EMERGENCY_IPS="$_fresh_ips"
+                    _EMERGENCY_IPS_LAST_REFRESH=$_now_ts
+                    logger -t podkop-bot "[Transport] Emergency IPs refreshed via DoH: ${_fresh_ips}"
+                else
+                    logger -t podkop-bot "[Transport] DoH refresh failed — keeping seed IPs"
+                fi
+            fi
             # TG is "reachable" if either path works (direct OK or transport OK).
             local _tgd _tgt
             _tgd=$(grep "^tg_direct=" "$HEALTH_STATE_FILE" 2>/dev/null | cut -d= -f2)
@@ -2368,11 +3022,23 @@ start_health_daemon() {
                     last_tg_state="ok"
                     logger -t podkop-bot "[Watchdog] Telegram reachable again."
                     if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
-                        admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
-                            --arg txt "$(printf '<b>[%s]</b> %s <b>Telegram reachable</b>\n\nBot connection restored.\n<b>Route:</b> <code>%s</code>' \
-                                "$_hn" "$E_OK" "${LAST_ROUTE_NAME:-unknown}")" \
-                            '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
-                        send_health_alert "$admin_payload"
+                        local _now_tg; _now_tg=$(date +%s)
+                        # Suppress if "Primary SOCKS recovered" was sent <30s ago
+                        # (that alert already conveys the recovery — no duplicate needed)
+                        if [ $((_now_tg - _recovery_ts)) -ge 30 ]; then
+                            local _tg_route
+                            _tg_route=$(cat "$MAIN_ROUTE_FILE" 2>/dev/null | tr -d '\n\r\t')
+                            case "$_tg_route" in
+                                ""|"Initializing..."|"Initializing") _tg_route="via SOCKS (recovered)" ;;
+                            esac
+                            admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" \
+                                --arg txt "$(printf '<b>[%s]</b> %s <b>Telegram reachable</b>\n\nBot connection restored.\n<b>Route:</b> <code>%s</code>' \
+                                    "$_hn" "$E_OK" "$_tg_route")" \
+                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                            send_health_alert "$admin_payload"
+                        else
+                            logger -t podkop-bot "[Watchdog] Telegram reachable — suppressed (within 30s of SOCKS recovery)"
+                        fi
                     fi
                 fi
                 [ "$last_tg_state" = "unknown" ] && last_tg_state="ok"
@@ -2453,6 +3119,7 @@ start_health_daemon() {
                             _rec_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$_rec_txt" \
                                 '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                             send_health_alert "$_rec_payload"
+                            _recovery_ts=$(date +%s)
                         fi
                     fi
                     # Reset tier1 tracking so next outage fires a fresh alert
@@ -2561,6 +3228,8 @@ start_health_daemon() {
                     admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$socks_alert_txt" \
                         '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
                     send_health_alert "$admin_payload"
+                    # Track recovery time to suppress duplicate "Telegram reachable" within 30s
+                    case "$socks_alert_txt" in *"SOCKS recovered"*) _recovery_ts=$(date +%s) ;; esac
                 fi
                 logger -t podkop-bot "[Watchdog] SOCKS state: ${last_socks_state} → ${effective_socks}"
                 last_socks_state="$effective_socks"
@@ -2630,16 +3299,20 @@ start_health_daemon() {
                                     "$_hn" "$E_TGT" "$old_disp" "$new_disp")
                             else
                                 # .now unchanged → URLTest picked a faster server
-                                local _mode
-                                _mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "unknown")
                                 logger -t podkop-bot "[Watchdog] Active proxy auto-switched: ${last_leaf} → ${curr_leaf}"
-                                leaf_txt=$(printf '<b>[%s]</b> %s <b>Proxy auto-switched</b>\n\n<b>From:</b> <code>%s</code>\n<b>To:</b>   <code>%s</code>\n\n<i>%s selected a faster server. No interruption expected.</i>' \
-                                    "$_hn" "$E_TGT" "$old_disp" "$new_disp" \
-                                    "$([ "$_mode" = "urltest" ] && echo "URLTest" || echo "Selector")")
+                                # Debounce: accumulate only. Flush is done periodically
+                                # at the end of the watchdog loop by _flush_autoswitch_summary,
+                                # so a single URLTest switch followed by silence is still sent.
+                                [ "$_sw_count" -eq 0 ] && { _sw_first_ts=$_now_ts; _sw_old_disp="$old_disp"; }
+                                _sw_count=$((_sw_count + 1))
+                                _sw_pending_to="$new_disp"
+                                leaf_txt=""
                             fi
-                            admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
-                                '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
-                            send_health_alert "$admin_payload"
+                            if [ -n "$leaf_txt" ]; then
+                                admin_payload=$(jq -n -c --arg cid "$ADMIN_ID" --arg txt "$leaf_txt" \
+                                    '{chat_id:$cid,text:$txt,parse_mode:"HTML"}')
+                                send_health_alert "$admin_payload"
+                            fi
                         fi
                     fi
                     [ -n "$curr_raw_choice" ] && last_raw_choice="$curr_raw_choice"
@@ -2725,6 +3398,10 @@ start_health_daemon() {
                 esac
             fi
 
+            # Flush pending URLTest auto-switch summary whose debounce window elapsed.
+            # This covers the common case of one switch followed by silence.
+            _flush_autoswitch_summary
+
             # Write structured state for status screens
             _write_socks_state "$last_tg_state" "$last_socks_state" "$last_ok_route"
 
@@ -2748,12 +3425,13 @@ _handle_sections() {
     case "$cmd" in
         "sections_menu")
             rm -f "$STATE_FILE"
+    rm -f "$REPLY_KB_INSTALLED_FILE"  # Force re-install reply keyboard after restart
             local sections rows s text kb
             # uci show gives "podkop.NAME=section" for section objects.
             # Correct pattern matches lines ending in =section exactly.
-            sections=$(uci -q show podkop 2>/dev/null \
-                | grep -E '^podkop\.[^.=]+=section$' \
-                | sed 's/^podkop\.\([^=]*\)=section$/\1/' \
+            sections=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+                | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
+                | sed 's/^[^.]*\.\([^=]*\)=section$/\1/' \
                 | grep -v '_routing$')
             rows=""
             for s in $sections; do
@@ -2771,11 +3449,19 @@ EOF
             kb="{\"inline_keyboard\":[${rows}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
-        "set_sec_"*)
-            local new_sec="${cmd#set_sec_}"
+        "do_set_sec_"*)
+            local new_sec="${cmd#do_set_sec_}"
             echo "$new_sec" > "$ACTIVE_SECTION_FILE"
             build_all_caches
+            safe_reload_podkop "force"; sleep 1
             _handle_sections "sections_menu" "$mid"
+            ;;
+
+        "set_sec_"*)
+            local new_sec="${cmd#set_sec_}"
+            send_or_edit "$mid" \
+                "$(printf '%s Switch active section to <code>%s</code>?\n\nPodkop will reload.' "$E_WARN" "$new_sec")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Switch\",\"callback_data\":\"do_set_sec_${new_sec}\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"sections_menu\"}]]}"
             ;;
     esac
 }
@@ -2796,25 +3482,30 @@ _handle_proxy() {
         if [ "$state" = "wait_proxy_link" ]; then
             delete_message "$mid"
             local safe_link=$(printf "%s" "$text" | tr -d '\r\n')
-            local _pmode; _pmode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            local _stype; _stype=$(get_section_type "$sec")
             local _links_key
-            case "$_pmode" in
-                urltest)  _links_key="urltest_proxy_links" ;;
-                selector) _links_key="selector_proxy_links" ;;
-                *)        _links_key="selector_proxy_links" ;;  # fallback
-            esac
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                # Plus stores all manual servers in selector_proxy_links;
+                # urltest is a flag (urltest_enabled), not a separate links list.
+                _links_key="selector_proxy_links"
+            else
+                case "$_stype" in
+                    proxy:urltest) _links_key="urltest_proxy_links" ;;
+                    *)             _links_key="selector_proxy_links" ;;
+                esac
+            fi
             if echo "$safe_link" | grep -q '[[:space:]]'; then
                 send_message "$(printf '%s <b>Invalid!</b>\nLink contains spaces.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
-            elif ! echo "$safe_link" | grep -qE '^(vless|hy2|hysteria2|ss|trojan|vmess|tuic)://'; then
+            elif ! echo "$safe_link" | grep -qE '^(vless|vmess|ss|trojan|hy2|hysteria2|socks|socks4|socks4a|socks5)://'; then
                 send_message "$(printf '%s <b>Invalid protocol!</b>' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
-            elif uci -q show podkop.${sec} 2>/dev/null | grep -qF "${_links_key}='$safe_link'"; then
+            elif uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -qF "${_links_key}='$safe_link'"; then
                 send_message "$(printf '%s <b>Duplicate!</b>\nThis link is already in the list.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
             else
-                uci add_list podkop.${sec}.${_links_key}="$safe_link"
-                uci_commit_safe podkop
+                uci add_list ${PODKOP_UCI}.${sec}.${_links_key}="$safe_link"
+                uci_commit_safe ${PODKOP_UCI}
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
                 _handle_proxy "proxy_menu" "" "" ""
@@ -2862,9 +3553,16 @@ _handle_proxy() {
 
             # Detect URLTest mode and whether auto or manual is active
             local proxy_mode_cur urltest_group urltest_now is_auto_mode auto_hint
-            proxy_mode_cur=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            proxy_mode_cur=$(get_section_type "$sec")
             auto_hint=""
-            if [ "$proxy_mode_cur" = "urltest" ]; then
+
+            # For Plus: fetch link states to mark filtered/unavailable outbounds
+            local _link_states_json=""
+            if [ "$PODKOP_VARIANT" = "plus" ] && _plus_has_cmd "get_outbound_link_states"; then
+                _link_states_json=$(_plus_json get_outbound_link_states "$sec")
+            fi
+
+            if [ "$proxy_mode_cur" = "proxy:urltest" ]; then
                 # Find the URLTest group that belongs to THIS selector — not globally.
                 # Search only within .proxies[$selector].all[] to avoid cross-section bleed.
                 urltest_group=$(echo "$proxies" | jq -r \
@@ -2963,21 +3661,33 @@ _handle_proxy() {
 
                 # Human-readable name (UCI fragment or tag)
                 human_name=$(display_proxy_name "$name")
-                # Button: just human name — clean, matches what user sees in list
-                short_name=$(json_escape "$human_name")
 
                 # List: active proxy gets ▶ + bold; others plain
                 # html_escape name: URI fragment may contain < > & from user input
                 safe_name=$(html_escape "$human_name")
-                if [ "$name" = "$current_proxy" ]; then
-                    list_text=$(printf '%s\n<code>[%s]</code> %s <b>%s</b> | %s | %s' \
-                        "$list_text" "$abs_idx" "${E_PLAY}" \
-                        "$safe_name" "$ptype" "$delay_txt")
-                else
-                    list_text=$(printf '%s\n<code>[%s]</code> %s %s | %s | %s' \
-                        "$list_text" "$abs_idx" "$icon" \
-                        "$safe_name" "$ptype" "$delay_txt")
+                # For Plus: mark filtered/inactive outbounds
+                local _ls_mark=""
+                if [ -n "$_link_states_json" ] && [ "$_link_states_json" != "{}" ]; then
+                    local _ls_val; _ls_val=$(printf '%s' "$_link_states_json" |                         jq -r --arg t "$name" '.[$t] // null' 2>/dev/null)
+                    [ "$_ls_val" = "false" ] && _ls_mark="⊘ "
                 fi
+                # Button label mirrors the list line: ▶ marks the active proxy,
+                # the latency dot (green/yellow/red) marks the rest. This way the
+                # active outbound is obvious on the button itself — no need to
+                # match the [index] against the list before tapping to test/switch.
+                local btn_mark
+                if [ "$name" = "$current_proxy" ]; then
+                    btn_mark="${E_PLAY}"
+                    list_text=$(printf '%s\n<code>[%s]</code> %s <b>%s%s</b> | %s | %s' \
+                        "$list_text" "$abs_idx" "${E_PLAY}" \
+                        "$_ls_mark" "$safe_name" "$ptype" "$delay_txt")
+                else
+                    btn_mark="${icon}"
+                    list_text=$(printf '%s\n<code>[%s]</code> %s %s%s | %s | %s' \
+                        "$list_text" "$abs_idx" "$icon" \
+                        "$_ls_mark" "$safe_name" "$ptype" "$delay_txt")
+                fi
+                short_name=$(json_escape "[${abs_idx}] ${btn_mark} ${_ls_mark}${human_name}")
                 rows="${rows}[{\"text\":\"${short_name}\",\"callback_data\":\"px_view_${abs_idx}\"}],"
                 disp_idx=$((disp_idx + 1))
             done <<EOF
@@ -2998,22 +3708,49 @@ EOF
 
             kb="{\"inline_keyboard\":[${rows}${nav_row}"
             # URLTest mode: prepend Auto (best ping) button on its own row
-            if [ "$proxy_mode_cur" = "urltest" ] && [ -n "$urltest_group" ]; then
-                if [ "${is_auto_mode:-0}" = "1" ]; then
-                    kb="${kb}[{\"text\":\"${E_SCAN} URLTest auto  ✓\",\"callback_data\":\"proxy_menu\"}],"
-                else
+            if [ "$proxy_mode_cur" = "proxy:urltest" ] && [ -n "$urltest_group" ]; then
+                if [ "${is_auto_mode:-0}" != "1" ]; then
                     kb="${kb}[{\"text\":\"${E_SCAN} Switch to URLTest auto\",\"callback_data\":\"do_px_auto_urltest\"}],"
                 fi
+                # URLTest auto ✓ indicator shown in list text, no standalone button needed
             fi
-            kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
-            local _card_title
+            kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
+            local _card_title _sub_url_line=""
+            # Show subscription URL(s) for subscription sections
+            if section_is_subscription "$sec"; then
+                local _sub_urls _sub_url_disp="" _sub_meta_str=""
+                _sub_urls=$(get_subscription_urls "$sec")
+                if [ -n "$_sub_urls" ]; then
+                    _sub_url_disp=$(printf '%s' "$_sub_urls" | head -3 | \
+                        awk '{ if(length($0)>60) $0=substr($0,1,57)"..."; printf "  <code>%s</code>\n", $0 }')
+                fi
+                # Traffic/expiry from Plus CLI
+                if _plus_has_cmd "get_subscription_metadata"; then
+                    local _smj; _smj=$(_plus_json get_subscription_metadata "$sec")
+                    _sub_meta_str=$(_plus_format_sub_meta "$_smj")
+                fi
+                # Build combined subscription line
+                if [ -n "$_sub_url_disp" ] || [ -n "$_sub_meta_str" ]; then
+                    # Build with printf to avoid literal \n in ash variable expansion
+                    local _smeta_part="" _surl_part=""
+                    [ -n "$_sub_meta_str" ] && _smeta_part=" 📊 ${_sub_meta_str}"
+                    [ -n "$_sub_url_disp" ] && _surl_part=$(printf '\n%s' "$_sub_url_disp")
+                    _sub_url_line=$(printf '\n%s <b>Subscription:</b>%s%s'                         "$E_LINK" "$_smeta_part" "$_surl_part")
+                fi
+            fi
             case "$proxy_mode_cur" in
-                urltest) _card_title="${E_TGT} <b>URLTest Outbounds</b>" ;;
-                *)       _card_title="${E_GLOB} <b>Outbound Selector</b>" ;;
+                proxy:urltest)
+                    if [ "${is_auto_mode:-0}" = "1" ]; then
+                        _card_title="${E_TGT} <b>URLTest Outbounds</b> <i>(auto: ${urltest_now})</i>"
+                    else
+                        _card_title="${E_TGT} <b>URLTest Outbounds</b>"
+                    fi ;;
+                proxy:subscription) _card_title="${E_LINK} <b>Subscription Outbounds</b>" ;;
+                *) _card_title="${E_GLOB} <b>Outbound Selector</b>" ;;
             esac
             text=$(cat <<EOF
 ${_card_title} [<code>${sec}</code>]
-<b>Active:</b> <code>${current_proxy_display}</code>${auto_hint}
+<b>Active:</b> <code>${current_proxy_display}</code>${auto_hint}${_sub_url_line}
 
 ${list_text}
 
@@ -3214,7 +3951,7 @@ EOF
                         "$UCI_LINKS_CACHE" 2>/dev/null)
                     if [ -z "$raw_link" ]; then
                         local _raw_uci
-                        _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                        _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                         if [ -n "$_raw_uci" ]; then
                             { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                             for _link in "$@"; do
@@ -3269,10 +4006,10 @@ EOF
                             "$UCI_LINKS_CACHE" 2>/dev/null)
                         if [ -z "$raw_link" ]; then
                             local _raw_uci _pmode
-                            _pmode=$(uci -q get podkop.${_sec}.proxy_config_type 2>/dev/null || echo "selector")
-                            [ "$_pmode" = "urltest" ] && \
-                                _raw_uci=$(uci -q show podkop.${_sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-) || \
-                                _raw_uci=$(uci -q show podkop.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                            _pmode=$(get_section_type "${_sec}")
+                            [ "$_pmode" = "proxy:urltest" ] && \
+                                _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-) || \
+                                _raw_uci=$(uci -q show ${PODKOP_UCI}.${_sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                             if [ -n "$_raw_uci" ]; then
                                 { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                                 for _link in "$@"; do
@@ -3290,7 +4027,7 @@ EOF
             # Also check urltest_proxy_links if selector search failed
             if [ -z "$raw_link" ]; then
                 local _raw_uci_ut
-                _raw_uci_ut=$(uci -q show podkop.${_sec:-$(get_active_section)}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+                _raw_uci_ut=$(uci -q show ${PODKOP_UCI}.${_sec:-$(get_active_section)}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
                 if [ -n "$_raw_uci_ut" ]; then
                     { _ucl=$(uci_list_clean "$_raw_uci_ut"); eval "set -- $_ucl"; }
                     for _link in "$@"; do
@@ -3309,10 +4046,10 @@ EOF
             fi
             [ -n "$p_idx" ] && ret_page=$(( p_idx / per_page ))
             local _del_sec; _del_sec=$(get_active_section)
-            local _del_mode; _del_mode=$(uci -q get podkop.${_del_sec}.proxy_config_type 2>/dev/null || echo "selector")
-            local _del_key; [ "$_del_mode" = "urltest" ] && _del_key="urltest_proxy_links" || _del_key="selector_proxy_links"
-            uci del_list podkop.${_del_sec}.${_del_key}="$raw_link"
-            uci_commit_safe podkop
+            local _del_mode; _del_mode=$(get_section_type "${_del_sec}")
+            local _del_key; [ "$_del_mode" = "proxy:urltest" ] && _del_key="urltest_proxy_links" || _del_key="selector_proxy_links"
+            uci del_list ${PODKOP_UCI}.${_del_sec}.${_del_key}="$raw_link"
+            uci_commit_safe ${PODKOP_UCI}
             send_or_edit "$mid" "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
             safe_reload_podkop "force"; sleep 1
             _handle_proxy "proxy_menu_p_${ret_page}" "$mid" "" ""
@@ -3321,7 +4058,7 @@ EOF
         "cmd_proxy_add")
             echo "wait_proxy_link" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Send outbound link.</b>\n<i>(vless, hy2, hysteria2, ss, trojan, vmess, tuic)</i>' "$E_EDIT")" \
+                "$(printf '%s <b>Send outbound link.</b>\n<i>vless://, vmess://, ss://, trojan://, hy2://, socks5://…</i>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_menu\"}]]}"
             ;;
     esac
@@ -3347,16 +4084,16 @@ _handle_url_links() {
             if [ -z "$safe_link" ]; then
                 send_message "$(printf '%s <b>Empty input.</b>' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"url_links_menu\"}]]}"
-            elif ! echo "$safe_link" | grep -qE '^(vless|hy2|hysteria2|ss|trojan|vmess|tuic)://'; then
-                send_message "$(printf '%s <b>Invalid protocol!</b>\n<i>Expected: vless://, hy2://, ss://, trojan://, vmess://, tuic://</i>' "$E_ERR")" \
+            elif ! echo "$safe_link" | grep -qE '^(vless|vmess|ss|trojan|hy2|hysteria2|socks|socks4|socks4a|socks5)://'; then
+                send_message "$(printf '%s <b>Invalid protocol!</b>\n<i>vless, vmess, ss, trojan, hy2, socks5…</i>' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"url_links_menu\"}]]}"
             elif get_url_proxy_links "$sec" | grep -qxF "$safe_link"; then
                 send_message "$(printf '%s <b>Duplicate!</b>\nThis link is already in the list.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"url_links_menu\"}]]}"
             else
                 # Replace proxy_string entirely — Single URL mode means one URL only
-                uci set podkop.${sec}.proxy_string="$safe_link"
-                uci_commit_safe podkop
+                uci set ${PODKOP_UCI}.${sec}.proxy_string="$safe_link"
+                uci_commit_safe ${PODKOP_UCI}
                 send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                 safe_reload_podkop "force"; sleep 1
                 _handle_url_links "url_links_menu" "" "" ""
@@ -3401,7 +4138,7 @@ _handle_url_links() {
             _ul_delay_raw=$(printf '%s' "$_ul_proxies" | jq -r \
                 --arg sel "$_ul_sel" '.proxies[$sel].history[-1].delay // 0' 2>/dev/null)
             local _ul_ps
-            _ul_ps=$(uci -q get podkop.${_ul_sec}.proxy_string 2>/dev/null | head -1)
+            _ul_ps=$(uci -q get ${PODKOP_UCI}.${_ul_sec}.proxy_string 2>/dev/null | head -1)
             case "$_ul_ps" in
                 *#?*) _ul_name=$(url_decode "${_ul_ps##*#}") ;;
                 *@*)  _ul_name=$(echo "$_ul_ps" | sed 's|.*@||;s|[/?].*||' | cut -c1-25) ;;
@@ -3456,7 +4193,7 @@ EOF
         "cmd_url_link_add")
             echo "wait_url_link" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Set Single URL Proxy</b>\n\nSend the proxy link:\n<i>(vless://, hy2://, ss://, trojan://, vmess://, tuic://)</i>\n\nThis replaces any existing URL.' "$E_EDIT")" \
+                "$(printf '%s <b>Set Single URL Proxy</b>\n\nSend the proxy link:\n<i>(vless://, hy2://, ss://, trojan://, vmess://, socks://)</i>\n\nThis replaces any existing URL.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"url_links_menu\"}]]}"
             ;;
 
@@ -3497,11 +4234,11 @@ $(get_url_proxy_links "$sec")
 EOF
             send_or_edit "$mid" "$(printf '%s <b>Removed. Applying...</b>' "$E_RST")" ""
             if [ -z "$new_val" ]; then
-                uci -q delete podkop.${sec}.proxy_string
+                uci -q delete ${PODKOP_UCI}.${sec}.proxy_string
             else
-                uci set podkop.${sec}.proxy_string="$new_val"
+                uci set ${PODKOP_UCI}.${sec}.proxy_string="$new_val"
             fi
-            uci_commit_safe podkop
+            uci_commit_safe ${PODKOP_UCI}
             safe_reload_podkop "force"; sleep 1
             _handle_url_links "url_links_menu" "$mid" "" ""
             ;;
@@ -3511,7 +4248,7 @@ EOF
             local luci_ip
             luci_ip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo "192.168.1.1")
             send_or_edit "$mid" \
-                "$(printf '%s <b>Outbound Config mode</b>\n\nThis mode requires editing raw sing-box JSON.\nEditing JSON via Telegram is error-prone and not supported by the bot.\n\n<b>Please use LuCI or console instead:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set podkop.%s.outbound_json=...</code>\n\n<i>After editing in LuCI/console, use Reload Podkop in the bot to apply.</i>' "$E_WARN" "$luci_ip" "$sec")" \
+                "$(printf '%s <b>Outbound Config mode</b>\n\nThis mode requires editing raw sing-box JSON.\nEditing JSON via Telegram is error-prone and not supported by the bot.\n\n<b>Please use LuCI or console instead:</b>\n\n<b>LuCI:</b> <code>http://%s/cgi-bin/luci/admin/services/podkop</code>\n<b>SSH:</b> <code>uci set ${PODKOP_UCI}.%s.outbound_json=...</code>\n\n<i>After editing in LuCI/console, use Reload Podkop in the bot to apply.</i>' "$E_WARN" "$luci_ip" "$sec")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
             ;;
     esac
@@ -3534,52 +4271,49 @@ Select a category to manage:
 EOF
 )
             kb="{\"inline_keyboard\":[
-                [{\"text\":\"${E_FILE} Routing & Lists\",\"callback_data\":\"community_lists\"}],
-                [{\"text\":\"${E_SET} Core Settings\",\"callback_data\":\"advanced_settings\"}],
+                [{\"text\":\"${E_SET} Section Settings\",\"callback_data\":\"section_settings\"}],
+                [{\"text\":\"${E_GLOB} Global Settings\",\"callback_data\":\"global_settings\"}],
                 [{\"text\":\"${E_CLIP} Sections\",\"callback_data\":\"sections_menu\"}],
+                [{\"text\":\"${E_FILE} Routing & Lists\",\"callback_data\":\"community_lists\"}],
                 [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "advanced_settings")
+            # v0.15.1: advanced_settings split into section_settings + global_settings.
+            # Redirect to section_settings for back-compat with saved buttons.
+            _handle_settings "section_settings" "$mid" "$cid" "$cb_id"
+            ;;
+
+        "section_settings")
             rm -f "$STATE_FILE"
-            local dl quic wan excl_ntp log_lvl interval proxy_mode conn_type mixed_en mixed_port
-            local next_log log_lvl_disp next_int outbound_iface text kb
+            # Redirect zapret/byedpi sections to their own menu
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                local _sec_action; _sec_action=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null)
+                case "$_sec_action" in
+                    zapret|byedpi)
+                        _handle_settings "${_sec_action}_section_menu" "$mid" "$cid" "$cb_id"
+                        return ;;
+                esac
+            fi
+            local proxy_mode conn_type mixed_en mixed_port proxy_mode_disp
+            local mode_hint conn_hint autostart_btn autostart_lbl text kb
 
-            dl=$(get_uci_bool_emoji "podkop.settings" "download_lists_via_proxy")
-            quic=$(get_uci_bool_emoji "podkop.settings" "disable_quic")
-            wan=$(get_uci_bool_emoji "podkop.settings" "enable_badwan_interface_monitoring")
-            excl_ntp=$(get_uci_bool_emoji "podkop.settings" "exclude_ntp")
-            log_lvl=$(uci -q get podkop.settings.log_level || echo "warn")
-            interval=$(uci -q get podkop.settings.update_interval || echo "1d")
-            proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "selector")
-            conn_type=$(uci -q get podkop.${sec}.connection_type || echo "proxy")
-            mixed_en=$(get_uci_bool_emoji "podkop.${sec}" "mixed_proxy_enabled")
-            mixed_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
-            outbound_iface=$(uci -q get podkop.settings.output_network_interface 2>/dev/null || echo "auto")
-
-            next_log="info"
-            [ "$log_lvl" = "info" ]  && next_log="warn"
-            [ "$log_lvl" = "warn" ]  && next_log="error"
-            [ "$log_lvl" = "error" ] && next_log="debug"
-            [ "$log_lvl" = "debug" ] && next_log="info"
-            log_lvl_disp=$(printf "%s" "$log_lvl" | tr 'a-z' 'A-Z')
-
-            next_int="1h"
-            [ "$interval" = "1h" ]  && next_int="6h"
-            [ "$interval" = "6h" ]  && next_int="12h"
-            [ "$interval" = "12h" ] && next_int="1d"
-            [ "$interval" = "1d" ]  && next_int="3d"
-            [ "$interval" = "3d" ]  && next_int="1h"
+            proxy_mode=$(get_section_type "$sec")
+            conn_type=$(get_section_type "$sec" | cut -d: -f1)
+            proxy_mode_disp="${proxy_mode#proxy:}"
+            mixed_en=$(get_uci_bool_emoji "${PODKOP_UCI}.${sec}" "mixed_proxy_enabled")
+            mixed_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
 
             local mode_hint conn_hint
             case "$proxy_mode" in
-                selector) mode_hint="${E_IDEA} <i>Selector: manually choose the active proxy.</i>" ;;
-                urltest)  mode_hint="${E_IDEA} <i>URLTest: sing-box auto-picks the fastest proxy.</i>" ;;
-                url)      mode_hint="${E_IDEA} <i>URL: single proxy_string connection.</i>" ;;
-                outbound) mode_hint="${E_IDEA} <i>Outbound: raw sing-box JSON config.</i>" ;;
-                *)        mode_hint="" ;;
+                proxy:selector)     mode_hint="${E_IDEA} <i>Selector: manually choose the active proxy.</i>" ;;
+                proxy:urltest)      mode_hint="${E_IDEA} <i>URLTest: sing-box auto-picks the fastest proxy.</i>" ;;
+                proxy:url)          mode_hint="${E_IDEA} <i>URL: single proxy_string connection.</i>" ;;
+                proxy:subscription) mode_hint="${E_IDEA} <i>Subscription: server list auto-managed.</i>" ;;
+                outbound)           mode_hint="${E_IDEA} <i>Outbound: raw sing-box JSON config.</i>" ;;
+                *)                  mode_hint="" ;;
             esac
             case "$conn_type" in
                 proxy)     conn_hint="${E_IDEA} <i>Proxy: route matched traffic through VPN tunnel.</i>" ;;
@@ -3589,97 +4323,222 @@ EOF
                 *)         conn_hint="" ;;
             esac
 
-            local autostart_btn autostart_lbl
-            if /etc/init.d/podkop enabled >/dev/null 2>&1; then
+            if ${PODKOP_INIT} enabled >/dev/null 2>&1; then
                 autostart_btn="${E_ON} Autostart ON"; autostart_lbl="ask_toggle_autostart_off"
             else
                 autostart_btn="${E_OFF} Autostart OFF"; autostart_lbl="ask_toggle_autostart_on"
             fi
 
             text=$(cat <<EOF
-${E_SET} <b>Core Settings</b> [<code>${sec}</code>]
+${E_SET} <b>Section Settings</b> [<code>${sec}</code>]
 <code>────────────────────</code>
 <b>Connection:</b> <code>${conn_type}</code>  ${conn_hint}
-<b>Mode:</b> <code>${proxy_mode}</code>  ${mode_hint}
+<b>Mode:</b> <code>${proxy_mode_disp}</code>  ${mode_hint}
 <code>────────────────────</code>
 <b>Mixed Proxy:</b> ${mixed_en} port <code>${mixed_port}</code>
-<b>Outbound iface:</b> <code>${outbound_iface}</code> <i>(global)</i>
-<code>────────────────────</code>
-<b>Log:</b> <code>${log_lvl}</code> | <b>Update:</b> ${interval}
-<b>Bad WAN:</b> ${wan} | <b>Excl. NTP:</b> ${excl_ntp}
-<b>DL via Proxy:</b> ${dl} | <b>Disable QUIC:</b> ${quic}
 EOF
 )
-            # ── Keyboard: 2-column, grouped by theme ────────────────────────────
-            # Row 1: Connection type + Proxy mode  (core routing behaviour)
             kb="{\"inline_keyboard\":["
-            kb="${kb}[{\"text\":\"Conn: ${conn_type}\",\"callback_data\":\"conn_type_menu\"},{\"text\":\"${E_TGT} Mode: ${proxy_mode}\",\"callback_data\":\"proxy_mode_menu\"}],"
-            # Row 2: Mixed proxy toggle + port editor  (same entity, same row)
+            kb="${kb}[{\"text\":\"Conn: ${conn_type}\",\"callback_data\":\"conn_type_menu\"},{\"text\":\"${E_TGT} Mode: ${proxy_mode_disp}\",\"callback_data\":\"proxy_mode_menu\"}],"
             kb="${kb}[{\"text\":\"${mixed_en} Mixed Proxy\",\"callback_data\":\"ask_toggle_mixed\"},{\"text\":\"${E_EDIT} Port: ${mixed_port}\",\"callback_data\":\"cmd_set_mixed_port\"}],"
-            # Row 3: Outbound interface + DNS  (network routing config)
-            kb="${kb}[{\"text\":\"${E_NET} Outbound: ${outbound_iface}\",\"callback_data\":\"cmd_set_outbound_iface\"},{\"text\":\"${E_NET} DNS\",\"callback_data\":\"dns_settings\"}],"
-            # Row 4: URLTest settings + Domain Resolver  (per-section extras)
+            # Plus: add URLTest Filters button when urltest mode active
+            local _uf_btn=""
+            [ "$PODKOP_VARIANT" = "plus" ] && [ "$proxy_mode" = "proxy:urltest" ] && _uf_btn="yes"
             kb="${kb}[{\"text\":\"${E_TGT} URLTest\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_NET} Resolver\",\"callback_data\":\"domain_resolver_settings\"}],"
-            # Row 5: YACD dashboard + Autostart  (system-level)
-            kb="${kb}[{\"text\":\"${E_STAT} YACD\",\"callback_data\":\"yacd_settings\"},{\"text\":\"${autostart_btn}\",\"callback_data\":\"${autostart_lbl}\"}],"
-            # Row 6: Disable QUIC + Update interval  (global flags, both fire-and-forget toggles)
-            kb="${kb}[{\"text\":\"${quic} Disable QUIC\",\"callback_data\":\"ask_toggle_quic\"},{\"text\":\"Update: ${interval}\",\"callback_data\":\"set_update_int_${next_int}\"}],"
-            # Row 7: Download via proxy + Exclude NTP  (global flags pair 2)
-            kb="${kb}[{\"text\":\"${dl} DL via Proxy\",\"callback_data\":\"ask_toggle_dl\"},{\"text\":\"${excl_ntp} Excl. NTP\",\"callback_data\":\"ask_toggle_ntp\"}],"
-            # Row 8: Bad WAN toggle + Bad WAN Details  (same entity — monitor config)
-            kb="${kb}[{\"text\":\"${wan} Bad WAN\",\"callback_data\":\"ask_toggle_wan\"},{\"text\":\"${E_SCAN} Bad WAN Details\",\"callback_data\":\"badwan_details\"}],"
-            # Row 9: Log level + Back
-            kb="${kb}[{\"text\":\"Log: ${log_lvl_disp}\",\"callback_data\":\"set_log_${next_log}\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
+            [ -n "$_uf_btn" ] && kb="${kb}[{\"text\":\"🔬 URLTest Filters (country/regex)\",\"callback_data\":\"urltest_filters_menu\"}],"
+            kb="${kb}[{\"text\":\"${autostart_btn}\",\"callback_data\":\"${autostart_lbl}\"}],"
+            kb="${kb}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
+            send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "zapret_section_menu"|"byedpi_section_menu")
+            # DPI bypass section menu — shown when active section has action=zapret or action=byedpi
+            rm -f "$STATE_FILE"
+            local dpi_type sec_action dpi_status_json dpi_icon dpi_running dpi_ver dpi_strategy text kb
+            sec_action=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null)
+            local _en; _en=$(uci -q get ${PODKOP_UCI}.${sec}.enabled 2>/dev/null); [ -z "$_en" ] && _en="1"
+
+            if [ "$sec_action" = "zapret" ]; then
+                dpi_type="Zapret"
+                dpi_strategy=$(uci -q get ${PODKOP_UCI}.${sec}.nfqws_opt 2>/dev/null || echo "not set")
+                if _plus_has_cmd "get_zapret_status"; then
+                    dpi_status_json=$(_plus_json get_zapret_status)
+                    dpi_running=$(printf '%s' "$dpi_status_json" | jq -r '.running_process_count // 0' 2>/dev/null)
+                    dpi_ver=$(printf '%s' "$dpi_status_json" | jq -r '.version // ""' 2>/dev/null)
+                    local _ready; _ready=$(printf '%s' "$dpi_status_json" | jq -r '.ready // false' 2>/dev/null)
+                    [ "$_ready" = "true" ] && dpi_icon="${E_OK}" || dpi_icon="${E_ERR}"
+                else
+                    dpi_icon="${E_OFF}"; dpi_running="?"; dpi_ver="?"
+                fi
+            else
+                dpi_type="ByeDPI"
+                dpi_strategy=$(uci -q get ${PODKOP_UCI}.${sec}.byedpi_cmd_opts 2>/dev/null || echo "not set")
+                if _plus_has_cmd "get_byedpi_status"; then
+                    dpi_status_json=$(_plus_json get_byedpi_status)
+                    dpi_running=$(printf '%s' "$dpi_status_json" | jq -r '.running_process_count // 0' 2>/dev/null)
+                    dpi_ver=$(printf '%s' "$dpi_status_json" | jq -r '.version // ""' 2>/dev/null)
+                    local _ready; _ready=$(printf '%s' "$dpi_status_json" | jq -r '.ready // false' 2>/dev/null)
+                    [ "$_ready" = "true" ] && dpi_icon="${E_OK}" || dpi_icon="${E_ERR}"
+                else
+                    dpi_icon="${E_OFF}"; dpi_running="?"; dpi_ver="?"
+                fi
+            fi
+
+            local _en_icon; [ "$_en" = "1" ] && _en_icon="${E_ON}" || _en_icon="${E_OFF}"
+            local _strat_short; _strat_short=$(printf '%s' "$dpi_strategy" | cut -c1-60)
+            [ ${#dpi_strategy} -gt 60 ] && _strat_short="${_strat_short}…"
+
+            text=$(cat <<EOF
+🛡 <b>${dpi_type} Section</b> [<code>${sec}</code>]
+<code>────────────────────</code>
+<b>Status:</b> ${dpi_icon} $([ "$dpi_running" != "0" ] && echo "running (${dpi_running} proc)" || echo "stopped")
+<b>Section:</b> ${_en_icon} $([ "$_en" = "1" ] && echo "enabled" || echo "disabled")
+$([ -n "$dpi_ver" ] && [ "$dpi_ver" != "?" ] && printf "<b>Version:</b> %s\n" "$dpi_ver")<b>Strategy:</b> <code>${_strat_short}</code>
+EOF
+)
+            local _toggle_cb _toggle_lbl
+            if [ "$_en" = "1" ]; then
+                _toggle_lbl="${E_OFF} Disable Section"; _toggle_cb="do_dpi_toggle_${sec}_0"
+            else
+                _toggle_lbl="${E_ON} Enable Section";  _toggle_cb="do_dpi_toggle_${sec}_1"
+            fi
+            kb="{\"inline_keyboard\":[
+                [{\"text\":\"${_toggle_lbl}\",\"callback_data\":\"${_toggle_cb}\"}],
+                [{\"text\":\"${E_EDIT} Edit Strategy\",\"callback_data\":\"wait_dpi_strategy_${sec}\"}],
+                [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]
+            ]}"
+            send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "do_dpi_toggle_"*)
+            # Toggle enabled for zapret/byedpi section: do_dpi_toggle_<sec>_<0|1>
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
+            local _dt="${cmd#do_dpi_toggle_}"
+            local _dt_sec="${_dt%_[01]}" _dt_val="${_dt##*_}"
+            # Guard: only act if section really is zapret/byedpi
+            local _dta; _dta=$(uci -q get ${PODKOP_UCI}.${_dt_sec}.action 2>/dev/null)
+            case "$_dta" in
+                zapret|byedpi) ;;
+                *) _handle_settings "section_settings" "$mid" "" ""; return ;;
+            esac
+            uci set ${PODKOP_UCI}.${_dt_sec}.enabled="$_dt_val"
+            uci_commit_safe ${PODKOP_UCI}
+            safe_reload_podkop "force"; sleep 1
+            _handle_settings "${_dta}_section_menu" "$mid" "" ""
+            ;;
+
+                "global_settings")
+            rm -f "$STATE_FILE"
+            local dl quic wan excl_ntp interval outbound_iface yacd_en lan_ip text kb
+            local next_int
+
+            dl=$(get_uci_bool_emoji "${PODKOP_UCI}.settings" "download_lists_via_proxy")
+            quic=$(get_uci_bool_emoji "${PODKOP_UCI}.settings" "disable_quic")
+            wan=$(get_uci_bool_emoji "${PODKOP_UCI}.settings" "enable_badwan_interface_monitoring")
+            excl_ntp=$(get_uci_bool_emoji "${PODKOP_UCI}.settings" "exclude_ntp")
+            interval=$(uci -q get ${PODKOP_UCI}.settings.update_interval || echo "1d")
+            outbound_iface=$(uci -q get ${PODKOP_UCI}.settings.output_network_interface 2>/dev/null || echo "auto")
+            yacd_en=$(uci -q get ${PODKOP_UCI}.settings.enable_yacd || echo "0")
+            lan_ip=$(uci -q get network.lan.ipaddr || echo "127.0.0.1")
+
+            next_int="1h"
+            [ "$interval" = "1h" ]  && next_int="6h"
+            [ "$interval" = "6h" ]  && next_int="12h"
+            [ "$interval" = "12h" ] && next_int="1d"
+            [ "$interval" = "1d" ]  && next_int="3d"
+            [ "$interval" = "3d" ]  && next_int="1h"
+
+            local yacd_url_line=""
+            [ "$yacd_en" = "1" ] && yacd_url_line=$(printf '\n<b>YACD URL:</b> <code>http://%s:9090/ui</code>' "$lan_ip")
+
+            text=$(cat <<EOF
+${E_GLOB} <b>Global Settings</b>
+<code>────────────────────</code>
+<b>Outbound iface:</b> <code>${outbound_iface}</code>
+<b>Update interval:</b> <code>${interval}</code>
+<b>Disable QUIC:</b> ${quic} | <b>Excl. NTP:</b> ${excl_ntp}
+<b>DL via Proxy:</b> ${dl} | <b>Bad WAN:</b> ${wan}
+<b>YACD:</b> $([ "$yacd_en" = "1" ] && echo "${E_ON} Enabled" || echo "${E_OFF} Disabled")${yacd_url_line}
+EOF
+)
+            kb="{\"inline_keyboard\":["
+            kb="${kb}[{\"text\":\"${E_NET} Outbound: ${outbound_iface}\",\"callback_data\":\"cmd_set_outbound_iface\"},{\"text\":\"Update: ${interval}\",\"callback_data\":\"set_update_int_${next_int}\"}],"
+            kb="${kb}[{\"text\":\"${quic} Disable QUIC\",\"callback_data\":\"ask_toggle_quic\"},{\"text\":\"${excl_ntp} Excl. NTP\",\"callback_data\":\"ask_toggle_ntp\"}],"
+            kb="${kb}[{\"text\":\"${dl} DL via Proxy\",\"callback_data\":\"ask_toggle_dl\"},{\"text\":\"${wan} Bad WAN\",\"callback_data\":\"ask_toggle_wan\"}],"
+            kb="${kb}[{\"text\":\"${E_NET} DNS\",\"callback_data\":\"dns_settings\"},{\"text\":\"${E_STAT} YACD: $([ "$yacd_en" = "1" ] && echo "ON" || echo "OFF")\",\"callback_data\":\"ask_toggle_yacd\"}],"
+            kb="${kb}[{\"text\":\"${E_SCAN} Bad WAN Details\",\"callback_data\":\"badwan_details\"}],"
+            kb="${kb}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "proxy_mode_menu")
             local current_mode
-            current_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "selector")
+            current_mode=$(get_section_type "$sec")
+            local current_mode_short; current_mode_short="${current_mode#proxy:}"
             local pm_txt kb_pm
-            pm_txt=$(printf '%s <b>Proxy Mode</b> [<code>%s</code>]\n\nCurrent: <code>%s</code>\n\n<b>url</b> — single proxy URL (proxy_string)\n<b>selector</b> — manual proxy selection\n<b>urltest</b> — auto best-ping selection\n<b>outbound</b> — raw sing-box JSON (LuCI/console only)' \
-                "$E_TGT" "$sec" "$current_mode")
+            local _pm_modes _pm_desc
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                _pm_modes="selector urltest"
+                _pm_desc="<b>selector</b> — manual proxy selection\n<b>urltest</b> — auto best-ping (toggle urltest_enabled)"
+            else
+                _pm_modes="url selector urltest outbound"
+                _pm_desc="<b>url</b> — single proxy URL (proxy_string)\n<b>selector</b> — manual proxy selection\n<b>urltest</b> — auto best-ping selection\n<b>outbound</b> — raw sing-box JSON (LuCI/console only)"
+            fi
+            pm_txt=$(printf '%s <b>Proxy Mode</b> [<code>%s</code>]\n\nCurrent: <code>%s</code>\n\n%s' \
+                "$E_TGT" "$sec" "$current_mode_short" "$_pm_desc")
             kb_pm="{\"inline_keyboard\":[["
-            for _m in url selector urltest outbound; do
-                if [ "$_m" = "$current_mode" ]; then
+            for _m in $_pm_modes; do
+                if [ "$_m" = "$current_mode_short" ]; then
                     kb_pm="${kb_pm}{\"text\":\"${E_OK} ${_m}\",\"callback_data\":\"proxy_mode_menu\"},"
                 else
                     kb_pm="${kb_pm}{\"text\":\"${_m}\",\"callback_data\":\"ask_switch_mode_${_m}\"},"
                 fi
             done
             # Remove trailing comma, close row and add back button
-            kb_pm="${kb_pm%,}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+            kb_pm="${kb_pm%,}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}"
             send_or_edit "$mid" "$pm_txt" "$kb_pm"
             ;;
 
         "ask_switch_mode_"*)
             local target_mode="${cmd#ask_switch_mode_}"
             local current_mode warn_txt kb
-            current_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "selector")
+            current_mode=$(get_section_type "$sec")
             case "$target_mode" in
                 urltest)
-                    local _utl_count
-                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; }; _utl_count=$#; }
-                    if [ "${_utl_count:-0}" -eq 0 ]; then
-                        warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
+                    if [ "$PODKOP_VARIANT" = "plus" ]; then
+                        # Plus: urltest_enabled flag, servers come from subscription
+                        local _sub_count; _sub_count=$(get_subscription_server_count "$sec")
+                        warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy from subscription.\n<b>You will no longer manually select a proxy.</b>\n%s <b>%s</b> subscription server(s) available.\n\nSection: <code>%s</code>' "$E_WARN" "$E_OK" "${_sub_count:-0}" "$sec")
                     else
-                        warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n%s <b>%s</b> URLTest link(s) ready.\n\nSection: <code>%s</code>' "$E_WARN" "$E_OK" "$_utl_count" "$sec")
+                        local _utl_count
+                        _utl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count=0; [ -n "$_utl_raw" ] && { { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; }; _utl_count=$#; }
+                        if [ "${_utl_count:-0}" -eq 0 ]; then
+                            warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\n%s <b>URLTest Proxy Links is empty!</b>\npodkop will fail to start after switching.\n\n<b>Add links first:</b> Settings → Core → URLTest → Proxy Links\n\nSection: <code>%s</code>' "$E_ERR" "$E_ERR" "$sec")
+                        else
+                            warn_txt=$(printf '%s <b>Switch to URLTest mode?</b>\n\nURLTest: sing-box auto-picks the fastest proxy.\n<b>You will no longer manually select a proxy.</b>\n%s <b>%s</b> URLTest link(s) ready.\n\nSection: <code>%s</code>' "$E_WARN" "$E_OK" "$_utl_count" "$sec")
+                        fi
                     fi
                     ;;
                 selector)
-                    local _sel_count _utl_count_back
-                    _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; _sel_count=$#; }
-                    _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count_back=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; _utl_count_back=$#; }
-                    if [ "${_sel_count:-0}" -eq 0 ] && [ "${_utl_count_back:-0}" -gt 0 ]; then
-                        warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\n%s <b>Selector Proxy Links is empty!</b>\nURLTest has %s link(s) that can be cloned.\n\nSection: <code>%s</code>' \
-                            "$E_WARN" "$E_WARN" "$_utl_count_back" "$sec")
+                    if [ "$PODKOP_VARIANT" = "plus" ]; then
+                        # Plus: just toggle urltest_enabled off, subscription servers stay
+                        local _sub_count2; _sub_count2=$(get_subscription_server_count "$sec")
+                        warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy from subscription.\n%s <b>%s</b> subscription server(s) available.\n\nSection: <code>%s</code>' "$E_WARN" "$E_OK" "${_sub_count2:-0}" "$sec")
                     else
-                        warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' \
-                            "$E_WARN" "$sec")
+                        local _sel_count _utl_count_back
+                        _sel_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; _sel_count=$#; }
+                        _utl_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_count_back=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; _utl_count_back=$#; }
+                        if [ "${_sel_count:-0}" -eq 0 ] && [ "${_utl_count_back:-0}" -gt 0 ]; then
+                            warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\n%s <b>Selector Proxy Links is empty!</b>\nURLTest has %s link(s) that can be cloned.\n\nSection: <code>%s</code>' \
+                                "$E_WARN" "$E_WARN" "$_utl_count_back" "$sec")
+                        else
+                            warn_txt=$(printf '%s <b>Switch to Selector mode?</b>\n\nSelector: you manually pick the active proxy.\n\nSection: <code>%s</code>' \
+                                "$E_WARN" "$sec")
+                        fi
                     fi
                     ;;
                 url)
-                    local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+                    local _ps; _ps=$(uci -q get ${PODKOP_UCI}.${sec}.proxy_string 2>/dev/null)
                     if [ -z "$_ps" ]; then
                         warn_txt=$(printf '%s <b>Switch to URL mode?</b>\n\n%s <b>No proxy URL configured!</b>\nIf you switch without setting a URL first, podkop will crash on reload.\n\n<b>You will be prompted to enter the URL immediately after confirming.</b>\n\nSection: <code>%s</code>' "$E_WARN" "$E_ERR" "$sec")
                     else
@@ -3693,7 +4552,7 @@ EOF
             local _kb_extra=""
             if [ "$target_mode" = "urltest" ]; then
                 local _utl_c _sel_c
-                _utl_raw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { { _ucl=$(uci_list_clean "$_utl_raw2"); eval "set -- $_ucl"; }; _utl_c=$#; }
+                _utl_raw2=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c=0; [ -n "$_utl_raw2" ] && { { _ucl=$(uci_list_clean "$_utl_raw2"); eval "set -- $_ucl"; }; _utl_c=$#; }
                 # Use Clash API count — captures ALL proxies, not just those added via bot
                 _sel_c=$(clash_request "/proxies" 2>/dev/null | \
                     jq -r --arg sel "$(get_selector_tag "")" '.proxies[$sel].all | length // 0' 2>/dev/null)
@@ -3704,8 +4563,8 @@ EOF
             # For selector: add clone button when urltest has links but selector is empty
             if [ "$target_mode" = "selector" ]; then
                 local _sel_c2 _utl_c2
-                _sel_lraw2=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_c2=0; [ -n "$_sel_lraw2" ] && { { _ucl=$(uci_list_clean "$_sel_lraw2"); eval "set -- $_ucl"; }; _sel_c2=$#; }
-                _utl_lraw2=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c2=0; [ -n "$_utl_lraw2" ] && { { _ucl=$(uci_list_clean "$_utl_lraw2"); eval "set -- $_ucl"; }; _utl_c2=$#; }
+                _sel_lraw2=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); _sel_c2=0; [ -n "$_sel_lraw2" ] && { { _ucl=$(uci_list_clean "$_sel_lraw2"); eval "set -- $_ucl"; }; _sel_c2=$#; }
+                _utl_lraw2=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); _utl_c2=0; [ -n "$_utl_lraw2" ] && { { _ucl=$(uci_list_clean "$_utl_lraw2"); eval "set -- $_ucl"; }; _utl_c2=$#; }
                 if [ "${_sel_c2:-0}" -eq 0 ] && [ "${_utl_c2:-0}" -gt 0 ]; then
                     _kb_extra="[{\"text\":\"${E_RST} Clone ${_utl_c2} links from URLTest first\",\"callback_data\":\"cmd_clone_utl_to_sel\"}],"
                 fi
@@ -3716,16 +4575,24 @@ EOF
 
         "do_switch_mode_"*)
             local target_mode="${cmd#do_switch_mode_}"
+            # Plus has no url/outbound proxy_config_type — block stale buttons
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                case "$target_mode" in
+                    url|outbound)
+                        send_or_edit "$mid" "$(printf '%s This mode is not available on Podkop Plus.' "$E_WARN")" \
+                            "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}" ; return ;;
+                esac
+            fi
             # Defense-in-depth: re-check list non-empty at do-stage (not only ask-stage).
             # If user ignored the warning and pressed "Yes, Switch" anyway on an empty list
             # podkop would fatal abort on reload and drop the entire tunnel.
             # url mode uses a state-machine delay (wait_url_link) — same pattern here.
             case "$target_mode" in
                 url)
-                    local _ps; _ps=$(uci -q get podkop.${sec}.proxy_string 2>/dev/null)
+                    local _ps; _ps=$(uci -q get ${PODKOP_UCI}.${sec}.proxy_string 2>/dev/null)
                     if [ -z "$_ps" ]; then
-                        uci set podkop.${sec}.proxy_config_type="url"
-                        uci_commit_safe podkop
+                        uci set ${PODKOP_UCI}.${sec}.proxy_config_type="url"
+                        uci_commit_safe ${PODKOP_UCI}
                         echo "wait_url_link" > "$STATE_FILE"
                         send_or_edit "$mid" \
                             "$(printf '%s <b>URL mode set.</b>\n\n%s <b>Reload is held</b> until you send a proxy URL.\nSend the link now (vless://, hy2://, trojan://, ss://, ...).\n\nTo cancel and revert to Selector, tap the button below.' \
@@ -3735,53 +4602,71 @@ EOF
                     fi
                     ;;
                 urltest)
-                    local _utl_raw _utl_c=0
-                    _utl_raw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
-                    [ -n "$_utl_raw" ] && { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; _utl_c=$#; }
-                    if [ "$_utl_c" -eq 0 ]; then
-                        send_or_edit "$mid" \
-                            "$(printf '%s <b>Refused: URLTest list is empty.</b>\n\nSwitching now would crash podkop on reload.\nAdd links first via URLTest Settings, or clone from Selector.' "$E_ERR")" \
-                            "{\"inline_keyboard\":[[{\"text\":\"${E_RST} URLTest Settings\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
-                        return
+                    # Plus: servers from subscription, no urltest_proxy_links to check
+                    if [ "$PODKOP_VARIANT" != "plus" ]; then
+                        local _utl_raw _utl_c=0
+                        _utl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+                        [ -n "$_utl_raw" ] && { _ucl=$(uci_list_clean "$_utl_raw"); eval "set -- $_ucl"; _utl_c=$#; }
+                        if [ "$_utl_c" -eq 0 ]; then
+                            send_or_edit "$mid" \
+                                "$(printf '%s <b>Refused: URLTest list is empty.</b>\n\nSwitching now would crash podkop on reload.\nAdd links first via URLTest Settings, or clone from Selector.' "$E_ERR")" \
+                                "{\"inline_keyboard\":[[{\"text\":\"${E_RST} URLTest Settings\",\"callback_data\":\"urltest_settings\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
+                            return
+                        fi
                     fi
                     ;;
                 selector)
-                    local _sel_raw _sel_c=0
-                    _sel_raw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
-                    [ -n "$_sel_raw" ] && { _ucl=$(uci_list_clean "$_sel_raw"); eval "set -- $_ucl"; _sel_c=$#; }
-                    if [ "$_sel_c" -eq 0 ]; then
-                        send_or_edit "$mid" \
-                            "$(printf '%s <b>Refused: Selector list is empty.</b>\n\nSwitching now would crash podkop on reload.\nAdd links first, or clone from URLTest.' "$E_ERR")" \
-                            "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
-                        return
+                    # Plus: servers from subscription, no selector_proxy_links to check
+                    if [ "$PODKOP_VARIANT" != "plus" ]; then
+                        local _sel_raw _sel_c=0
+                        _sel_raw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                        [ -n "$_sel_raw" ] && { _ucl=$(uci_list_clean "$_sel_raw"); eval "set -- $_ucl"; _sel_c=$#; }
+                        if [ "$_sel_c" -eq 0 ]; then
+                            send_or_edit "$mid" \
+                                "$(printf '%s <b>Refused: Selector list is empty.</b>\n\nSwitching now would crash podkop on reload.\nAdd links first, or clone from URLTest.' "$E_ERR")" \
+                                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
+                            return
+                        fi
                     fi
                     ;;
             esac
-            uci set podkop.${sec}.proxy_config_type="$target_mode"
-            uci_commit_safe podkop
+            # Apply mode switch — variant-aware
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                # Plus uses urltest_enabled flag instead of proxy_config_type
+                case "$target_mode" in
+                    urltest)  uci set ${PODKOP_UCI}.${sec}.urltest_enabled="1" ;;
+                    selector) uci set ${PODKOP_UCI}.${sec}.urltest_enabled="0" ;;
+                esac
+            else
+                uci set ${PODKOP_UCI}.${sec}.proxy_config_type="$target_mode"
+            fi
+            uci_commit_safe ${PODKOP_UCI}
             # Invalidate caches: mode switch changes which links list is active,
             # stale TAG_NAME_CACHE/UCI_LINKS_CACHE would show old proxy names.
             rm -f "$TAG_NAME_CACHE" "$UCI_LINKS_CACHE" "$TAG_URI_CACHE"
             send_or_edit "$mid" "$(printf '%s Applying mode switch to <code>%s</code>...' "$E_RST" "$target_mode")" ""
             safe_reload_podkop "force"; sleep 1
-            _handle_settings "advanced_settings" "$mid" "" ""
+            _handle_settings "section_settings" "$mid" "" ""
             ;;
 
-        "set_update_int_"*) uci set podkop.settings.update_interval="${cmd#set_update_int_}"; uci_commit_safe podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
-        "set_log_"*)        uci set podkop.settings.log_level="${cmd#set_log_}";               uci_commit_safe podkop; safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
+        "set_update_int_"*) uci set ${PODKOP_UCI}.settings.update_interval="${cmd#set_update_int_}"; uci_commit_safe ${PODKOP_UCI}; _handle_settings "global_settings" "$mid" "" "" ;;
+        "set_log_"*)
+            # v0.15.1: log_level removed from bot UI. Use LuCI or SSH.
+            send_or_edit "$mid" "$(printf '%s Log level is no longer managed by the bot.\nUse LuCI or SSH to change it.' "$E_WARN")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"global_settings\"}]]}" ;;
 
-        "ask_toggle_dl")   send_or_edit "$mid" "$(printf '%s Toggle download lists via proxy?' "$E_WARN")"  "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_dl\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
-        "ask_toggle_quic") send_or_edit "$mid" "$(printf '%s Toggle QUIC blocking?' "$E_WARN")"             "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_quic\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
-        "ask_toggle_wan")  send_or_edit "$mid" "$(printf '%s Toggle bad WAN monitoring?' "$E_WARN")"        "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_wan\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
-        "ask_toggle_ntp")  send_or_edit "$mid" "$(printf '%s Toggle NTP exclusion?' "$E_WARN")"             "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_ntp\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
+        "ask_toggle_dl")   send_or_edit "$mid" "$(printf '%s Toggle download lists via proxy?' "$E_WARN")"  "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_dl\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"global_settings\"}]]}" ;;
+        "ask_toggle_quic") send_or_edit "$mid" "$(printf '%s Toggle QUIC blocking?' "$E_WARN")"             "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_quic\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"global_settings\"}]]}" ;;
+        "ask_toggle_wan")  send_or_edit "$mid" "$(printf '%s Toggle bad WAN monitoring?' "$E_WARN")"        "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_wan\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"global_settings\"}]]}" ;;
+        "ask_toggle_ntp")  send_or_edit "$mid" "$(printf '%s Toggle NTP exclusion?' "$E_WARN")"             "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_ntp\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"global_settings\"}]]}" ;;
         "ask_toggle_mixed")
-            local _mp; _mp=$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null)
-            local _cur_me; _cur_me=$(uci -q get podkop.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
+            local _mp; _mp=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null)
+            local _cur_me; _cur_me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
             local _note=""
             if [ "$_cur_me" != "1" ] && [ -z "$_mp" ]; then
                 # Calculate what port would be auto-assigned
                 local _used _candidate=2080
-                _used=$(uci -q show podkop 2>/dev/null \
+                _used=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
                     | grep '\.mixed_proxy_port=' \
                     | sed "s/.*mixed_proxy_port='//;s/'$//" \
                     | grep -E '^[0-9]+$')
@@ -3792,24 +4677,31 @@ EOF
                 _note="\n\n<i>Port not set — will auto-assign ${_candidate}.</i>"
             fi
             send_or_edit "$mid" "$(printf '%s Toggle Mixed Proxy (SOCKS5 listener on port %s)?%s' "$E_WARN" "${_mp:-2080}" "$_note")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_mixed\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_mixed\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "conn_type_menu")
-            local curr_ct; curr_ct=$(uci -q get podkop.${sec}.connection_type || echo "proxy")
+            local curr_ct
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                curr_ct=$(uci -q get ${PODKOP_UCI}.${sec}.action 2>/dev/null || echo "proxy")
+            else
+                curr_ct=$(get_section_type "$sec" | cut -d: -f1)
+            fi
             local ct_txt; ct_txt=$(printf '%s <b>Connection Type</b> [<code>%s</code>]\n\nCurrent: <code>%s</code>\n\n<b>proxy</b> - route matched traffic through VPN tunnel\n<b>vpn</b> - full tunnel, all traffic through VPN\n<b>block</b> - drop matched traffic\n<b>exclusion</b> - matched traffic bypasses tunnel' "$E_SET" "$sec" "$curr_ct")
+            local _excl_btn=",{\"text\":\"Exclusion\",\"callback_data\":\"do_set_conn_exclusion\"}"
+            [ "$PODKOP_VARIANT" = "plus" ] && _excl_btn=",{\"text\":\"Direct\",\"callback_data\":\"do_set_conn_direct\"}"
             send_or_edit "$mid" "$ct_txt" \
-                "{\"inline_keyboard\":[[{\"text\":\"Proxy\",\"callback_data\":\"do_set_conn_proxy\"},{\"text\":\"VPN\",\"callback_data\":\"do_set_conn_vpn\"},{\"text\":\"Block\",\"callback_data\":\"do_set_conn_block\"},{\"text\":\"Exclusion\",\"callback_data\":\"do_set_conn_exclusion\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"Proxy\",\"callback_data\":\"do_set_conn_proxy\"},{\"text\":\"VPN\",\"callback_data\":\"do_set_conn_vpn\"},{\"text\":\"Block\",\"callback_data\":\"do_set_conn_block\"}${_excl_btn}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}"
             ;;
         "do_set_conn_"*)
             local new_ct="${cmd#do_set_conn_}"
             # VPN guard: podkop aborts if connection_type=vpn and interface is not set.
             # Mirror the url-mode guard: save the type, hold reload, ask for interface.
             if [ "$new_ct" = "vpn" ]; then
-                local _vpn_iface; _vpn_iface=$(uci -q get podkop.${sec}.interface 2>/dev/null)
+                local _vpn_iface; _vpn_iface=$(uci -q get ${PODKOP_UCI}.${sec}.interface 2>/dev/null)
                 if [ -z "$_vpn_iface" ]; then
-                    uci set podkop.${sec}.connection_type="vpn"
-                    uci_commit_safe podkop
+                    set_section_action "$sec" "vpn"
+                    uci_commit_safe ${PODKOP_UCI}
                     echo "wait_vpn_iface" > "$STATE_FILE"
                     send_or_edit "$mid"                         "$(printf '%s <b>VPN mode set.</b>
 
@@ -3818,29 +4710,29 @@ Send the UCI interface name now (e.g. <code>wg0</code>, <code>tun0</code>, <code
 
 Without this, podkop will abort on reload with "VPN interface is not set".
 
-To cancel and revert to Proxy, tap below.'                             "$E_WARN" "$E_ERR")"                         "{"inline_keyboard":[[{"text":"${E_BACK} Cancel — revert to Proxy","callback_data":"do_set_conn_proxy"}]]}"
+To cancel and revert to Proxy, tap below.'                             "$E_WARN" "$E_ERR")"                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel — revert to Proxy\",\"callback_data\":\"do_set_conn_proxy\"}]]}"
                     return
                 fi
             fi
-            uci set podkop.${sec}.connection_type="$new_ct"
-            uci_commit_safe podkop
+            set_section_action "$sec" "$new_ct"
+            uci_commit_safe ${PODKOP_UCI}
             send_or_edit "$mid" "$(printf '%s Applying connection type <code>%s</code>...' "$E_RST" "$new_ct")" ""
             safe_reload_podkop "force"; sleep 1
-            _handle_settings "advanced_settings" "$mid" "" ""
+            _handle_settings "section_settings" "$mid" "" ""
             ;;
 
-        "do_toggle_dl")   toggle_uci_bool "podkop.settings" "download_lists_via_proxy";           safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
-        "do_toggle_quic") toggle_uci_bool "podkop.settings" "disable_quic";                        safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
-        "do_toggle_wan")  toggle_uci_bool "podkop.settings" "enable_badwan_interface_monitoring";   safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
-        "do_toggle_ntp")  toggle_uci_bool "podkop.settings" "exclude_ntp";                         safe_reload_podkop; _handle_settings "advanced_settings" "$mid" "" "" ;;
+        "do_toggle_dl")   toggle_uci_bool "${PODKOP_UCI}.settings" "download_lists_via_proxy";           safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
+        "do_toggle_quic") toggle_uci_bool "${PODKOP_UCI}.settings" "disable_quic";                        safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
+        "do_toggle_wan")  toggle_uci_bool "${PODKOP_UCI}.settings" "enable_badwan_interface_monitoring";   safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
+        "do_toggle_ntp")  toggle_uci_bool "${PODKOP_UCI}.settings" "exclude_ntp";                         safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
         "do_toggle_mixed")
-            local _cur_me; _cur_me=$(uci -q get podkop.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
+            local _cur_me; _cur_me=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "0")
             # When enabling mixed proxy — ensure required parameters are set
             if [ "$_cur_me" != "1" ]; then
-                [ -z "$(uci -q get podkop.${sec}.mixed_proxy_port 2>/dev/null)" ] && {
+                [ -z "$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port 2>/dev/null)" ] && {
                     # Find a free port — collect all ports already used by other sections
                     local _used_ports _candidate=2080
-                    _used_ports=$(uci -q show podkop 2>/dev/null \
+                    _used_ports=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
                         | grep '\.mixed_proxy_port=' \
                         | sed "s/.*mixed_proxy_port='//;s/'$//" \
                         | grep -E '^[0-9]+$')
@@ -3848,35 +4740,35 @@ To cancel and revert to Proxy, tap below.'                             "$E_WARN"
                     while echo "$_used_ports" | grep -qx "$_candidate"; do
                         _candidate=$((_candidate + 1))
                     done
-                    uci set podkop.${sec}.mixed_proxy_port="${_candidate}"
+                    uci set ${PODKOP_UCI}.${sec}.mixed_proxy_port="${_candidate}"
                     logger -t podkop-bot "[Config] Auto-set mixed_proxy_port=${_candidate} for section ${sec}"
                 }
             fi
-            toggle_uci_bool "podkop.${sec}" "mixed_proxy_enabled"
+            toggle_uci_bool "${PODKOP_UCI}.${sec}" "mixed_proxy_enabled"
             if safe_reload_podkop; then
-                _handle_settings "advanced_settings" "$mid" "" ""
+                _handle_settings "section_settings" "$mid" "" ""
             else
                 send_or_edit "$mid" "$(printf '%s <b>Reload failed</b>\n\nPodkop could not apply the config change.\nMixed proxy toggle was saved to UCI but sing-box did not restart.\n\nCheck: <code>logread | grep podkop</code>' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             fi
             ;;
 
         "ask_toggle_autostart_off")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Disable Podkop autostart?</b>\n\nPodkop will NOT start on reboot.\nYou can re-enable it here at any time.' "$E_WARN")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Disable\",\"callback_data\":\"do_autostart_off\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Disable\",\"callback_data\":\"do_autostart_off\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}" ;;
         "ask_toggle_autostart_on")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Enable Podkop autostart?</b>\n\nPodkop will start automatically on every reboot.' "$E_WARN")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Enable\",\"callback_data\":\"do_autostart_on\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Enable\",\"callback_data\":\"do_autostart_on\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}" ;;
         "do_autostart_off")
-            /etc/init.d/podkop disable 2>/dev/null
+            ${PODKOP_INIT} disable 2>/dev/null
             send_or_edit "$mid" "$(printf '%s Podkop autostart <b>disabled</b>.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}" ;;
         "do_autostart_on")
-            /etc/init.d/podkop enable 2>/dev/null
+            ${PODKOP_INIT} enable 2>/dev/null
             send_or_edit "$mid" "$(printf '%s Podkop autostart <b>enabled</b>.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}" ;;
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}" ;;
     esac
 }
 
@@ -3899,8 +4791,8 @@ _handle_section_extras() {
                     send_message "$(printf '%s Invalid URL. Must start with http:// or https://' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
                 else
-                    uci set podkop.${sec}.urltest_testing_url="$val"
-                    uci_commit_safe podkop; safe_reload_podkop
+                    uci set ${PODKOP_UCI}.${sec}.urltest_testing_url="$val"
+                    uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
                     _handle_section_extras "urltest_settings" "" "" ""
                 fi ;;
             wait_urltest_interval)
@@ -3910,8 +4802,8 @@ _handle_section_extras() {
                     send_message "$(printf '%s Invalid interval. Examples: 3m, 180s, 1h' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
                 else
-                    uci set podkop.${sec}.urltest_check_interval="$val"
-                    uci_commit_safe podkop; safe_reload_podkop
+                    uci set ${PODKOP_UCI}.${sec}.urltest_check_interval="$val"
+                    uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
                     _handle_section_extras "urltest_settings" "" "" ""
                 fi ;;
             wait_urltest_tolerance)
@@ -3921,21 +4813,21 @@ _handle_section_extras() {
                     send_message "$(printf '%s Invalid value. Enter a number in milliseconds (e.g. 50).' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_settings\"}]]}"
                 else
-                    uci set podkop.${sec}.urltest_tolerance="$val"
-                    uci_commit_safe podkop; safe_reload_podkop
+                    uci set ${PODKOP_UCI}.${sec}.urltest_tolerance="$val"
+                    uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
                     _handle_section_extras "urltest_settings" "" "" ""
                 fi ;;
             wait_dr_server)
                 delete_message "$mid"
                 local val; val=$(printf '%s' "$text" | tr -d '\r\n\t ')
-                uci set podkop.${sec}.domain_resolver_dns_server="$val"
-                uci_commit_safe podkop; safe_reload_podkop
+                uci set ${PODKOP_UCI}.${sec}.domain_resolver_dns_server="$val"
+                uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
                 _handle_section_extras "domain_resolver_settings" "" "" "" ;;
             wait_badwan_ifaces)
                 delete_message "$mid"
                 local val; val=$(printf '%s' "$text" | tr -d '\r\n')
-                uci set podkop.settings.badwan_monitored_interfaces="$val"
-                uci_commit_safe podkop; safe_reload_podkop
+                uci set ${PODKOP_UCI}.settings.badwan_monitored_interfaces="$val"
+                uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
                 _handle_section_extras "badwan_details" "" "" "" ;;
             wait_badwan_delay)
                 delete_message "$mid"
@@ -3944,8 +4836,8 @@ _handle_section_extras() {
                     send_message "$(printf '%s Invalid value. Enter seconds (e.g. 10).' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"badwan_details\"}]]}"
                 else
-                    uci set podkop.settings.badwan_reload_delay="$val"
-                    uci_commit_safe podkop; safe_reload_podkop
+                    uci set ${PODKOP_UCI}.settings.badwan_reload_delay="$val"
+                    uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
                     _handle_section_extras "badwan_details" "" "" ""
                 fi ;;
             wait_mixed_port)
@@ -3953,56 +4845,56 @@ _handle_section_extras() {
                 local val; val=$(printf '%s' "$text" | tr -d '\n\r\t ')
                 if ! echo "$val" | grep -qE '^[0-9]+$' || [ "$val" -lt 1024 ] || [ "$val" -gt 65535 ]; then
                     send_message "$(printf '%s Invalid port. Must be 1024-65535.' "$E_ERR")" \
-                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
+                        "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
                 else
-                    uci set podkop.${sec}.mixed_proxy_port="$val"
-                    uci_commit_safe podkop
+                    uci set ${PODKOP_UCI}.${sec}.mixed_proxy_port="$val"
+                    uci_commit_safe ${PODKOP_UCI}
                     send_message "$(printf '%s Port set to %s. Applying...' "$E_OK" "$val")" ""
                     safe_reload_podkop "force"; sleep 1
-                    _handle_settings "advanced_settings" "" "" ""
+                    _handle_settings "section_settings" "" "" ""
                 fi ;;
             wait_outbound_iface)
                 delete_message "$mid"
                 local val; val=$(printf '%s' "$text" | tr -d '\r\n\t ')
                 if [ -z "$val" ]; then
-                    uci delete podkop.settings.output_network_interface 2>/dev/null
-                    uci set podkop.settings.enable_output_network_interface="0"
+                    uci delete ${PODKOP_UCI}.settings.output_network_interface 2>/dev/null
+                    uci set ${PODKOP_UCI}.settings.enable_output_network_interface="0"
                 else
-                    uci set podkop.settings.output_network_interface="$val"
-                    uci set podkop.settings.enable_output_network_interface="1"
+                    uci set ${PODKOP_UCI}.settings.output_network_interface="$val"
+                    uci set ${PODKOP_UCI}.settings.enable_output_network_interface="1"
                 fi
-                uci_commit_safe podkop
+                uci_commit_safe ${PODKOP_UCI}
                 send_message "$(printf '%s Interface set to: %s. Applying...' "$E_OK" "${val:-auto}")" ""
                 safe_reload_podkop "force"; sleep 1
-                _handle_settings "advanced_settings" "" "" "" ;;
+                _handle_settings "global_settings" "" "" "" ;;
             wait_vpn_iface)
                 delete_message "$mid"
                 local val; val=$(printf '%s' "$text" | tr -d '
 	 ')
                 if [ -z "$val" ]; then
-                    send_message "$(printf '%s Interface name cannot be empty. Send the UCI interface name (e.g. wg0, tun0) or tap Cancel.' "$E_ERR")"                         "{"inline_keyboard":[[{"text":"${E_BACK} Cancel — revert to Proxy","callback_data":"do_set_conn_proxy"}]]}"
+                    send_message "$(printf '%s Interface name cannot be empty. Send the UCI interface name (e.g. wg0, tun0) or tap Cancel.' "$E_ERR")"                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel — revert to Proxy\",\"callback_data\":\"do_set_conn_proxy\"}]]}"
                     # Keep state — wait for valid input
                 else
-                    uci set podkop.${sec}.interface="$val"
-                    uci_commit_safe podkop
+                    uci set ${PODKOP_UCI}.${sec}.interface="$val"
+                    uci_commit_safe ${PODKOP_UCI}
                     send_message "$(printf '%s VPN interface set to <code>%s</code>. Applying...' "$E_OK" "$val")" ""
                     safe_reload_podkop "force"; sleep 1
-                    _handle_settings "advanced_settings" "" "" ""
+                    _handle_settings "section_settings" "" "" ""
                 fi
                 ;;
 
             wait_utl_link)
                 delete_message "$mid"
                 local safe_link; safe_link=$(printf "%s" "$text" | tr -d '\r\n' | sed 's/[[:space:]]//g')
-                if ! echo "$safe_link" | grep -qE '^(vless|hy2|hysteria2|ss|trojan|vmess|tuic)://'; then
-                    send_message "$(printf '%s <b>Invalid protocol!</b>\nExpected: vless://, hy2://, ss://, trojan://, vmess://, tuic://' "$E_ERR")" \
+                if ! echo "$safe_link" | grep -qE '^(vless|vmess|ss|trojan|hy2|hysteria2|socks|socks4|socks4a|socks5)://'; then
+                    send_message "$(printf '%s <b>Invalid protocol!</b>\n<i>vless, vmess, ss, trojan, hy2, socks5…</i>' "$E_ERR")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_links_menu\"}]]}"
                 elif get_urltest_proxy_links "$sec" | grep -qxF "$safe_link"; then
                     send_message "$(printf '%s <b>Duplicate!</b> Link already in list.' "$E_WARN")" \
                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_links_menu\"}]]}"
                 else
-                    uci add_list podkop.${sec}.urltest_proxy_links="$safe_link"
-                    uci_commit_safe podkop
+                    uci add_list ${PODKOP_UCI}.${sec}.urltest_proxy_links="$safe_link"
+                    uci_commit_safe ${PODKOP_UCI}
                     send_message "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
                     safe_reload_podkop "force"; sleep 1
                     _handle_section_extras "urltest_links_menu" "" "" ""
@@ -4012,14 +4904,131 @@ _handle_section_extras() {
     fi
 
     case "$cmd" in
+        "wait_utfilter_exc_"*|"wait_utfilter_inc_"*|"wait_utfilter_excob_"*|"wait_utfilter_incob_"*)
+            # Enter edit state for URLTest filter list
+            local _wcb_full="${cmd#wait_utfilter_}"
+            local _wcb_type="${_wcb_full%%_*}"
+            local _wcb_sec="${_wcb_full#*_}"
+            local _wcb_field _wcb_label _wcb_hint
+            case "$_wcb_type" in
+                exc)   _wcb_field="urltest_exclude_countries"; _wcb_label="Exclude Countries"; _wcb_hint="RU,BY,KZ" ;;
+                inc)   _wcb_field="urltest_include_countries"; _wcb_label="Include Countries"; _wcb_hint="NL,DE,FI" ;;
+                excob) _wcb_field="urltest_exclude_outbounds"; _wcb_label="Exclude Outbounds"; _wcb_hint="server tag names, one per line" ;;
+                incob) _wcb_field="urltest_include_outbounds"; _wcb_label="Include Outbounds"; _wcb_hint="server tag names, one per line" ;;
+            esac
+            local _wcb_cur; _wcb_cur=$(uci -q show ${PODKOP_UCI}.${_wcb_sec}.${_wcb_field} 2>/dev/null |                 cut -d= -f2- | tr "'" "
+" | grep -v "^$" | tr "
+" ",")
+            echo "$cmd" > "$STATE_FILE"
+            send_or_edit "$mid"                 "$(printf '%s <b>%s for section <code>%s</code></b>\n\nCurrent: <code>%s</code>\n\nSend new value (e.g. <code>%s</code>) or /cancel.'                     "$E_EDIT" "$_wcb_label" "$_wcb_sec"                     "$(html_escape "${_wcb_cur:-none}")" "$_wcb_hint")"                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"urltest_filters_menu\"}]]}"
+            ;;
+
+        "wait_dpi_strategy_"*)
+            # Enter strategy edit state for DPI section
+            local _wds_sec="${cmd#wait_dpi_strategy_}"
+            local _wds_act; _wds_act=$(uci -q get ${PODKOP_UCI}.${_wds_sec}.action 2>/dev/null)
+            local _wds_field _wds_cur
+            if [ "$_wds_act" = "zapret" ]; then
+                _wds_field="nfqws_opt"
+            else
+                _wds_field="byedpi_cmd_opts"
+            fi
+            _wds_cur=$(uci -q get ${PODKOP_UCI}.${_wds_sec}.${_wds_field} 2>/dev/null || echo "")
+            echo "$cmd" > "$STATE_FILE"
+            send_or_edit "$mid"                 "$(printf '%s <b>Enter %s strategy for section <code>%s</code></b>\n\nCurrent:\n<code>%s</code>\n\nSend new strategy string or /cancel.'                     "$E_EDIT" "$([ "$_wds_act" = "zapret" ] && echo "nfqws" || echo "byedpi")" "$_wds_sec"                     "$(html_escape "${_wds_cur:-not set}")")"                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"${_wds_act}_section_menu\"}]]}"
+            ;;
+
+        "urltest_filters_menu")
+            # URLTest filters — Plus only (urltest_filter_mode, countries, regex, outbounds)
+            rm -f "$STATE_FILE"
+            if [ "$PODKOP_VARIANT" != "plus" ]; then
+                send_or_edit "$mid" "$(printf '%s URLTest filters are only available on Podkop Plus.' "$E_WARN")"                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
+                return
+            fi
+            local _fm _dc _exc _inc _exc_ob _inc_ob _exc_re _inc_re _hide text kb
+            _fm=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_filter_mode 2>/dev/null || echo "disabled")
+            _dc=$(uci -q get ${PODKOP_UCI}.${sec}.detect_server_country 2>/dev/null || echo "0")
+            _exc=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_exclude_countries 2>/dev/null | tr "'" "
+" | grep -v "^$" | tr "
+" "," | sed "s/,$//")
+            _inc=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_include_countries 2>/dev/null | tr "'" "
+" | grep -v "^$" | tr "
+" "," | sed "s/,$//")
+            local _exc_ob_raw _inc_ob_raw _exc_ob_disp _inc_ob_disp
+            _exc_ob_raw=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_exclude_outbounds 2>/dev/null | tr "'" "\n" | grep -v "^$")
+            _inc_ob_raw=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_include_outbounds 2>/dev/null | tr "'" "\n" | grep -v "^$")
+            _exc_ob=$(printf '%s' "$_exc_ob_raw" | grep -c "." 2>/dev/null || echo 0)
+            _inc_ob=$(printf '%s' "$_inc_ob_raw" | grep -c "." 2>/dev/null || echo 0)
+            _exc_ob_disp=$(printf '%s' "$_exc_ob_raw" | head -3 | sed 's/^/  • /')
+            [ "${_exc_ob:-0}" -gt 3 ] && _exc_ob_disp="${_exc_ob_disp}\n  (+$((_exc_ob-3)) more)"
+            _inc_ob_disp=$(printf '%s' "$_inc_ob_raw" | head -3 | sed 's/^/  • /')
+            [ "${_inc_ob:-0}" -gt 3 ] && _inc_ob_disp="${_inc_ob_disp}\n  (+$((_inc_ob-3)) more)"
+            _inc_ob=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_include_outbounds 2>/dev/null | tr "'" "
+" | grep -vc "^$")
+            _exc_re=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_exclude_regex 2>/dev/null | tr "'" "
+" | grep -vc "^$")
+            _inc_re=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_include_regex 2>/dev/null | tr "'" "
+" | grep -vc "^$")
+            _hide=$(get_uci_bool_emoji "${PODKOP_UCI}.${sec}" "urltest_hide_filtered_outbounds")
+            local _dc_icon; [ "$_dc" = "1" ] && _dc_icon="${E_ON}" || _dc_icon="${E_OFF}"
+            text=$(cat <<EOF
+${E_TGT} <b>URLTest Filters</b> [<code>${sec}</code>]
+<i>Filter servers by country, name or regex before URLTest picks the fastest.</i>
+<code>────────────────────</code>
+<b>Filter mode:</b> <code>${_fm}</code>
+<b>Detect country:</b> ${_dc_icon}
+<b>Hide filtered:</b> ${_hide}
+$([ -n "$_exc" ] && printf "<b>Excl countries:</b> <code>%s</code>\n" "$_exc")$([ -n "$_inc" ] && printf "<b>Incl countries:</b> <code>%s</code>\n" "$_inc")$([ "${_exc_ob:-0}" -gt 0 ] && printf "<b>Excl outbounds (%d):</b>\n%s\n" "$_exc_ob" "$_exc_ob_disp")$([ "${_inc_ob:-0}" -gt 0 ] && printf "<b>Incl outbounds (%d):</b>\n%s\n" "$_inc_ob" "$_inc_ob_disp")$([ "${_exc_ob:-0}" -eq 0 ] && [ "${_inc_ob:-0}" -eq 0 ] && printf "<b>Outbound filters:</b> none")
+$([ "$_exc_re" -gt 0 ] 2>/dev/null && printf "<b>Excl regex:</b> %d rules\n" "$_exc_re")$([ "$_inc_re" -gt 0 ] 2>/dev/null && printf "<b>Incl regex:</b> %d rules\n" "$_inc_re")
+EOF
+)
+            # Filter mode cycle: disabled → exclude → include → disabled
+            local _next_fm
+            case "$_fm" in
+                disabled) _next_fm="exclude" ;;
+                exclude)  _next_fm="include" ;;
+                *)        _next_fm="disabled" ;;
+            esac
+            kb="{\"inline_keyboard\":[
+                [{\"text\":\"Mode: ${_fm}\",\"callback_data\":\"do_utfilter_mode_${_next_fm}\"},{\"text\":\"${_dc_icon} Detect Country\",\"callback_data\":\"do_utfilter_toggle_dc\"}],
+                [{\"text\":\"${_hide} Hide Filtered\",\"callback_data\":\"do_utfilter_toggle_hide\"}],
+                [{\"text\":\"${E_EDIT} Excl Countries\",\"callback_data\":\"wait_utfilter_exc_${sec}\"},{\"text\":\"${E_EDIT} Incl Countries\",\"callback_data\":\"wait_utfilter_inc_${sec}\"}],
+                [{\"text\":\"${E_EDIT} Excl Outbounds\",\"callback_data\":\"wait_utfilter_excob_${sec}\"},{\"text\":\"${E_EDIT} Incl Outbounds\",\"callback_data\":\"wait_utfilter_incob_${sec}\"}],
+                [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]
+            ]}"
+            send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "do_utfilter_mode_"*)
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
+            uci set ${PODKOP_UCI}.${sec}.urltest_filter_mode="${cmd#do_utfilter_mode_}"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
+            local _ufw; _ufw=$(_utf_postcheck_warn "$sec")
+            [ -n "$_ufw" ] && send_or_edit "$mid" "$(printf '%s Filter mode changed.%s' "$E_OK" "$_ufw")"                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_filters_menu\"}]]}" && return
+            _handle_settings "urltest_filters_menu" "$mid" "" "" ;;
+
+        "do_utfilter_toggle_dc")
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
+            toggle_uci_bool "${PODKOP_UCI}.${sec}" "detect_server_country"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
+            local _ufd; _ufd=$(_utf_postcheck_warn "$sec")
+            [ -n "$_ufd" ] && send_or_edit "$mid" "$(printf '%s Setting changed.%s' "$E_OK" "$_ufd")"                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"urltest_filters_menu\"}]]}" && return
+            _handle_settings "urltest_filters_menu" "$mid" "" "" ;;
+
+        "do_utfilter_toggle_hide")
+            [ "$PODKOP_VARIANT" = "plus" ] || { _handle_settings "section_settings" "$mid" "" ""; return; }
+            toggle_uci_bool "${PODKOP_UCI}.${sec}" "urltest_hide_filtered_outbounds"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
+            _handle_settings "urltest_filters_menu" "$mid" "" "" ;;
+
         "urltest_settings")
             rm -f "$STATE_FILE"
             local ut_url ut_interval ut_tol ut_links_count sel_links_count
-            ut_url=$(uci -q get podkop.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
-            ut_interval=$(uci -q get podkop.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
-            ut_tol=$(uci -q get podkop.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
-            _utl_lraw=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
-            _sel_lraw=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
+            ut_url=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_testing_url 2>/dev/null || echo "https://www.gstatic.com/generate_204 (default)")
+            ut_interval=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_check_interval 2>/dev/null || echo "3m (default)")
+            ut_tol=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_tolerance 2>/dev/null || echo "50 (default)")
+            _utl_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-); ut_links_count=0; [ -n "$_utl_lraw" ] && { { _ucl=$(uci_list_clean "$_utl_lraw"); eval "set -- $_ucl"; }; ut_links_count=$#; }
+            _sel_lraw=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-); sel_links_count=0; [ -n "$_sel_lraw" ] && { { _ucl=$(uci_list_clean "$_sel_lraw"); eval "set -- $_ucl"; }; sel_links_count=$#; }
             local _clone_btn=""
             if [ "${sel_links_count:-0}" -gt 0 ]; then
                 _clone_btn="[{\"text\":\"${E_RST} Clone from Selector (${sel_links_count})\",\"callback_data\":\"cmd_clone_sel_to_utl\"}],"
@@ -4037,14 +5046,14 @@ _handle_section_extras() {
             send_or_edit "$mid" \
                 "$(printf '%s <b>URLTest Settings</b> [<code>%s</code>]\n\n<b>Testing URL:</b>\n<code>%s</code>\n\n<b>Check Interval:</b> <code>%s</code>\n<i>How often sing-box tests proxies. Format: 3m, 180s, 1h</i>\n\n<b>Tolerance:</b> <code>%s ms</code>\n<i>Max latency diff to switch proxies. Lower = more switching.</i>\n\n<b>Proxy Links:</b> %s entries%b' \
                     "$E_TGT" "$sec" "$ut_url" "$ut_interval" "$ut_tol" "$ut_links_count" "$_links_hint")" \
-                "{\"inline_keyboard\":[${_clone_btn}[{\"text\":\"${E_EDIT} Testing URL\",\"callback_data\":\"cmd_set_ut_url\"},{\"text\":\"${E_EDIT} Interval\",\"callback_data\":\"cmd_set_ut_interval\"}],[{\"text\":\"${E_EDIT} Tolerance\",\"callback_data\":\"cmd_set_ut_tolerance\"},{\"text\":\"${E_GLOB} Proxy Links\",\"callback_data\":\"urltest_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
+                "{\"inline_keyboard\":[${_clone_btn}[{\"text\":\"${E_EDIT} Testing URL\",\"callback_data\":\"cmd_set_ut_url\"},{\"text\":\"${E_EDIT} Interval\",\"callback_data\":\"cmd_set_ut_interval\"}],[{\"text\":\"${E_EDIT} Tolerance\",\"callback_data\":\"cmd_set_ut_tolerance\"},{\"text\":\"${E_GLOB} Proxy Links\",\"callback_data\":\"urltest_links_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "cmd_set_ut_url")
             echo "wait_urltest_url" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set URLTest Testing URL</b>\n\nCurrent: <code>%s</code>\n\nSend new URL (must start with http:// or https://).\nDefault: <code>https://www.gstatic.com/generate_204</code>' \
-                    "$E_EDIT" "$(uci -q get podkop.${sec}.urltest_testing_url || echo "not set")")" \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_testing_url || echo "not set")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
@@ -4052,7 +5061,7 @@ _handle_section_extras() {
             echo "wait_urltest_interval" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set URLTest Check Interval</b>\n\nCurrent: <code>%s</code>\n\nFormat: <code>3m</code>, <code>180s</code>, <code>1h</code>\nDefault: 3m' \
-                    "$E_EDIT" "$(uci -q get podkop.${sec}.urltest_check_interval || echo "not set")")" \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_check_interval || echo "not set")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
@@ -4060,16 +5069,16 @@ _handle_section_extras() {
             echo "wait_urltest_tolerance" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set URLTest Tolerance</b>\n\nCurrent: <code>%s ms</code>\n\nEnter value in milliseconds.\nDefault: 50ms. Lower values cause more proxy switching.' \
-                    "$E_EDIT" "$(uci -q get podkop.${sec}.urltest_tolerance || echo "not set")")" \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.urltest_tolerance || echo "not set")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"urltest_settings\"}]]}"
             ;;
 
         "domain_resolver_settings")
             rm -f "$STATE_FILE"
             local dr_en dr_type dr_server dr_en_icon
-            dr_en=$(uci -q get podkop.${sec}.domain_resolver_enabled 2>/dev/null || echo "0")
-            dr_type=$(uci -q get podkop.${sec}.domain_resolver_dns_type 2>/dev/null || echo "udp")
-            dr_server=$(uci -q get podkop.${sec}.domain_resolver_dns_server 2>/dev/null || echo "not set")
+            dr_en=$(uci -q get ${PODKOP_UCI}.${sec}.domain_resolver_enabled 2>/dev/null || echo "0")
+            dr_type=$(uci -q get ${PODKOP_UCI}.${sec}.domain_resolver_dns_type 2>/dev/null || echo "udp")
+            dr_server=$(uci -q get ${PODKOP_UCI}.${sec}.domain_resolver_dns_server 2>/dev/null || echo "not set")
             dr_en_icon=$([ "$dr_en" = "1" ] && echo "$E_ON" || echo "$E_OFF")
 
             # Cycle DNS type: udp -> doh -> dot -> udp
@@ -4082,18 +5091,18 @@ _handle_section_extras() {
                     "$E_NET" "$sec" "$dr_en_icon" \
                     "$([ "$dr_en" = "1" ] && echo "yes" || echo "no")" \
                     "$dr_type" "$dr_server")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${dr_en_icon} Toggle\",\"callback_data\":\"do_toggle_dr\"},{\"text\":\"DNS Type: ${dr_type}\",\"callback_data\":\"set_dr_type_${next_dr_type}\"}],[{\"text\":\"${E_EDIT} DNS Server\",\"callback_data\":\"cmd_set_dr_server\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${dr_en_icon} Toggle\",\"callback_data\":\"do_toggle_dr\"},{\"text\":\"DNS Type: ${dr_type}\",\"callback_data\":\"set_dr_type_${next_dr_type}\"}],[{\"text\":\"${E_EDIT} DNS Server\",\"callback_data\":\"cmd_set_dr_server\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "do_toggle_dr")
-            toggle_uci_bool "podkop.${sec}" "domain_resolver_enabled"
-            uci_commit_safe podkop; safe_reload_podkop
+            toggle_uci_bool "${PODKOP_UCI}.${sec}" "domain_resolver_enabled"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
             _handle_section_extras "domain_resolver_settings" "$mid" "" ""
             ;;
 
         "set_dr_type_"*)
-            uci set podkop.${sec}.domain_resolver_dns_type="${cmd#set_dr_type_}"
-            uci_commit_safe podkop; safe_reload_podkop
+            uci set ${PODKOP_UCI}.${sec}.domain_resolver_dns_type="${cmd#set_dr_type_}"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop
             _handle_section_extras "domain_resolver_settings" "$mid" "" ""
             ;;
 
@@ -4101,16 +5110,16 @@ _handle_section_extras() {
             echo "wait_dr_server" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set Domain Resolver DNS Server</b>\n\nCurrent: <code>%s</code>\n\nSend new value.\nExamples: <code>8.8.8.8</code>, <code>dns.google</code>, <code>https://dns.google/dns-query</code>' \
-                    "$E_EDIT" "$(uci -q get podkop.${sec}.domain_resolver_dns_server || echo "not set")")" \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.domain_resolver_dns_server || echo "not set")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"domain_resolver_settings\"}]]}"
             ;;
 
         "badwan_details")
             rm -f "$STATE_FILE"
             local bw_en bw_ifaces bw_delay bw_en_icon
-            bw_en=$(uci -q get podkop.settings.enable_badwan_interface_monitoring 2>/dev/null || echo "0")
-            bw_ifaces=$(uci -q get podkop.settings.badwan_monitored_interfaces 2>/dev/null || echo "not set")
-            bw_delay=$(uci -q get podkop.settings.badwan_reload_delay 2>/dev/null || echo "10 (default)")
+            bw_en=$(uci -q get ${PODKOP_UCI}.settings.enable_badwan_interface_monitoring 2>/dev/null || echo "0")
+            bw_ifaces=$(uci -q get ${PODKOP_UCI}.settings.badwan_monitored_interfaces 2>/dev/null || echo "not set")
+            bw_delay=$(uci -q get ${PODKOP_UCI}.settings.badwan_reload_delay 2>/dev/null || echo "10 (default)")
             bw_en_icon=$([ "$bw_en" = "1" ] && echo "$E_ON" || echo "$E_OFF")
 
             send_or_edit "$mid" \
@@ -4118,14 +5127,14 @@ _handle_section_extras() {
                     "$E_SCAN" "$bw_en_icon" \
                     "$([ "$bw_en" = "1" ] && echo "yes" || echo "no")" \
                     "$bw_ifaces" "$bw_delay")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${bw_en_icon} Toggle\",\"callback_data\":\"do_toggle_wan\"},{\"text\":\"${E_EDIT} Interfaces\",\"callback_data\":\"cmd_set_bw_ifaces\"}],[{\"text\":\"${E_EDIT} Reload Delay\",\"callback_data\":\"cmd_set_bw_delay\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${bw_en_icon} Toggle\",\"callback_data\":\"do_toggle_wan\"},{\"text\":\"${E_EDIT} Interfaces\",\"callback_data\":\"cmd_set_bw_ifaces\"}],[{\"text\":\"${E_EDIT} Reload Delay\",\"callback_data\":\"cmd_set_bw_delay\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "cmd_set_bw_ifaces")
             echo "wait_badwan_ifaces" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set Monitored Interfaces</b>\n\nCurrent: <code>%s</code>\n\nSend space-separated interface names.\nExample: <code>wan wan6</code>\nLeave blank to clear (monitor default WAN).' \
-                    "$E_EDIT" "$(uci -q get podkop.settings.badwan_monitored_interfaces || echo "not set")")" \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.settings.badwan_monitored_interfaces || echo "not set")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"badwan_details\"}]]}"
             ;;
 
@@ -4133,7 +5142,7 @@ _handle_section_extras() {
             echo "wait_badwan_delay" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set Reload Delay</b>\n\nCurrent: <code>%s s</code>\n\nSeconds to wait after WAN change before reload.\nDefault: 10' \
-                    "$E_EDIT" "$(uci -q get podkop.settings.badwan_reload_delay || echo "10")")" \
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.settings.badwan_reload_delay || echo "10")")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"badwan_details\"}]]}"
             ;;
 
@@ -4141,16 +5150,16 @@ _handle_section_extras() {
             echo "wait_mixed_port" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set Mixed Proxy Port</b>\n\nCurrent: <code>%s</code>\n\nEnter port number (1024-65535).\nDefault: 2080\n\n%s Changing the port requires reload. Make sure no other service uses this port.' \
-                    "$E_EDIT" "$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")" "$E_WARN")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")" "$E_WARN")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "cmd_set_outbound_iface")
             echo "wait_outbound_iface" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Set Outbound Interface</b>\n\nCurrent: <code>%s</code>\n\n<i>Global setting — applies to all podkop sections.</i>\nEnter UCI interface name (e.g. <code>wan</code>, <code>wwan0</code>).\nLeave blank to reset to auto.' \
-                    "$E_EDIT" "$(uci -q get podkop.settings.output_network_interface || echo "auto")")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"advanced_settings\"}]]}"
+                    "$E_EDIT" "$(uci -q get ${PODKOP_UCI}.settings.output_network_interface || echo "auto")")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"section_settings\"}]]}"
             ;;
 
         "urltest_links_menu"|"urltest_links_p_"*)
@@ -4237,7 +5246,7 @@ EOF
                 if [ -z "$_full_link" ]; then
                     # Fallback: try live uci show
                     local _raw_uci
-                    _raw_uci=$(uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
+                    _raw_uci=$(uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | cut -d= -f2-)
                     if [ -n "$_raw_uci" ]; then
                         { _ucl=$(uci_list_clean "$_raw_uci"); eval "set -- $_ucl"; }
                         for _l in "$@"; do
@@ -4251,16 +5260,16 @@ EOF
                     _not_found=$((_not_found + 1)); continue
                 fi
                 # Skip duplicates already in urltest_proxy_links
-                if uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | grep -qF "'${_full_link}'"; then
+                if uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | grep -qF "'${_full_link}'"; then
                     _skipped=$((_skipped + 1))
                 else
-                    uci add_list podkop.${sec}.urltest_proxy_links="$_full_link"
+                    uci add_list ${PODKOP_UCI}.${sec}.urltest_proxy_links="$_full_link"
                     _added=$((_added + 1))
                 fi
             done < "$proxy_names_file"
             rm -f "$proxy_names_file"
 
-            uci_commit_safe podkop
+            uci_commit_safe ${PODKOP_UCI}
             build_tag_name_cache
 
             local _result
@@ -4276,7 +5285,7 @@ EOF
             # Symmetric counterpart of cmd_clone_sel_to_utl.
             local _added=0 _skipped=0
             local _utl_raw_c _item_c
-            _utl_raw_c=$(uci -q show podkop.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
+            _utl_raw_c=$(uci -q show ${PODKOP_UCI}.${sec}.urltest_proxy_links 2>/dev/null | cut -d= -f2-)
             if [ -z "$_utl_raw_c" ]; then
                 send_or_edit "$mid" "$(printf '%s URLTest Proxy Links is empty — nothing to clone.' "$E_ERR")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}"
@@ -4285,14 +5294,14 @@ EOF
             { _ucl=$(uci_list_clean "$_utl_raw_c"); eval "set -- $_ucl"; }
             for _item_c in "$@"; do
                 [ -z "$_item_c" ] && continue
-                if uci -q show podkop.${sec}.selector_proxy_links 2>/dev/null | grep -qF "'${_item_c}'"; then
+                if uci -q show ${PODKOP_UCI}.${sec}.selector_proxy_links 2>/dev/null | grep -qF "'${_item_c}'"; then
                     _skipped=$((_skipped + 1))
                 else
-                    uci add_list podkop.${sec}.selector_proxy_links="$_item_c"
+                    uci add_list ${PODKOP_UCI}.${sec}.selector_proxy_links="$_item_c"
                     _added=$((_added + 1))
                 fi
             done
-            uci_commit_safe podkop
+            uci_commit_safe ${PODKOP_UCI}
             build_all_caches
             local _result2
             if [ "$_added" -eq 0 ] && [ "$_skipped" -gt 0 ]; then
@@ -4309,7 +5318,7 @@ EOF
         "cmd_utl_add")
             echo "wait_utl_link" > "$STATE_FILE"
             send_or_edit "$mid" \
-                "$(printf '%s <b>Add URLTest Outbound Link</b>\n\n<i>(vless, hy2, hysteria2, ss, trojan, vmess, tuic)</i>\n\nOne link per message.' "$E_EDIT")" \
+                "$(printf '%s <b>Add URLTest Outbound Link</b>\n\n<i>(vless, hy2, hysteria2, ss, trojan, vmess, socks)</i>\n\nOne link per message.' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"urltest_links_menu\"}]]}"
             ;;
 
@@ -4343,8 +5352,8 @@ EOF
 $(get_urltest_proxy_links "$sec")
 EOF
             [ -n "$link_to_del" ] && {
-                uci del_list podkop.${sec}.urltest_proxy_links="$link_to_del"
-                uci_commit_safe podkop; safe_reload_podkop "force"; sleep 1
+                uci del_list ${PODKOP_UCI}.${sec}.urltest_proxy_links="$link_to_del"
+                uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
             }
             _handle_section_extras "urltest_links_menu" "$mid" "" ""
             ;;
@@ -4362,12 +5371,12 @@ _handle_dns() {
         local srv=$(printf "%s" "$text" | tr -d '\r\n\t ')
         if [ "$state" = "wait_dns_server" ]; then
             delete_message "$mid"
-            uci set podkop.settings.dns_server="$srv"; uci_commit_safe podkop
+            uci set ${PODKOP_UCI}.settings.dns_server="$srv"; uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s DNS Server set to: %s' "$E_OK" "$srv")" ""
             safe_reload_podkop "force"; sleep 1; _handle_dns "dns_settings" "" "" ""
         elif [ "$state" = "wait_bootstrap_dns" ]; then
             delete_message "$mid"
-            uci set podkop.settings.bootstrap_dns_server="$srv"; uci_commit_safe podkop
+            uci set ${PODKOP_UCI}.settings.bootstrap_dns_server="$srv"; uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s Bootstrap DNS set to: %s' "$E_OK" "$srv")" ""
             safe_reload_podkop "force"; sleep 1; _handle_dns "dns_settings" "" "" ""
         fi
@@ -4378,9 +5387,9 @@ _handle_dns() {
         "dns_settings")
             rm -f "$STATE_FILE"
             local protocol server boot_dns kb_boot text kb
-            protocol=$(uci -q get podkop.settings.dns_type || echo "udp")
-            server=$(uci -q get podkop.settings.dns_server || echo "Not set")
-            boot_dns=$(uci -q get podkop.settings.bootstrap_dns_server || echo "Not set")
+            protocol=$(uci -q get ${PODKOP_UCI}.settings.dns_type || echo "udp")
+            server=$(uci -q get ${PODKOP_UCI}.settings.dns_server || echo "Not set")
+            boot_dns=$(uci -q get ${PODKOP_UCI}.settings.bootstrap_dns_server || echo "Not set")
             local proto_hint
             case "$protocol" in
                 udp)  proto_hint="${E_IDEA} <i>UDP: fast, unencrypted DNS. ISP can see your queries.</i>" ;;
@@ -4403,12 +5412,12 @@ EOF
             kb_boot=""
             [ "$protocol" = "doh" ] || [ "$protocol" = "dot" ] && \
                 kb_boot="[{\"text\":\"${E_EDIT} Set Bootstrap\",\"callback_data\":\"cmd_boot_dns\"}],"
-            kb="{\"inline_keyboard\":[${kb_boot}[{\"text\":\"Protocol: ${protocol}\",\"callback_data\":\"dns_proto_menu\"}],[{\"text\":\"${E_EDIT} Change Server\",\"callback_data\":\"cmd_dns_server\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[${kb_boot}[{\"text\":\"Protocol: ${protocol}\",\"callback_data\":\"dns_proto_menu\"}],[{\"text\":\"${E_EDIT} Change Server\",\"callback_data\":\"cmd_dns_server\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
         "cmd_dns_server")
             echo "wait_dns_server" > "$STATE_FILE"
-            local _cur_dns; _cur_dns=$(uci -q get podkop.settings.dns_server || echo "not set")
+            local _cur_dns; _cur_dns=$(uci -q get ${PODKOP_UCI}.settings.dns_server || echo "not set")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Change DNS Server</b>\n\nCurrent: <code>%s</code>\n\nSend new value:\nExample: <code>8.8.8.8</code> or <code>dns.google</code>' "$E_EDIT" "$_cur_dns")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"dns_settings\"}]]}"
@@ -4428,59 +5437,24 @@ EOF
                 "{\"inline_keyboard\":[[{\"text\":\"UDP\",\"callback_data\":\"do_dns_pr_udp\"},{\"text\":\"DoH\",\"callback_data\":\"do_dns_pr_doh\"},{\"text\":\"DoT\",\"callback_data\":\"do_dns_pr_dot\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"dns_settings\"}]]}"
             ;;
         "do_dns_pr_"*)
-            uci set podkop.settings.dns_type="${cmd#do_dns_pr_}"; uci_commit_safe podkop
+            uci set ${PODKOP_UCI}.settings.dns_type="${cmd#do_dns_pr_}"; uci_commit_safe ${PODKOP_UCI}
             safe_reload_podkop; _handle_dns "dns_settings" "$mid" "" ""
             ;;
 
         "yacd_settings")
-            rm -f "$STATE_FILE"
-            local en wn sk text kb
-            en=$(uci -q get podkop.settings.enable_yacd || echo "0")
-            wn=$(uci -q get podkop.settings.enable_yacd_wan_access || echo "0")
-            sk=$(uci -q get podkop.settings.yacd_secret_key || echo "Not set")
-            text=$(cat <<EOF
-${E_STAT} <b>YACD Settings</b> (Global)
+            # v0.15.1: YACD detail management removed from bot (use LuCI for secret/WAN).
+            # Toggle lives in global_settings. Redirect for back-compat.
+            _handle_settings "global_settings" "$mid" "$cid" "$cb_id"
+            ;;
+        "ask_toggle_yacd")     send_or_edit "$mid" "$(printf '%s Toggle YACD?' "$E_WARN")"         "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_yacd\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"global_settings\"}]]}" ;;
+        "ask_toggle_yacd_wan"|"do_toggle_yacd_wan"|"yacd_secret_menu"|"ask_yacd_generate_secret"|"do_yacd_generate_secret"|"ask_yacd_remove_secret"|"do_yacd_remove_secret")
+            # v0.15.1: YACD secret/WAN management removed. Use LuCI or SSH.
+            send_or_edit "$mid" "$(printf '%s YACD WAN access and secret key are managed via LuCI or SSH.\nOnly enable/disable is available in the bot.' "$E_WARN")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"global_settings\"}]]}" ;;
+        "do_toggle_yacd")      toggle_uci_bool "${PODKOP_UCI}.settings" "enable_yacd";            safe_reload_podkop; _handle_settings "global_settings" "$mid" "" "" ;;
+        
 
-YACD: $([ "$en" = "1" ] && echo "${E_ON} Enabled" || echo "${E_OFF} Disabled")
-WAN Access: $([ "$wn" = "1" ] && echo "${E_ON}" || echo "${E_OFF}")
-Secret Key: $([ "$sk" != "Not set" ] && echo "${E_OK} Set" || echo "${E_ERR} Not set")
-EOF
-)
-            kb="{\"inline_keyboard\":[[{\"text\":\"$([ "$en" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") Toggle YACD\",\"callback_data\":\"ask_toggle_yacd\"}],[{\"text\":\"$([ "$wn" = "1" ] && echo "${E_ON}" || echo "${E_OFF}") WAN Access\",\"callback_data\":\"ask_toggle_yacd_wan\"}],[{\"text\":\"${E_KEY} Secret Key\",\"callback_data\":\"yacd_secret_menu\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"advanced_settings\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
-            send_or_edit "$mid" "$text" "$kb"
-            ;;
-        "ask_toggle_yacd")     send_or_edit "$mid" "$(printf '%s Toggle YACD?' "$E_WARN")"         "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_yacd\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"yacd_settings\"}]]}" ;;
-        "ask_toggle_yacd_wan") send_or_edit "$mid" "$(printf '%s Toggle YACD WAN access?' "$E_WARN")" "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_toggle_yacd_wan\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"yacd_settings\"}]]}" ;;
-        "do_toggle_yacd")      toggle_uci_bool "podkop.settings" "enable_yacd";            safe_reload_podkop; _handle_dns "yacd_settings" "$mid" "" "" ;;
-        "do_toggle_yacd_wan")  toggle_uci_bool "podkop.settings" "enable_yacd_wan_access"; safe_reload_podkop; _handle_dns "yacd_settings" "$mid" "" "" ;;
 
-        "yacd_secret_menu")
-            local secret text kb
-            secret=$(uci -q get podkop.settings.yacd_secret_key || echo "Not set")
-            if [ "$secret" = "Not set" ]; then
-                text=$(printf '%s <b>YACD Secret Key</b>\n\n%s No secret key set.' "$E_KEY" "$E_ERR")
-            else
-                text=$(printf '%s <b>YACD Secret Key</b>\n\n%s Set\n\n<code>%s</code>' "$E_KEY" "$E_OK" "$secret")
-            fi
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Generate New\",\"callback_data\":\"ask_yacd_generate_secret\"}],[{\"text\":\"${E_DEL} Remove\",\"callback_data\":\"ask_yacd_remove_secret\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"yacd_settings\"}]]}"
-            send_or_edit "$mid" "$text" "$kb"
-            ;;
-        "ask_yacd_generate_secret") send_or_edit "$mid" "$(printf '%s Generate new secret? This disconnects all dashboards.' "$E_WARN")" "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes\",\"callback_data\":\"do_yacd_generate_secret\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"yacd_secret_menu\"}]]}" ;;
-        "do_yacd_generate_secret")
-            local new_secret
-            new_secret=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c 32 | tr 'a-f' 'A-F')
-            uci set "podkop.settings.yacd_secret_key=${new_secret}"; uci_commit_safe podkop
-            safe_reload_podkop "force"; sleep 1
-            send_or_edit "$mid" "$(printf '%s New Secret:\n<code>%s</code>' "$E_OK" "$new_secret")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"yacd_secret_menu\"}]]}"
-            ;;
-        "ask_yacd_remove_secret") send_or_edit "$mid" "$(printf '%s Remove secret? YACD will be unprotected.' "$E_WARN")" "{\"inline_keyboard\":[[{\"text\":\"${E_WARN} Yes, Remove\",\"callback_data\":\"do_yacd_remove_secret\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"yacd_secret_menu\"}]]}" ;;
-        "do_yacd_remove_secret")
-            uci delete podkop.settings.yacd_secret_key 2>/dev/null; uci_commit_safe podkop
-            safe_reload_podkop "force"; sleep 1
-            send_or_edit "$mid" "$(printf '%s Secret removed.' "$E_OK")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"yacd_settings\"}]]}"
-            ;;
     esac
 }
 
@@ -4499,6 +5473,19 @@ _handle_lists() {
     local sec=$(get_active_section)
 
     if [ "$cmd" = "STATE_INPUT" ]; then
+        # Nav escape: persistent keyboard buttons cancel current state
+        case "$text" in
+            "🏠 Menu"|"/menu"|"main_menu")
+                rm -f "$STATE_FILE"
+                delete_message "$mid"
+                _handle_bot "/menu" "" "" ""
+                return ;;
+            "📊 Status"|"cmd_status")
+                rm -f "$STATE_FILE"
+                delete_message "$mid"
+                _handle_bot "cmd_status" "" "" ""
+                return ;;
+        esac
         rm -f "$STATE_FILE"
 
         if [ "$state" = "wait_fully_routed_ip" ]; then
@@ -4509,7 +5496,7 @@ _handle_lists() {
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"community_lists\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
-            uci add_list podkop.${sec}.fully_routed_ips="$ip"; uci_commit_safe podkop
+            uci add_list ${PODKOP_UCI}.${sec}.fully_routed_ips="$ip"; uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s Routed IP added: %s' "$E_OK" "$ip")" ""
             safe_reload_podkop "force"; sleep 1; _handle_lists "community_lists" "" "" ""
 
@@ -4521,7 +5508,7 @@ _handle_lists() {
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"excl_ips_edit\"}]]}"
                 return
             fi
-            uci add_list podkop.settings.routing_excluded_ips="$ip"; uci_commit_safe podkop
+            uci add_list ${PODKOP_UCI}.settings.routing_excluded_ips="$ip"; uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s Excluded IP added: %s' "$E_OK" "$ip")" ""
             safe_reload_podkop "force"; sleep 1; _handle_lists "excl_ips_edit" "" "" ""
 
@@ -4534,13 +5521,77 @@ _handle_lists() {
                 return
             fi
             if [ "$state" = "wait_remote_domain" ]; then
-                uci add_list podkop.${sec}.remote_domain_lists="$safe_link"
+                uci add_list ${PODKOP_UCI}.${sec}.remote_domain_lists="$safe_link"
             else
-                uci add_list podkop.${sec}.remote_subnet_lists="$safe_link"
+                uci add_list ${PODKOP_UCI}.${sec}.remote_subnet_lists="$safe_link"
             fi
-            uci_commit_safe podkop
+            uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s Remote list saved.' "$E_OK")" ""
             safe_reload_podkop "force"; sleep 1; _handle_lists "community_lists" "" "" ""
+
+        elif printf '%s' "$state" | grep -qE '^wait_utfilter_(exc|inc|excob|incob)_'; then
+            # URLTest filter list edit: wait_utfilter_<type>_<sec>
+            delete_message "$mid"
+            local _utf_full="${state#wait_utfilter_}"
+            local _utf_type="${_utf_full%%_*}"
+            local _utf_sec="${_utf_full#*_}"
+            local _utf_field _utf_label
+            case "$_utf_type" in
+                exc)   _utf_field="urltest_exclude_countries"; _utf_label="exclude countries (2-letter codes, comma-separated)" ;;
+                inc)   _utf_field="urltest_include_countries"; _utf_label="include countries (2-letter codes, comma-separated)" ;;
+                excob) _utf_field="urltest_exclude_outbounds"; _utf_label="exclude outbounds (server tags, one per line)" ;;
+                incob) _utf_field="urltest_include_outbounds"; _utf_label="include outbounds (server tags, one per line)" ;;
+            esac
+            # Parse input: comma-separated → UCI list
+            local _utf_input="$text"
+            # Clear existing list
+            uci -q delete ${PODKOP_UCI}.${_utf_sec}.${_utf_field} 2>/dev/null || true
+            # Add each item
+            local _utf_item
+            printf '%s' "$_utf_input" | tr ",
+" "
+" | while IFS= read -r _utf_item; do
+                _utf_item=$(printf '%s' "$_utf_item" | tr -d ' 	
+')
+                [ -z "$_utf_item" ] && continue
+                uci add_list ${PODKOP_UCI}.${_utf_sec}.${_utf_field}="$_utf_item"
+            done
+            uci_commit_safe ${PODKOP_UCI}
+            safe_reload_podkop "force"; sleep 1
+            local _utf_w; _utf_w=$(_utf_postcheck_warn "$_utf_sec")
+            send_message "$(printf '%s Filter list updated.%s' "$E_OK" "$_utf_w")" ""
+            _handle_settings "urltest_filters_menu" "" "" ""
+
+        elif printf '%s' "$state" | grep -qE '^wait_dpi_strategy_'; then
+            # Edit nfqws_opt (zapret) or byedpi_cmd_opts (byedpi) strategy
+            delete_message "$mid"
+            local _dpi_sec="${state#wait_dpi_strategy_}"
+            local _dpi_act; _dpi_act=$(uci -q get ${PODKOP_UCI}.${_dpi_sec}.action 2>/dev/null)
+            local _strategy_field _validate_cmd
+            if [ "$_dpi_act" = "zapret" ]; then
+                _strategy_field="nfqws_opt"
+                _validate_cmd="validate_nfqws_strategy_json"
+            else
+                _strategy_field="byedpi_cmd_opts"
+                _validate_cmd="validate_byedpi_strategy_json"
+            fi
+            local _new_strategy="$text"
+            # Validate strategy if Plus CLI available
+            if _plus_has_cmd "$_validate_cmd"; then
+                local _vres; _vres=$(${PODKOP_BIN} "$_validate_cmd" "$_new_strategy" 2>/dev/null)
+                local _valid; _valid=$(printf '%s' "$_vres" | jq -r '.valid // true' 2>/dev/null)
+                if [ "$_valid" = "false" ]; then
+                    local _vmsg; _vmsg=$(printf '%s' "$_vres" | jq -r '.message // "Invalid strategy"' 2>/dev/null)
+                    send_message "$(printf '%s Strategy validation failed:\n<code>%s</code>\n\nTry again or send /cancel.' "$E_ERR" "$(html_escape "$_vmsg")")" ""
+                    echo "$state" > "$STATE_FILE"
+                    return
+                fi
+            fi
+            uci set ${PODKOP_UCI}.${_dpi_sec}.${_strategy_field}="$_new_strategy"
+            uci_commit_safe ${PODKOP_UCI}
+            safe_reload_podkop "force"; sleep 1
+            send_message "$(printf '%s Strategy updated.' "$E_OK")" ""
+            _handle_settings "${_dpi_act}_section_menu" "" "" ""
 
         elif [ "$state" = "wait_user_domain_add" ] || [ "$state" = "wait_user_subnet_add" ]; then
             # Add a single line to user_domains_text or user_subnets_text.
@@ -4549,8 +5600,8 @@ _handle_lists() {
             #   subnet list: only IP/CIDR (no domain names)
             delete_message "$mid"
             local entry=$(printf "%s" "$text" | tr -d '\r\n\t ')
-            local field="user_domains_text" back_cb="user_domains_menu"
-            [ "$state" = "wait_user_subnet_add" ] && { field="user_subnets_text"; back_cb="user_subnets_menu"; }
+            local field="user_domains_text" back_cb="user_domains_menu" type_key="user_domain_list_type"
+            [ "$state" = "wait_user_subnet_add" ] && { field="user_subnets_text"; back_cb="user_subnets_menu"; type_key="user_subnet_list_type"; }
 
             if [ "$state" = "wait_user_domain_add" ]; then
                 if ! validate_domain "$entry"; then
@@ -4566,14 +5617,16 @@ _handle_lists() {
                 fi
             fi
             local current
-            current=$(uci -q get podkop.${sec}.${field} 2>/dev/null || echo "")
+            current=$(uci -q get ${PODKOP_UCI}.${sec}.${field} 2>/dev/null || echo "")
             if [ -n "$current" ]; then
-                uci set podkop.${sec}.${field}="${current}
+                uci set ${PODKOP_UCI}.${sec}.${field}="${current}
 ${entry}"
             else
-                uci set podkop.${sec}.${field}="$entry"
+                uci set ${PODKOP_UCI}.${sec}.${field}="$entry"
             fi
-            uci_commit_safe podkop
+            # Ensure podkop reads *_text field (ignored when list_type != text)
+            uci set ${PODKOP_UCI}.${sec}.${type_key}="text"
+            uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s Added: %s' "$E_OK" "$(html_escape "$entry")")" ""
             safe_reload_podkop "force"; sleep 1; _handle_lists "$back_cb" "" "" ""
 
@@ -4581,8 +5634,8 @@ ${entry}"
             # Delete a line from user_domains_text or user_subnets_text by index
             delete_message "$mid"
             local del_idx=$(printf "%s" "$text" | tr -d '\r\n\t ')
-            local field="user_domains_text" back_cb="user_domains_menu"
-            [ "$state" = "wait_user_subnet_del" ] && { field="user_subnets_text"; back_cb="user_subnets_menu"; }
+            local field="user_domains_text" back_cb="user_domains_menu" type_key="user_domain_list_type"
+            [ "$state" = "wait_user_subnet_del" ] && { field="user_subnets_text"; back_cb="user_subnets_menu"; type_key="user_subnet_list_type"; }
 
             case "$del_idx" in
                 ''|*[!0-9]*)
@@ -4592,7 +5645,7 @@ ${entry}"
             esac
 
             local current new_val i=0 line
-            current=$(uci -q get podkop.${sec}.${field} 2>/dev/null || echo "")
+            current=$(uci -q get ${PODKOP_UCI}.${sec}.${field} 2>/dev/null || echo "")
             new_val=""
             while IFS= read -r line; do
                 if [ "$i" -ne "$del_idx" ]; then
@@ -4603,7 +5656,9 @@ ${entry}"
             done <<EOF
 $current
 EOF
-            uci set podkop.${sec}.${field}="$new_val"; uci_commit_safe podkop
+            uci set ${PODKOP_UCI}.${sec}.${field}="$new_val"
+            uci set ${PODKOP_UCI}.${sec}.${type_key}="text"
+            uci_commit_safe ${PODKOP_UCI}
             send_message "$(printf '%s Line %s removed.' "$E_OK" "$del_idx")" ""
             safe_reload_podkop "force"; sleep 1; _handle_lists "$back_cb" "" "" ""
         fi
@@ -4617,17 +5672,17 @@ EOF
             local r_dom_text r_sub_text fr_ips_text active_lists
             local list_url clean_url filename ip raw
 
-            cd_count=$(uci -q get podkop.${sec}.user_domains_text 2>/dev/null | grep -c "[^[:space:]]")
-            sn_count=$(uci -q get podkop.${sec}.user_subnets_text  2>/dev/null | grep -c "[^[:space:]]")
-            fr_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.fully_routed_ips=")
-            r_dom_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.remote_domain_lists=")
-            r_sub_count=$(uci -q show podkop.${sec} 2>/dev/null | grep -c "^podkop\.${sec}\.remote_subnet_lists=")
-            excl_count=$(uci -q show podkop.settings 2>/dev/null | grep -c "^podkop\.settings\.routing_excluded_ips=")
+            cd_count=$(uci -q get ${PODKOP_UCI}.${sec}.user_domains_text 2>/dev/null | grep -c "[^[:space:]]")
+            sn_count=$(uci -q get ${PODKOP_UCI}.${sec}.user_subnets_text  2>/dev/null | grep -c "[^[:space:]]")
+            fr_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.fully_routed_ips=")
+            r_dom_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.remote_domain_lists=")
+            r_sub_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.remote_subnet_lists=")
+            excl_count=$(uci -q show ${PODKOP_UCI}.settings 2>/dev/null | grep -c "^${PODKOP_UCI}\.settings\.routing_excluded_ips=")
 
             # Use safe_set_args for list parsing (glob-safe; uci get N broken on BusyBox)
             r_dom_text=""
             if [ "$r_dom_count" -gt 0 ]; then
-                raw=$(uci -q show podkop.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
+                raw=$(uci -q show ${PODKOP_UCI}.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
                 [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_dom_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_dom_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
@@ -4638,7 +5693,7 @@ EOF
 
             r_sub_text=""
             if [ "$r_sub_count" -gt 0 ]; then
-                raw=$(uci -q show podkop.${sec}.remote_subnet_lists 2>/dev/null | cut -d= -f2-)
+                raw=$(uci -q show ${PODKOP_UCI}.${sec}.remote_subnet_lists 2>/dev/null | cut -d= -f2-)
                 [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_sub_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_sub_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
@@ -4649,7 +5704,7 @@ EOF
 
             fr_ips_text=""
             if [ "$fr_count" -gt 0 ]; then
-                raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
+                raw=$(uci -q show ${PODKOP_UCI}.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
                 [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
                     fr_ips_text=$(printf '%s\n• <code>%s</code>' "$fr_ips_text" "$ip")
                 done
@@ -4657,35 +5712,35 @@ EOF
                 fr_ips_text=$(printf '\n<i>None</i>')
             fi
 
-            active_lists=$(uci -q show podkop.${sec} 2>/dev/null \
-                | grep "^podkop\.${sec}\.community_lists=" \
+            active_lists=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null \
+                | grep "^${PODKOP_UCI}\.${sec}\.community_lists=" \
                 | sed "s/^[^']*'//g; s/'$//g; s/' '/, /g" || echo "<i>None</i>")
 
             text=$(cat <<EOF
 ${E_FILE} <b>Routing & Lists</b> [<code>${sec}</code>]
+<i>What goes through the tunnel — and what bypasses it.</i>
 
-<b>Community Lists:</b>
+<b>Service Lists</b> (predefined sets — which services to tunnel):
 <code>${active_lists}</code>
 
-<b>Remote Domain Lists:</b>${r_dom_text}
+<b>Domain List URLs</b> (external domain lists by URL):${r_dom_text}
 
-<b>Remote Subnet Lists:</b>${r_sub_text}
+<b>Subnet List URLs</b> (external subnet lists by URL):${r_sub_text}
 
-<b>Fully Routed IPs:</b>${fr_ips_text}
+<b>Devices → Tunnel</b> (all their traffic via tunnel):${fr_ips_text}
 
-<b>Custom Domains:</b> ${cd_count} entries
-<b>Custom Subnets:</b> ${sn_count} entries
-<b>Routing Excluded IPs:</b> ${excl_count} entries
+<b>Devices → Bypass:</b> ${excl_count} entries (go direct, skip tunnel)
+<b>My Domains:</b> ${cd_count} · <b>My Subnets:</b> ${sn_count}
 EOF
 )
             local kb
             kb="{\"inline_keyboard\":["
-            kb="${kb}[{\"text\":\"${E_SET} Community Lists\",\"callback_data\":\"community_lists_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_ADD} R-Domain\",\"callback_data\":\"cmd_add_r_dom\"},{\"text\":\"${E_SET} Edit R-Domains\",\"callback_data\":\"r_dom_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_ADD} R-Subnet\",\"callback_data\":\"cmd_add_r_sub\"},{\"text\":\"${E_SET} Edit R-Subnets\",\"callback_data\":\"r_sub_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_ADD} FR IP\",\"callback_data\":\"cmd_add_fr_ip\"},{\"text\":\"${E_SET} Edit FR IPs\",\"callback_data\":\"fr_ips_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_ADD} Excl IP\",\"callback_data\":\"cmd_add_excl_ip\"},{\"text\":\"${E_SET} Edit Excl IPs\",\"callback_data\":\"excl_ips_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_EDIT} Custom Domains\",\"callback_data\":\"user_domains_menu\"},{\"text\":\"${E_EDIT} Custom Subnets\",\"callback_data\":\"user_subnets_menu\"}],"
+            kb="${kb}[{\"text\":\"${E_SET} Service Lists\",\"callback_data\":\"community_lists_edit\"}],"
+            kb="${kb}[{\"text\":\"${E_ADD} + Domain List URL\",\"callback_data\":\"cmd_add_r_dom\"},{\"text\":\"${E_SET} Domain Lists\",\"callback_data\":\"r_dom_edit\"}],"
+            kb="${kb}[{\"text\":\"${E_ADD} + Subnet List URL\",\"callback_data\":\"cmd_add_r_sub\"},{\"text\":\"${E_SET} Subnet Lists\",\"callback_data\":\"r_sub_edit\"}],"
+            kb="${kb}[{\"text\":\"➡️ + Device → Tunnel\",\"callback_data\":\"cmd_add_fr_ip\"},{\"text\":\"➡️ Edit Tunnel Devices\",\"callback_data\":\"fr_ips_edit\"}],"
+            kb="${kb}[{\"text\":\"↩️ + Device → Bypass\",\"callback_data\":\"cmd_add_excl_ip\"},{\"text\":\"↩️ Edit Bypass Devices\",\"callback_data\":\"excl_ips_edit\"}],"
+            kb="${kb}[{\"text\":\"${E_EDIT} My Domains\",\"callback_data\":\"user_domains_menu\"},{\"text\":\"${E_EDIT} My Subnets\",\"callback_data\":\"user_subnets_menu\"}],"
             kb="${kb}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -4726,11 +5781,11 @@ EOF
             case "$tag" in *[!a-z0-9_-]*) send_or_edit "$mid" "$(printf '%s Invalid tag.' "$E_ERR")" ""; return ;; esac
             send_or_edit "$mid" "$(printf '%s Applying...' "$E_RST")" ""
             if is_list_enabled "$sec" "$tag"; then
-                uci del_list podkop.${sec}.community_lists="$tag"
+                uci del_list ${PODKOP_UCI}.${sec}.community_lists="$tag"
             else
-                uci add_list podkop.${sec}.community_lists="$tag"
+                uci add_list ${PODKOP_UCI}.${sec}.community_lists="$tag"
             fi
-            uci_commit_safe podkop; safe_reload_podkop "force"; sleep 1
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
             _handle_lists "community_lists_edit" "$mid" "" ""
             ;;
 
@@ -4740,7 +5795,7 @@ EOF
             [ "$cmd" = "r_sub_edit" ] && { list_type="remote_subnet_lists"; human_type="Remote Subnet Lists"; cb_prefix="del_rsub_"; }
             local rows="" text list_url clean_url filename raw i=0
             text=$(printf '%s <b>Manage %s</b> [<code>%s</code>]\n\n' "$E_FILE" "$human_type" "$sec")
-            raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
+            raw=$(uci -q show ${PODKOP_UCI}.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
                 { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; }
                 for list_url in "$@"; do
@@ -4764,7 +5819,7 @@ EOF
             else
                 idx="${cmd#del_rsub_}"; list_type="remote_subnet_lists"; target="r_sub_edit"
             fi
-            raw=$(uci -q show podkop.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
+            raw=$(uci -q show ${PODKOP_UCI}.${sec}.${list_type} 2>/dev/null | cut -d= -f2-)
             if [ -n "$raw" ]; then
                 { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; }
                 for url in "$@"; do
@@ -4774,8 +5829,8 @@ EOF
             fi
             if [ -n "$list_url" ]; then
                 send_or_edit "$mid" "$(printf '%s Applying...' "$E_RST")" ""
-                uci del_list podkop.${sec}.${list_type}="$list_url"
-                uci_commit_safe podkop; safe_reload_podkop "force"; sleep 1
+                uci del_list ${PODKOP_UCI}.${sec}.${list_type}="$list_url"
+                uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
             fi
             _handle_lists "$target" "$mid" "" ""
             ;;
@@ -4783,7 +5838,7 @@ EOF
         "fr_ips_edit")
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb
-            raw=$(uci -q show podkop.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
+            raw=$(uci -q show ${PODKOP_UCI}.${sec}.fully_routed_ips 2>/dev/null | cut -d= -f2-)
             [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_frip_${ip}\"}],"
             done
@@ -4807,15 +5862,15 @@ EOF
                 send_or_edit "$mid" "$(printf '%s Invalid IP.' "$E_ERR")" ""; return
             fi
             send_or_edit "$mid" "$(printf '%s Applying...' "$E_RST")" ""
-            uci del_list podkop.${sec}.fully_routed_ips="$ip"
-            uci_commit_safe podkop; safe_reload_podkop "force"; sleep 1
+            uci del_list ${PODKOP_UCI}.${sec}.fully_routed_ips="$ip"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
             _handle_lists "fr_ips_edit" "$mid" "" ""
             ;;
 
         "excl_ips_edit")
             rm -f "$STATE_FILE"
             local rows="" ip raw text kb excl_count=0
-            raw=$(uci -q show podkop.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
+            raw=$(uci -q show ${PODKOP_UCI}.settings.routing_excluded_ips 2>/dev/null | cut -d= -f2-)
             [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for ip in "$@"; do
                 rows="${rows}[{\"text\":\"${E_DEL} ${ip}\",\"callback_data\":\"del_excl_${ip}\"}],"
             done
@@ -4838,8 +5893,8 @@ EOF
                 send_or_edit "$mid" "$(printf '%s Invalid IP.' "$E_ERR")" ""; return
             fi
             send_or_edit "$mid" "$(printf '%s Applying...' "$E_RST")" ""
-            uci del_list podkop.settings.routing_excluded_ips="$ip"
-            uci_commit_safe podkop; safe_reload_podkop "force"; sleep 1
+            uci del_list ${PODKOP_UCI}.settings.routing_excluded_ips="$ip"
+            uci_commit_safe ${PODKOP_UCI}; safe_reload_podkop "force"; sleep 1
             _handle_lists "excl_ips_edit" "$mid" "" ""
             ;;
 
@@ -4863,7 +5918,7 @@ EOF
             esac
 
             local per_pg=20 current total total_pages start end idx=0 line list_text
-            current=$(uci -q get podkop.${sec}.${field} 2>/dev/null || echo "")
+            current=$(uci -q get ${PODKOP_UCI}.${sec}.${field} 2>/dev/null || echo "")
             total=$(printf '%s' "$current" | grep -c "[^[:space:]]" 2>/dev/null)
             case "$total" in ''|*[!0-9]*) total=0 ;; esac
             total_pages=$(( (total + per_pg - 1) / per_pg ))
@@ -4931,7 +5986,7 @@ EOF
         "cmd_user_download_"*)
             local field="${cmd#cmd_user_download_}"
             local current tmp_f
-            current=$(uci -q get podkop.${sec}.${field} 2>/dev/null || echo "")
+            current=$(uci -q get ${PODKOP_UCI}.${sec}.${field} 2>/dev/null || echo "")
             tmp_f=$(mktemp /tmp/podkop_userlist.XXXXXX)
             printf '%s\n' "$current" > "$tmp_f"
             api_document "$tmp_f" "${field} [${sec}]"
@@ -5270,7 +6325,7 @@ _handle_bot() {
             else
                 delete_message "$mid"
                 send_message "$(printf '%s Reboot cancelled. You typed: <code>%s</code>' "$E_BACK" "$(html_escape "$input")")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
             fi
             return
         elif [ "$state" = "wait_custom_proxy" ]; then
@@ -5303,8 +6358,19 @@ _handle_bot() {
     fi
 
     case "$cmd" in
+        # Back-compat: the /status slash-command redirects to the cmd_status
+        # screen. IMPORTANT: this pattern must NOT include "cmd_status" itself —
+        # doing so makes this branch call _handle_bot "cmd_status", which matches
+        # this same pattern again → unbounded recursion → the shell aborts and
+        # procd respawns the bot (the "Status crashes & restarts" bug). Plain
+        # "cmd_status" must fall through to the real renderer below.
+        "/status")
+            _handle_bot "cmd_status" "$mid" "" "" ;;
+
         "/start"|"/menu"|"main_menu"|"main_menu_new")
             rm -f "$STATE_FILE"
+            # Install persistent bottom keyboard on /start or /menu
+            install_reply_keyboard_once
             local _stop_start hostname p_ver active_proxy active_proxy_display sec sec_count sec_str text kb
 
             _stop_start="{\"text\":\"${E_STP} Stop Podkop\",\"callback_data\":\"ask_cmd_stop\"}"
@@ -5312,18 +6378,21 @@ _handle_bot() {
                 _stop_start="{\"text\":\"${E_ON} Start Podkop\",\"callback_data\":\"cmd_start\"}"
 
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+            p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
             # Pass cached proxies to avoid extra clash_request
             local proxies; proxies=$(clash_request "/proxies")
             active_proxy=$(get_active_proxy_name "$proxies")
             active_proxy_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             sec=$(get_active_section)
-            sec_count=$(uci -q show podkop 2>/dev/null | grep -cE '^podkop\.[^.=]+=section$')
+            sec_count=$(uci -q show ${PODKOP_UCI} 2>/dev/null | grep -cE "^${PODKOP_UCI}\.[^.=]+=section$")
 
             # Show section name always when >1 section, on its own line before Active Route
             sec_str=""
             [ "$sec_count" -gt 1 ] && sec_str="<b>Section:</b> <code>${sec}</code>"
+
+            # Subscription metadata for Plus (traffic/expiry) — show in main menu
+            # Traffic/expiry shown in Outbounds, not main menu
 
             # NOTE: get_tg_latency intentionally removed from main_menu (was 3s delay per open)
             # Latency is still available in Status and Bot Settings screens.
@@ -5331,44 +6400,46 @@ _handle_bot() {
 <b>${E_RTR} Podkop Manager</b>
 <code>────────────────────</code>
 <b>Host:</b> ${hostname}
-<b>Podkop:</b> ${p_ver:-Unknown} | <b>Bot:</b> v${BOT_VERSION}
-$([ -n "$sec_str" ] && printf '%s\n' "$sec_str")<b>Active Route:</b> <code>${active_proxy_display}</code>
-<b>Transport:</b> ${LAST_ROUTE_NAME}
+<b>Podkop:</b> ${p_ver:-Unknown} (${PODKOP_DISPLAY_NAME}) | <b>Bot:</b> v${BOT_VERSION}
+${sec_str:+${sec_str}
+}<b>Active Route:</b> <code>${active_proxy_display}</code>
+<b>Bot route:</b> ${LAST_ROUTE_NAME}
 <code>────────────────────</code>
 EOF
 )
             kb="{\"inline_keyboard\":["
             # Mode-aware proxy button: label and target depend on proxy_config_type
-            local cur_pct; cur_pct=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            local cur_pct; cur_pct=$(get_section_type "$sec")
             local proxy_btn_lbl proxy_btn_cb
             case "$cur_pct" in
-                urltest)  proxy_btn_lbl="${E_GLOB} Outbounds";      proxy_btn_cb="proxy_menu" ;;
-                url)      proxy_btn_lbl="${E_GLOB} Single URL";      proxy_btn_cb="url_links_menu" ;;
-                outbound) proxy_btn_lbl="${E_GLOB} Outbound";       proxy_btn_cb="outbound_info" ;;
-                *)        proxy_btn_lbl="${E_GLOB} Outbounds"; proxy_btn_cb="proxy_menu" ;;
+                proxy:urltest)      proxy_btn_lbl="${E_GLOB} Outbounds"; proxy_btn_cb="proxy_menu" ;;
+                proxy:url)          proxy_btn_lbl="${E_GLOB} Single URL"; proxy_btn_cb="url_links_menu" ;;
+                proxy:subscription) proxy_btn_lbl="📡 Subscription";     proxy_btn_cb="proxy_menu" ;;
+                outbound)           proxy_btn_lbl="${E_GLOB} Outbound";   proxy_btn_cb="outbound_info" ;;
+                *)                  proxy_btn_lbl="${E_GLOB} Outbounds";  proxy_btn_cb="proxy_menu" ;;
             esac
             kb="${kb}[{\"text\":\"${E_STAT} Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"${proxy_btn_lbl}\",\"callback_data\":\"${proxy_btn_cb}\"}],"
             kb="${kb}[{\"text\":\"${E_SET} Settings\",\"callback_data\":\"main_settings_menu\"},{\"text\":\"${E_RST} Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"}],"
             kb="${kb}[{\"text\":\"${E_BOT} Bot Settings\",\"callback_data\":\"bot_settings\"},${_stop_start}],"
-            kb="${kb}[{\"text\":\"Info / Updates\",\"callback_data\":\"cmd_info\"}]]}"
+            kb="${kb}[{\"text\":\"🔧 Maintenance\",\"callback_data\":\"cmd_maintenance\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "cmd_status")
             local hostname lan_ip wan_ip uptime_sys loadavg mem_free os_ver extra_ifs
-            local podkop_init_status podkop_autostart podkop_mode
-            local sb_state sb_pid sb_ram health_st strategy yacd_en tg_lat sec
-            local active_proxy active_proxy_display text kb proxies pub_ip_display
+            local podkop_running podkop_autostart_ok podkop_mode podkop_mode_lbl
+            local sb_running sb_pid sb_ram sb_ver_st p_ver_st
+            local proxies active_proxy_display pub_ip_display
+            local _h_tgd _h_tgt _h_socks _h_tier2
+            local strategy yacd_en tg_lat sec text kb
 
             hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             os_ver=$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo "OpenWrt")
-            lan_ip=$(uci -q get network.lan.ipaddr || echo "Unknown")
 
-            # FIXED: wan_ip via local routing (no blocking external curl)
+            lan_ip=$(uci -q get network.lan.ipaddr || echo "Unknown")
             wan_ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
                 | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
             [ -z "$wan_ip" ] && wan_ip=$(uci -q get network.wan.ipaddr 2>/dev/null || echo "Unknown")
-
             uptime_sys=$(awk '{d=int($1/86400);h=int(($1%86400)/3600);m=int(($1%3600)/60);printf "%dd %dh %dm",d,h,m}' /proc/uptime)
             loadavg=$(awk '{printf "%s, %s, %s",$1,$2,$3}' /proc/loadavg)
             mem_free=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "0")
@@ -5386,102 +6457,255 @@ EOF
                     printf "%s %s (<code>%s</code>): <code>%s</code>\n", icon, label, iface, ip;
                 }
             }')
-            # $() strips trailing newlines — restore separator so CPU Load stays on its own line
             [ -n "$extra_ifs" ] && extra_ifs="${extra_ifs}
 "
-
-            if /etc/init.d/podkop status 2>&1 | grep -qi "running"; then
-                podkop_init_status="${E_ON} RUNNING"
-            else
-                podkop_init_status="${E_OK} done"
-            fi
-            if /etc/init.d/podkop enabled >/dev/null 2>&1; then
-                podkop_autostart="${E_OK} ENABLED"
-            else
-                podkop_autostart="${E_ERR} DISABLED"
-            fi
+            # Podkop state
+            podkop_running=0
+            ${PODKOP_INIT} status 2>&1 | grep -qi "running" && podkop_running=1
+            podkop_autostart_ok=0
+            ${PODKOP_INIT} enabled >/dev/null 2>&1 && podkop_autostart_ok=1
 
             sec=$(get_active_section)
-            podkop_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "unknown")
-            local podkop_mode_lbl
+            podkop_mode=$(get_section_type "$sec")
             case "$podkop_mode" in
-                selector) podkop_mode_lbl="Selector (manual)" ;;
-                urltest)  podkop_mode_lbl="URLTest (auto-fastest)" ;;
-                url)      podkop_mode_lbl="URL Connection" ;;
-                outbound) podkop_mode_lbl="Outbound Config (LuCI)" ;;
-                *)        podkop_mode_lbl="$podkop_mode" ;;
+                proxy:selector)     podkop_mode_lbl="Selector" ;;
+                proxy:urltest)      podkop_mode_lbl="URLTest" ;;
+                proxy:url)          podkop_mode_lbl="URL" ;;
+                proxy:subscription) podkop_mode_lbl="Subscription" ;;
+                outbound)           podkop_mode_lbl="Outbound" ;;
+                byedpi|zapret)      podkop_mode_lbl="${podkop_mode}" ;;
+                vpn)                podkop_mode_lbl="VPN" ;;
+                *)                  podkop_mode_lbl="${podkop_mode}" ;;
             esac
 
-            if pidof sing-box >/dev/null 2>&1; then sb_state="${E_ON} RUNNING"
-            else sb_state="${E_ERR} STOPPED"; fi
-            sb_pid=$(pidof sing-box 2>/dev/null || echo "n/a")
+            # Sing-box state
+            sb_running=0
+            pidof sing-box >/dev/null 2>&1 && sb_running=1
+            sb_pid=$(pidof sing-box 2>/dev/null || echo "")
             sb_ram="0"
-            [ "$sb_pid" != "n/a" ] && \
+            [ -n "$sb_pid" ] && \
                 sb_ram=$(awk '/VmRSS/{print int($2/1024)}' /proc/"$sb_pid"/status 2>/dev/null || echo "0")
 
-            # Build health summary from SOCKS_STATE_FILE (two TG metrics + SOCKS)
-            local _h_tgd _h_tgt _h_socks _h_tgd_icon _h_tgt_icon _h_socks_icon _h_tunnel_icon
+            # Versions — use Plus get_system_info if available, else manual
+            local _sysinfo _update_avail=""
+            if _plus_has_cmd "get_system_info"; then
+                _sysinfo=$(_plus_json get_system_info)
+                p_ver_st=$(printf '%s' "$_sysinfo" | jq -r '.podkop_version // ""' 2>/dev/null)
+                sb_ver_st=$(printf '%s' "$_sysinfo" | jq -r '.sing_box_version // ""' 2>/dev/null)
+                # Check if update available
+                local _latest; _latest=$(printf '%s' "$_sysinfo" | jq -r '.podkop_latest_version // "unknown"' 2>/dev/null)
+                if [ -n "$_latest" ] && [ "$_latest" != "unknown" ] && [ "$_latest" != "$p_ver_st" ]; then
+                    _update_avail=" → <b>${_latest}</b> available"
+                fi
+            fi
+            if [ -z "$p_ver_st" ]; then
+                p_ver_st=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+                [ -z "$p_ver_st" ] && p_ver_st=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
+            fi
+            [ -z "$sb_ver_st" ] && sb_ver_st=$(get_singbox_version_display)
+            # Device model — read from Plus CLI if available, else /tmp/sysinfo/model
+            local _device_model
+            if [ -n "${_sysinfo:-}" ]; then
+                _device_model=$(printf '%s' "$_sysinfo" | jq -r 'if (.device_model // "") == "unknown" then "" else (.device_model // "") end' 2>/dev/null)
+            fi
+            [ -z "$_device_model" ] && _device_model=$(cat /tmp/sysinfo/model 2>/dev/null || echo "")
+            local _device_model_html; _device_model_html=$(html_escape "$_device_model")
+
+            # Connectivity state from SOCKS_STATE_FILE
             _h_tgd=$(grep "^tg_direct=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             _h_tgt=$(grep "^tg_transport=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
             _h_socks=$(grep "^socks=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
-            local _h_tier2; _h_tier2=$(grep "^tg_tier2=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
-            [ "$_h_tgd" = "ok" ]   && _h_tgd_icon="$E_OK"   || _h_tgd_icon="$E_ERR"
-            [ "$_h_tgt" = "ok" ]   && _h_tgt_icon="$E_OK"   || _h_tgt_icon="$E_ERR"
-            [ "$_h_socks" = "up" ] && _h_socks_icon="$E_OK" || _h_socks_icon="$E_ERR"
-            # tunnel (SOCKS5): ok if transport ok AND socks up
-            [ "$_h_tgt" = "ok" ] && [ "$_h_socks" = "up" ] && _h_tunnel_icon="$E_OK" || {
-                [ "$_h_tgt" = "ok" ] && _h_tunnel_icon="$E_YLW" || _h_tunnel_icon="$E_ERR"
-            }
-            local _h_tier2_icon=""
-            case "$_h_tier2" in
-                ok)   _h_tier2_icon=" | ${E_OK} tier2" ;;
-                fail) _h_tier2_icon=" | ${E_ERR} tier2" ;;
-                none) _h_tier2_icon="" ;;
-            esac
-            health_st="${_h_tgd_icon} TG direct | ${_h_tunnel_icon} tunnel (SOCKS5)${_h_tier2_icon}"
-            strategy=$(uci -q get podkop.settings.dns_type || echo "udp")
-            yacd_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
+            _h_tier2=$(grep "^tg_tier2=" "$SOCKS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+
+            strategy=$(uci -q get ${PODKOP_UCI}.settings.dns_type || echo "udp")
+            yacd_en=$(uci -q get ${PODKOP_UCI}.settings.enable_yacd || echo "0")
             tg_lat=$(get_tg_latency)
 
             proxies=$(clash_request "/proxies")
-            active_proxy=$(get_active_proxy_name "$proxies")
             active_proxy_display=$(html_escape "$(get_active_proxy_display "$proxies")")
-
-            # Public IP: read from cache (instant). Background refresh if stale.
+            # Truncate proxy display for Status (full URI in Runtime Info).
+            # POSIX/BusyBox-safe: do not use ${var:0:N}; some OpenWrt ash builds
+            # abort with "bad substitution" at runtime, which killed cmd_status.
+            if [ "$(printf '%s' "$active_proxy_display" | wc -c | tr -d ' ')" -gt 35 ]; then
+                active_proxy_display=$(printf '%s' "$active_proxy_display" | sed 's/ (.*$//')
+                active_proxy_display="$(printf '%s' "$active_proxy_display" | cut -c1-32)..."
+            fi
             pub_ip_display=$(get_public_ip_display)
 
-            text=$(cat <<EOF
-${E_STAT} <b>System & Podkop Status</b>
-<code>────────────────────</code>
-${E_RTR} <b>${hostname}</b> | ${uptime_sys}
-${E_PENGUIN} <b>OS:</b> ${os_ver}
-${E_GLOB} <b>WAN:</b> <code>${wan_ip}</code>$([ "$pub_ip_display" != "$wan_ip" ] && printf '\n%s <b>Public IP:</b> <code>%s</code>' "$E_GLOB" "$pub_ip_display")
-${E_NET} <b>LAN:</b> <code>${lan_ip}</code>
-${extra_ifs}${E_CPU} <b>Load:</b> <code>${loadavg}</code>
-${E_RAM} <b>Free RAM:</b> <code>${mem_free} MB</code>
-<code>────────────────────</code>
-${E_DOG} <b>Podkop:</b> ${podkop_init_status}
-${E_ON} <b>Autostart:</b> ${podkop_autostart}
-${E_SET} <b>Mode:</b> <code>${podkop_mode_lbl}</code>
-${E_BOX} <b>Sing-box:</b> ${sb_state}$([ "$sb_ram" != "0" ] && printf ' | <b>RAM:</b> %s MB' "$sb_ram")
-<code>────────────────────</code>
-${E_GLOB} <b>Active Proxy:</b> <code>${active_proxy_display}</code>
-${E_ENVELOPE} <b>Telegram:</b> direct ${_h_tgd_icon} | tunnel SOCKS5 ${_h_tunnel_icon}${_h_tier2_icon}
-${E_NET} <b>DNS:</b> <code>${strategy}</code> | <b>YACD:</b> $([ "$yacd_en" = "1" ] && echo "${E_ON} ON" || echo "${E_OFF} OFF")
-${E_SHLD} <b>Bot Route:</b> ${LAST_ROUTE_NAME} (${tg_lat})
-EOF
-)
-            kb="{\"inline_keyboard\":[
-                [{\"text\":\"${E_SCAN} Runtime Info\",\"callback_data\":\"cmd_runtime\"}],
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
-            ]}"
+            # ── HTML-escape display strings ───────────────────────────────────
+            local _route_name_html _hostname_html _os_ver_html _mode_lbl_html _strategy_html
+            _route_name_html=$(html_escape "$LAST_ROUTE_NAME")
+            _hostname_html=$(html_escape "$hostname")
+            _os_ver_html=$(html_escape "$os_ver")
+            _mode_lbl_html=$(html_escape "$podkop_mode_lbl")
+            _strategy_html=$(html_escape "$strategy")
+
+
+
+            # ── Aggregate severity ────────────────────────────────────────────
+            # Inputs: podkop_running, sb_running, _h_tgt, _h_socks, LAST_ROUTE
+            local _sev _sev_title _sev_note
+            local _socks_state _tg_ok=0
+            case "$_h_socks" in
+                up)   _socks_state="up" ;;
+                down) _socks_state="down" ;;
+                *)    _socks_state="unknown" ;;
+            esac
+            [ "$_h_tgt" = "ok" ] && _tg_ok=1
+
+            _sev=$(_status_severity "$podkop_running" "$sb_running" "$_h_tgt" "$_h_socks" "$LAST_ROUTE")
+            # Override: empty SOCKS_STATE_FILE (watchdog not yet run) → pending, not degraded
+            [ "$_socks_state" = "unknown" ] && [ "$_sev" = "degraded" ] && _sev="ok"
+
+            case "$_sev" in
+                ok)
+                    _sev_title="${E_OK} <b>Podkop is running</b>"
+                    if [ "$_socks_state" = "unknown" ]; then
+                        _sev_note="Health check pending — watchdog has not run yet."
+                    else
+                        case "$_h_tgd" in
+                            ok)      _sev_note="Telegram reachable directly and via tunnel." ;;
+                            fail)    _sev_note="Telegram via tunnel. Direct is blocked — expected for this network." ;;
+                            unknown) _sev_note="Telegram reachable via tunnel. Direct not checked (WAN iface unknown)." ;;
+                            *)       _sev_note="Telegram reachable via tunnel." ;;
+                        esac
+                    fi
+                    ;;
+                warn)
+                    _sev_title="${E_WARN} <b>Running with limitations</b>"
+                    _sev_note="Podkop is running but Telegram is unreachable via tunnel."
+                    ;;
+                degraded)
+                    _sev_title="${E_YLW} <b>Bot on fallback route</b>"
+                    case "$LAST_ROUTE" in
+                        tier4) _sev_note="SOCKS unavailable. Bot connected directly — may stop responding if Telegram is blocked." ;;
+                        tier5) _sev_note="All routes failed. Bot using emergency Telegram IPs." ;;
+                        *)     _sev_note="Primary SOCKS unavailable. Bot on $(html_escape "$LAST_ROUTE_NAME")." ;;
+                    esac
+                    ;;
+                fail)
+                    _sev_title="${E_ERR} <b>Action required</b>"
+                    if   [ "$podkop_running" = "0" ]; then
+                        _sev_note="Podkop is not running. Traffic may not be routed through VPN."
+                    elif [ "$sb_running" = "0" ]; then
+                        _sev_note="Sing-box is stopped. Reload Podkop to restart."
+                    else
+                        _sev_note="Service state unknown."
+                    fi
+                    ;;
+            esac
+
+            # ── Telegram connectivity block ───────────────────────────────────
+            local _tg_line _tg_direct_line _tg_backup_line
+            if [ "$_tg_ok" = "1" ]; then
+                _tg_line="${E_OK} via ${_route_name_html}"
+            else
+                _tg_line="${E_ERR} unreachable"
+            fi
+            case "$_h_tgd" in
+                ok)      _tg_direct_line="${E_OK} reachable" ;;
+                fail)    _tg_direct_line="${E_ERR} blocked" ;;
+                unknown) _tg_direct_line="${E_OFF} not checked (WAN iface unknown)" ;;
+                *)       _tg_direct_line="${E_OFF} unknown" ;;
+            esac
+            case "$_h_tier2" in
+                ok)
+                    case "$LAST_ROUTE" in
+                        tier2_*) _tg_backup_line="${E_OK} active (in use)" ;;
+                        *)       _tg_backup_line="${E_OK} available" ;;
+                    esac ;;
+                fail) _tg_backup_line="${E_ERR} unavailable" ;;
+                *)    _tg_backup_line="not configured" ;;
+            esac
+
+            # ── Bot route block ───────────────────────────────────────────────
+            local _route_icon _route_note
+            case "$LAST_ROUTE" in
+                tier1)   _route_icon="$E_OK" ;  _route_note="" ;;
+                tier2_*) _route_icon="$E_OK" ;  _route_note=" (backup SOCKS)" ;;
+                tier3)   _route_icon="$E_OK" ;  _route_note=" (custom proxy)" ;;
+                tier4)   _route_icon="$E_YLW";  _route_note=" ⚠ direct — bot may fail if TG is blocked" ;;
+                tier5)   _route_icon="$E_ERR";  _route_note=" ⚠ emergency IPs only" ;;
+                *)       _route_icon="$E_OFF";  _route_note="" ;;
+            esac
+
+
+            # ── Build text ────────────────────────────────────────────────────
+            # Short version for display (strip trailing build number after 3rd dot for singbox)
+            local sb_ver_short p_ver_short
+            sb_ver_short=$(printf '%s' "$sb_ver_st" | sed 's/-[0-9]*\.[0-9]*\.[0-9]*$//')
+            p_ver_short="$p_ver_st"
+
+            # Podkop status icons
+            local _pk_icon _sb_icon _as_icon
+            [ "$podkop_running"    = "1" ] && _pk_icon="$E_OK" || _pk_icon="$E_ERR"
+            [ "$sb_running"        = "1" ] && _sb_icon="$E_OK" || _sb_icon="$E_ERR"
+            [ "$podkop_autostart_ok" = "1" ] && _as_icon="$E_OK" || _as_icon="$E_ERR"
+
+            # Precompute all optional fragments outside the message body.
+            # BusyBox ash on OpenWrt is much safer when Status text contains no
+            # embedded command substitutions inside a here-doc / multi-line body.
+            local _device_model_inline _pub_ip_inline _sb_ram_inline _tier2_inline _yacd_icon _pub_ip_html
+            # Full device model is intentionally NOT shown on the Status host line
+            # (too long, e.g. "Xiaomi Redmi Router AX6000 (OpenWrt U-Boot layout)").
+            # The full name lives in Runtime Info instead.
+            _device_model_inline=""
+            # Public IP: only show it when it is a real IPv4 that differs from WAN.
+            # Skip placeholders like "Unavailable" / "N/A" / "Checking..." so the
+            # WAN line never ends in an ugly " · Unavailable" when the router is
+            # behind double-NAT or direct egress is blocked.
+            _pub_ip_inline=""
+            if _validate_ip "$pub_ip_display" && [ "$pub_ip_display" != "$wan_ip" ]; then
+                _pub_ip_html=$(html_escape "$pub_ip_display")
+                _pub_ip_inline=" — EXT <code>${_pub_ip_html}</code>"
+            fi
+            _sb_ram_inline=""
+            [ "$sb_ram" != "0" ] && _sb_ram_inline=" | <code>${sb_ram} MB</code>"
+            _tier2_inline=""
+            [ -n "$_h_tier2" ] && _tier2_inline=" · Backup: ${_tg_backup_line}"
+            [ "$yacd_en" = "1" ] && _yacd_icon="$E_ON" || _yacd_icon="$E_OFF"
+
+            text=$(printf '%s' "${_sev_title}
+<i>${_sev_note}</i>
+
+${E_RTR} <b>${_hostname_html}</b> | ${uptime_sys}${_device_model_inline}
+${E_PENGUIN} ${_os_ver_html}
+${E_GLOB} WAN: <code>${wan_ip}</code>${_pub_ip_inline}
+${extra_ifs}${E_CPU} <code>${loadavg}</code> | ${E_RAM} <code>${mem_free} MB</code> RAM free
+
+${E_DOG} ${PODKOP_DISPLAY_NAME} <code>${p_ver_short:-?}</code> ${_pk_icon}${_update_avail}
+   autostart: ${_as_icon}
+${E_BOX} Sing-box <code>${sb_ver_short}</code> ${_sb_icon}${_sb_ram_inline}
+${E_GLOB} <code>${active_proxy_display}</code> — ${_mode_lbl_html}
+
+${E_ENVELOPE} Telegram: ${_tg_line}
+${E_NET} Direct: ${_tg_direct_line}${_tier2_inline}
+
+${E_SHLD} Bot: ${_route_icon} ${_route_name_html} <code>${tg_lat}</code>
+${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
+
+<i>${PODKOP_DISPLAY_NAME} ${p_ver_short:-?} · sb ${sb_ver_short} · bot v${BOT_VERSION}</i>")
+            kb='{"inline_keyboard":['
+            kb="${kb}[{\"text\":\"🧭 Runtime Info\",\"callback_data\":\"cmd_runtime\"}],"
+            if [ "$podkop_running" = "1" ]; then
+                kb="${kb}[{\"text\":\"♻️ Reload Podkop\",\"callback_data\":\"ask_reload_podkop\"}],"
+            else
+                kb="${kb}[{\"text\":\"${E_ON} Start Podkop\",\"callback_data\":\"cmd_start\"}],"
+            fi
+            kb="${kb}[{\"text\":\"🔃 Refresh\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]"
+            kb="${kb}]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
-
         "cmd_runtime")
             local conn_data curr_conn total_dl total_ul dl_fmt ul_fmt text kb
             local proxies selector active_proxy active_proxy_display p_delay_raw p_delay p_type active_leaf
             local sb_uptime_str sb_pid_rt
+            # Full device model lives here (not on the Status host line, where it
+            # would be too long). Read from /tmp/sysinfo/model; omit if empty.
+            local _rt_model _rt_model_line=""
+            _rt_model=$(cat /tmp/sysinfo/model 2>/dev/null)
+            [ -n "$_rt_model" ] && _rt_model_line="${E_RTR} <b>Device:</b> $(html_escape "$_rt_model")
+"
             sb_pid_rt=$(pidof sing-box 2>/dev/null)
             if [ -n "$sb_pid_rt" ]; then
                 local _now _lrr _diff _sb_start _tps _boot
@@ -5548,7 +6772,7 @@ ${E_PRX} <b>Connections:</b> ${curr_conn}
 ${E_DWN} <b>Downloaded:</b> ${dl_fmt}
 ${E_UP} <b>Uploaded:</b> ${ul_fmt}
 ⏱ <b>Session:</b> ${sb_uptime_str}
-<code>────────────────────</code>
+${_rt_model_line}<code>────────────────────</code>
 ${E_GLOB} <b>Active proxy:</b> <code>${active_proxy_display}</code>
 ${E_SET} <b>Type:</b> ${p_type} | <b>Delay:</b> ${p_delay}
 <b>Selector:</b> <code>${selector}</code>
@@ -5556,13 +6780,28 @@ ${E_SET} <b>Type:</b> ${p_type} | <b>Delay:</b> ${p_delay}
 ${E_SHLD} <b>Bot route:</b> ${rt_transport_summary}
 EOF
 )
+            local _close_conn_btn=""
+            if [ "$PODKOP_VARIANT" = "plus" ] && _plus_has_cmd "clash_api"; then
+                _close_conn_btn=",{\"text\":\"🔌 Close Connections\",\"callback_data\":\"do_close_connections\"}"
+            fi
             kb="{\"inline_keyboard\":[
-                [{\"text\":\"${E_HEALTH} Tunnel Health\",\"callback_data\":\"cmd_tunnel_health\"}],
                 [{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"}],
-                [{\"text\":\"${E_FILE} Configs & Logs\",\"callback_data\":\"cmd_files\"}],
+                [{\"text\":\"${E_FILE} Configs & Logs\",\"callback_data\":\"cmd_files\"}${_close_conn_btn}],
                 [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
+            ;;
+
+        "do_close_connections")
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                local _res; _res=$(_plus_json clash_api close_all_connections)
+                local _ok; _ok=$(printf '%s' "$_res" | jq -r '.success // false' 2>/dev/null)
+                if [ "$_ok" = "true" ]; then
+                    send_or_edit "$mid" "$(printf '%s All connections closed. Active traffic will reconnect.' "$E_OK")"                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"}]]}"
+                else
+                    send_or_edit "$mid" "$(printf '%s Failed to close connections.' "$E_ERR")"                         "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"}]]}"
+                fi
+            fi
             ;;
 
         "cmd_tunnel_health")
@@ -5570,9 +6809,12 @@ EOF
             local sec nft_count sb_pid sb_ram sb_state wan_iface proxy_mode
             local last_reload_ts last_reload_str active_cl nft_raw text kb
 
+            # Load transport context so _t_ip/_t_port are set for GitHub SOCKS probes
+            _load_transport_ctx
             sec=$(get_active_section)
-            proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type || echo "unknown")
-            wan_iface=$(uci -q get podkop.settings.output_network_interface 2>/dev/null || echo "auto")
+            proxy_mode=$(get_section_type "$sec")
+            proxy_mode_disp="${proxy_mode#proxy:}"
+            wan_iface=$(uci -q get ${PODKOP_UCI}.settings.output_network_interface 2>/dev/null || echo "auto")
 
             # nftables podkop rules count
             nft_raw=$(nft list ruleset 2>/dev/null | grep -i podkop | wc -l)
@@ -5610,8 +6852,8 @@ EOF
             fi
 
             # Active community lists
-            active_cl=$(uci -q show podkop.${sec} 2>/dev/null \
-                | grep "^podkop\.${sec}\.community_lists=" \
+            active_cl=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null \
+                | grep "^${PODKOP_UCI}\.${sec}\.community_lists=" \
                 | sed "s/^[^']*'//g; s/'$//g; s/' '/, /g" || echo "None")
             [ -z "$active_cl" ] && active_cl="None"
 
@@ -5647,9 +6889,9 @@ EOF
             local _sec_ob_lines=""
             if [ -n "$th_proxies" ]; then
                 local _all_secs_th
-                _all_secs_th=$(uci -q show podkop 2>/dev/null \
-                    | grep -E '^podkop\.[^.=]+=section$' \
-                    | sed 's/^podkop\.\([^=]*\)=section$/\1/')
+                _all_secs_th=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+                    | grep -E "^${PODKOP_UCI}\.[^.=]+=section$" \
+                    | sed 's/^[^.]*\.\([^=]*\)=section$/\1/')
                 for _s in $_all_secs_th; do
                     local _s_sel _s_now _s_leaf _s_delay _s_icon _s_name _s_tg _s_tg_icon
                     # Get selector tag for this section
@@ -5749,7 +6991,7 @@ ${E_HEALTH} <b>Tunnel Health</b> [<code>${sec}</code>]
 <code>────────────────────</code>
 ${E_PRX} <b>Sing-box:</b> ${sb_state}
 ${E_RAM} <b>PID:</b> <code>${sb_pid}</code> | <b>RAM:</b> ${sb_ram} MB
-${E_SET} <b>Mode:</b> <code>${proxy_mode}</code>
+${E_SET} <b>Mode:</b> <code>${proxy_mode_disp}</code>
 ${E_NET} <b>WAN iface:</b> <code>${wan_iface}</code>
 ${E_GLOB} <b>Active proxy:</b> <code>${th_active_display}</code>
 <code>────────────────────</code>
@@ -5767,8 +7009,16 @@ ${E_ON} <b>Community Lists:</b>
 <code>${active_cl}</code>
 EOF
 )
+            # Append GitHub connectivity section (all variants, not Plus-only)
+            local _ghc_section=""
+            send_or_edit "$mid" "${text}
+<code>────────────────────</code>
+<i>Checking GitHub connectivity…</i>" ""
+            run_github_health_check
+            _ghc_section=$(printf '\n<code>────────────────────</code>\n%s <b>GitHub Connectivity</b>\napi.github.com:\n   direct: %s\n   SOCKS: %s\nraw.githubusercontent.com:\n   direct: %s\n   SOCKS: %s'                     "$E_GLOB"                     "$(_ghc_icon "$_ghc_api_direct")"                     "$(_ghc_icon "$_ghc_api_socks")"                     "$(_ghc_icon "$_ghc_raw_direct")"                     "$(_ghc_icon "$_ghc_raw_socks")")
+            text="${text}${_ghc_section}"
             kb="{\"inline_keyboard\":[
-                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_tunnel_health\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
+                [{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_tunnel_health\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
             ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
@@ -5797,7 +7047,7 @@ EOF
             [ "$hi" = "300" ] && next_hi="60"
 
             sec=$(get_active_section)
-            m_port=$(uci -q get podkop.${sec}.mixed_proxy_port || echo "2080")
+            m_port=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_port || echo "2080")
             m_ip=$(get_proxy_ip)
 
             # Build fallback route chain with active tier highlighted in bold.
@@ -5995,10 +7245,11 @@ EOF
 
         "cmd_diagnostics")
             local text kb
-            text=$(printf '%s <b>Diagnostics</b>\n\nAll actions below run active tests.\nOn slow routers they may take 10\xe2\x80\x9330 seconds.' "$E_TEST")
+            text=$(printf '%s <b>Diagnostics</b>\n\nActive tests — may take 10–30 sec on slow routers.' "$E_TEST")
             kb="{\"inline_keyboard\":[
+                [{\"text\":\"${E_HEALTH} Tunnel Health + GitHub\",\"callback_data\":\"cmd_tunnel_health\"}],
                 [{\"text\":\"${E_MICRO} Probe Active Outbound\",\"callback_data\":\"ask_probe_outbound\"}],
-                [{\"text\":\"${E_SCAN} Upstream Health\",\"callback_data\":\"ask_upstream_health\"}],
+                [{\"text\":\"${E_SCAN} Proxy Latency Test\",\"callback_data\":\"ask_upstream_health\"}],
                 [{\"text\":\"${E_GLOB} Global Check\",\"callback_data\":\"ask_run_podkop_tests\"},{\"text\":\"${E_CPU} Internal Diag\",\"callback_data\":\"ask_run_internal_diag\"}],
                 [{\"text\":\"${E_LOG} Support Bundle\",\"callback_data\":\"ask_support_bundle\"}],
                 [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
@@ -6048,11 +7299,11 @@ EOF
                     ;;
             esac
             sec=$(get_active_section)
-            proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            proxy_mode=$(get_section_type "$sec")
 
             # Check mixed_proxy is enabled — probe uses it as SOCKS5 endpoint
             local _mixed_enabled
-            _mixed_enabled=$(uci -q get podkop.${sec}.mixed_proxy_enabled 2>/dev/null || echo "1")
+            _mixed_enabled=$(uci -q get ${PODKOP_UCI}.${sec}.mixed_proxy_enabled 2>/dev/null || echo "1")
             if [ "$_mixed_enabled" = "0" ]; then
                 send_or_edit "$mid" "$(printf '%s <b>Probe unavailable</b>\n\n<code>mixed_proxy</code> is disabled for section <code>%s</code>.\n\nProbe routes traffic through mixed_proxy SOCKS5 — it cannot run without it.\n\n<i>Enable mixed_proxy in Podkop settings and reload to use Probe.</i>' \
                     "$E_WARN" "$sec")" \
@@ -6069,7 +7320,7 @@ EOF
             active_px=$(get_active_proxy_name "$proxies")
             active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
             local mode_note=""
-            [ "$proxy_mode" = "urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
+            [ "$proxy_mode" = "proxy:urltest" ] && mode_note=$(printf '\n<i>URLTest mode: testing current auto-selected proxy.</i>')
             text=$(printf '%s <b>Probe Active Outbound</b>\n\nTests the currently active proxy through <code>mixed_proxy</code>:\n\n• Exit IP, GeoIP, Cloudflare geo, Google hint\n• Service reachability (YouTube, Telegram API, ChatGPT, Gemini, Discord)\n• Throughput: 32 KB block check + 1 MB speed test\n\n<b>Active:</b> <code>%s</code>%s\n\n<i>Takes 20–40 sec. Traffic ~1.3 MB.</i>' \
                 "$E_MICRO" "$active_px_display" "$mode_note")
             kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Run\",\"callback_data\":\"cmd_probe_outbound_back_${_back_target}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"${_back_target}\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
@@ -6096,7 +7347,7 @@ EOF
             # Collect context
             local sec proxy_mode proxies active_px active_px_display px_type
             sec=$(get_active_section)
-            proxy_mode=$(uci -q get podkop.${sec}.proxy_config_type 2>/dev/null || echo "selector")
+            proxy_mode=$(get_section_type "$sec")
             proxies=$(clash_request "/proxies")
             active_px=$(get_active_proxy_name "$proxies")
             active_px_display=$(html_escape "$(get_active_proxy_display "$proxies")")
@@ -6169,8 +7420,8 @@ EOF
             # Mode hint
             local mode_hint=""
             case "$proxy_mode" in
-                urltest)  mode_hint=" <i>(URLTest auto)</i>" ;;
-                selector) mode_hint="" ;;
+                proxy:urltest) mode_hint=" <i>(URLTest auto)</i>" ;;
+                *)            mode_hint="" ;;
             esac
 
             # Org line
@@ -6210,10 +7461,10 @@ EOF
                 action_btn="[{\"text\":\"${E_BOT} Bot Settings\",\"callback_data\":\"bot_settings\"}],"
             elif [ "$PROBE_SPEED_STATUS" = "throttled" ] || [ "$PROBE_SPEED_STATUS" = "block16k" ] || [ "$PROBE_SPEED_STATUS" = "blocked" ]; then
                 case "$proxy_mode" in
-                    urltest)
+                    proxy:urltest)
                         action_btn="[{\"text\":\"${E_TEST} Test All Proxies\",\"callback_data\":\"cmd_all_delay_test\"}],"
                         ;;
-                    url)
+                    proxy:url)
                         action_btn="[{\"text\":\"${E_EDIT} Set New URL\",\"callback_data\":\"cmd_url_link_add\"}],"
                         ;;
                     *)
@@ -6245,7 +7496,7 @@ EOF
         "cmd_run_podkop_tests")
             local tf="/tmp/podkop_global_check.txt"
             send_or_edit "$mid" "$(printf '%s Running Global Check...' "$E_TIME")" ""
-            /usr/bin/podkop global_check | sed "s/$(printf '\033')\\[[0-9;]*[a-zA-Z]//g" > "$tf" 2>&1 || \
+            ${PODKOP_BIN} global_check | sed "s/$(printf '\033')\\[[0-9;]*[a-zA-Z]//g" > "$tf" 2>&1 || \
                 echo "ERROR: global_check failed" >> "$tf"
             api_document "$tf" "Podkop Global Check"
             rm -f "$tf"; delete_message "$mid"; _handle_bot "cmd_diagnostics" "" "" ""
@@ -6267,7 +7518,7 @@ EOF
                     [{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_runtime\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
                 ]}"
             ;;
-        "cmd_get_config")  api_document "/etc/config/podkop"        "Podkop Config" ;;
+        "cmd_get_config")  api_document "/etc/config/${PODKOP_UCI}" "${PODKOP_DISPLAY_NAME} Config" ;;
         "cmd_get_sb_json") api_document "/etc/sing-box/config.json" "Sing-box Config" ;;
         "cmd_get_log")
             logread | grep -iE 'podkop|sing-box' | tail -n 150 > /tmp/podkop_syslog.txt
@@ -6280,8 +7531,8 @@ EOF
             send_or_edit "$mid" "$(printf '%s Collecting support bundle...' "$E_TIME")" ""
             local sec; sec=$(get_active_section)
             local hostname; hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            local p_ver; p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+            local p_ver; p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
             local sb_ver; sb_ver=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
             {
                 echo "=== Podkop Support Bundle ==="
@@ -6295,7 +7546,7 @@ EOF
                 echo "$sec"
                 echo ""
                 echo "=== Podkop Status ==="
-                /etc/init.d/podkop status 2>&1 || echo "status failed"
+                ${PODKOP_INIT} status 2>&1 || echo "status failed"
                 echo ""
                 echo "=== Sing-box Process ==="
                 if pidof sing-box >/dev/null 2>&1; then
@@ -6306,8 +7557,8 @@ EOF
                     echo "NOT RUNNING"
                 fi
                 echo ""
-                echo "=== UCI Config (podkop) ==="
-                uci show podkop 2>&1
+                echo "=== UCI Config (${PODKOP_UCI}) ==="
+                uci show ${PODKOP_UCI} 2>&1
                 echo ""
                 echo "=== UCI Config (podkop_bot) ==="
                 uci show podkop_bot 2>&1 | grep -v "bot_token\|chat_id\|admin_ids"
@@ -6350,7 +7601,7 @@ EOF
                 "$(printf '%s <b>Restart Router?</b>\n\nThis will reboot <b>%s</b>.\nAll connections will be interrupted for ~60 seconds.\n\n<b>Are you sure?</b>' "$E_WARN" "$(cat /proc/sys/kernel/hostname 2>/dev/null || echo Router)")" \
                 "{\"inline_keyboard\":[
                     [{\"text\":\"${E_OK} Yes, continue\",\"callback_data\":\"ask_restart_router_2\"}],
-                    [{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]
+                    [{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"}]
                 ]}"
             ;;
 
@@ -6360,14 +7611,14 @@ EOF
             send_or_edit "$mid" \
                 "$(printf '%s <b>Final confirmation required.</b>\n\nType <code>YES</code> (uppercase) to confirm router reboot.\nAny other input cancels.' "$E_WARN")" \
                 "{\"inline_keyboard\":[
-                    [{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]
+                    [{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"}]
                 ]}"
             ;;
 
         "ask_restart_bot")
             send_or_edit "$mid" \
                 "$(printf '%s <b>Restart Bot?</b>\n\nKills all bot processes (main loop + watchdog subshells) and restarts via init.d.\nBot will send a startup notification when back online.' "$E_WARN")" \
-                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Restart\",\"callback_data\":\"do_restart_bot\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Restart\",\"callback_data\":\"do_restart_bot\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             ;;
 
         "do_restart_bot")
@@ -6396,39 +7647,80 @@ EOF
             ;;
 
         "cmd_info")
-            local hostname lan_ip p_ver y_en sb_ver text kb
-            hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-            lan_ip=$(uci -q get network.lan.ipaddr || echo "Unknown")
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
-            sb_ver=$(sing-box version 2>/dev/null | head -n 1 | awk '{print $3}')
-            y_en=$(uci -q get podkop.settings.enable_yacd || echo "0")
-            text=$(cat <<EOF
-${E_INFO} <b>System Information</b>
+            # v0.15.1: cmd_info merged into cmd_status. Redirect for back-compat.
+            _handle_bot "cmd_status" "$mid" "$cid" "$cb_id"
+            ;;
 
-<b>Hostname:</b> ${hostname}
-<b>LAN IP:</b> ${lan_ip}
-<b>Podkop:</b> ${p_ver:-Unknown}
-<b>Sing-box:</b> ${sb_ver:-Unknown}
+        "cmd_info_legacy_unused_placeholder")
+            # Placeholder to preserve grep/diff context — never reached
+            :
+            ;;
+
+        "cmd_maintenance")
+            local p_ver sb_ver lan_ip y_en text kb
+            local _mi_sysinfo _mi_update="" _mi_zapret="" _mi_byedpi=""
+            if _plus_has_cmd "get_system_info"; then
+                _mi_sysinfo=$(_plus_json get_system_info)
+                p_ver=$(printf '%s' "$_mi_sysinfo" | jq -r '.podkop_version // ""' 2>/dev/null)
+                sb_ver=$(printf '%s' "$_mi_sysinfo" | jq -r '.sing_box_version // ""' 2>/dev/null)
+                local _mi_latest; _mi_latest=$(printf '%s' "$_mi_sysinfo" | jq -r '.podkop_latest_version // "unknown"' 2>/dev/null)
+                [ -n "$_mi_latest" ] && [ "$_mi_latest" != "unknown" ] && [ "$_mi_latest" != "$p_ver" ] &&                     _mi_update=$(printf '\n   %s Update available: <b>%s</b>' "$E_YLW" "$_mi_latest")
+                # zapret/byedpi if installed
+                local _zap_inst _byedpi_inst
+                _zap_inst=$(printf '%s' "$_mi_sysinfo" | jq -r '.zapret_installed // 0' 2>/dev/null)
+                _byedpi_inst=$(printf '%s' "$_mi_sysinfo" | jq -r '.byedpi_installed // 0' 2>/dev/null)
+                [ "$_zap_inst" = "1" ] && _mi_zapret=$(printf '\n<b>Zapret:</b> %s'                     "$(printf '%s' "$_mi_sysinfo" | jq -r '.zapret_version // "installed"' 2>/dev/null)")
+                [ "$_byedpi_inst" = "1" ] && _mi_byedpi=$(printf '\n<b>ByeDPI:</b> %s'                     "$(printf '%s' "$_mi_sysinfo" | jq -r '.byedpi_version // "installed"' 2>/dev/null)")
+            fi
+            if [ -z "$p_ver" ]; then
+                p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+                [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
+            fi
+            [ -z "$sb_ver" ] && sb_ver=$(get_singbox_version_display)
+            sb_ver=$(get_singbox_version_display)
+            lan_ip=$(uci -q get network.lan.ipaddr || echo "127.0.0.1")
+            # Device model for Maintenance screen
+            local _maint_model
+            if [ -n "${_mi_sysinfo:-}" ]; then
+                _maint_model=$(printf '%s' "$_mi_sysinfo" | jq -r 'if (.device_model // "") == "unknown" then "" else (.device_model // "") end' 2>/dev/null)
+            fi
+            [ -z "$_maint_model" ] && _maint_model=$(cat /tmp/sysinfo/model 2>/dev/null || echo "")
+            y_en=$(uci -q get ${PODKOP_UCI}.settings.enable_yacd || echo "0")
+
+            # GitHub releases URL for this variant
+            local _gh_releases="https://github.com/${PODKOP_GITHUB_REPO}/releases"
+
+            text=$(cat <<EOF
+${E_SET} <b>Maintenance</b>
+<code>────────────────────</code>
+$([ -n "$_maint_model" ] && echo "$E_RTR <b>Device:</b> $(html_escape $_maint_model)")
+${E_DOG} <b>${PODKOP_DISPLAY_NAME}</b> <a href="${_gh_releases}">${p_ver:-Unknown}</a>${_mi_update}
+<b>Sing-box:</b> ${sb_ver:-Unknown}${_mi_zapret}${_mi_byedpi}
 <b>Bot:</b> v${BOT_VERSION}
-<b>YACD:</b> $([ "$y_en" = "1" ] && echo "${E_ON} Enabled - http://${lan_ip}:9090/ui" || echo "${E_OFF} Disabled")
+<b>YACD:</b> $([ "$y_en" = "1" ] && printf "${E_ON} Enabled — http://%s:9090/ui" "$lan_ip" || echo "${E_OFF} Disabled")
 EOF
 )
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],[{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],[{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],[{\"text\":\"${E_SKULL} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],[{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[
+                [{\"text\":\"${E_RST} Check Podkop Update\",\"callback_data\":\"cmd_check_update\"}],
+                [{\"text\":\"${E_NEW} Check Bot Update\",\"callback_data\":\"cmd_check_update_bot\"}],
+                [{\"text\":\"${E_RST} Restart Bot\",\"callback_data\":\"ask_restart_bot\"}],
+                [{\"text\":\"${E_SKULL} Restart Router\",\"callback_data\":\"ask_restart_router_1\"}],
+                [{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]
+            ]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
         "cmd_check_update")
             local p_ver latest text kb
             send_or_edit "$mid" "$(printf '%s Checking GitHub...' "$E_TIME")" ""
-            p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+            p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
             latest=$(_curl_via_best_socks 10 \
-                "https://api.github.com/repos/itdoginfo/podkop/releases/latest" \
+                "https://api.github.com/repos/${PODKOP_GITHUB_REPO}/releases/latest" \
                 | jq -r '.tag_name' 2>/dev/null | sed 's/^v//' | cut -d'-' -f1)
             if [ -z "$latest" ] || [ "$latest" = "null" ]; then
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub.' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 return
             fi
             # If p_ver is empty (package manager returned nothing — unusual pkg name or not installed),
@@ -6436,23 +7728,26 @@ EOF
             if [ -z "$p_ver" ]; then
                 text=$(printf '%s <b>Cannot detect installed podkop version.</b>\n\nLatest on GitHub: <b>%s</b>\n\n<i>opkg/apk returned no version info.</i>' "$E_WARN" "$latest")
                 send_or_edit "$mid" "$text" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Install/Update\",\"callback_data\":\"do_update_podkop\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_OK} Install/Update\",\"callback_data\":\"do_update_podkop\"},{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 return
             fi
             # Compare versions without sort -V (not guaranteed on BusyBox).
             # Split x.y.z into parts and compare numerically.
             local _upd=0
             if [ "$p_ver" != "$latest" ]; then
-                local _p1 _p2 _p3 _l1 _l2 _l3
+                local _p1 _p2 _p3 _p4 _l1 _l2 _l3 _l4
                 _p1=$(printf '%s' "$p_ver" | cut -d. -f1)
                 _p2=$(printf '%s' "$p_ver" | cut -d. -f2)
                 _p3=$(printf '%s' "$p_ver" | cut -d. -f3)
+                _p4=$(printf '%s' "$p_ver" | cut -d. -f4)
                 _l1=$(printf '%s' "$latest" | cut -d. -f1)
                 _l2=$(printf '%s' "$latest" | cut -d. -f2)
                 _l3=$(printf '%s' "$latest" | cut -d. -f3)
+                _l4=$(printf '%s' "$latest" | cut -d. -f4)
                 if   [ "${_l1:-0}" -gt "${_p1:-0}" ]; then _upd=1
                 elif [ "${_l1:-0}" -eq "${_p1:-0}" ] && [ "${_l2:-0}" -gt "${_p2:-0}" ]; then _upd=1
                 elif [ "${_l1:-0}" -eq "${_p1:-0}" ] && [ "${_l2:-0}" -eq "${_p2:-0}" ] && [ "${_l3:-0}" -gt "${_p3:-0}" ]; then _upd=1
+                elif [ "${_l1:-0}" -eq "${_p1:-0}" ] && [ "${_l2:-0}" -eq "${_p2:-0}" ] && [ "${_l3:-0}" -eq "${_p3:-0}" ] && [ "${_l4:-0}" -gt "${_p4:-0}" ]; then _upd=1
                 fi
             fi
             if [ "$_upd" = "1" ]; then
@@ -6465,45 +7760,63 @@ ${E_NEW} <b>Update Available!</b>
 <i>Runs install.sh from GitHub (no hash verification).</i>
 EOF
 )
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Install\",\"callback_data\":\"do_update_podkop\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Install\",\"callback_data\":\"do_update_podkop\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             else
                 send_or_edit "$mid" "$(printf '%s Up to date: %s' "$E_OK" "$p_ver")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
             fi
             ;;
 
         "do_update_podkop")
             local _upd_tmp="/tmp/podkop_update.sh"
             local _upd_log="/tmp/podkop_update.log"
-            local _upd_url="https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh"
+            local _upd_url="https://raw.githubusercontent.com/${PODKOP_GITHUB_REPO}/refs/heads/main/install.sh"
             send_or_edit "$mid" "$(printf '%s Downloading update...' "$E_TIME")" ""
             rm -f "$_upd_tmp" "$_upd_log"
             if ! _curl_via_best_socks 30 -o "$_upd_tmp" "$_upd_url"; then
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub — install.sh not downloaded.' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 return
             fi
             if ! grep -q "^#!" "$_upd_tmp" 2>/dev/null; then
                 send_or_edit "$mid" "$(printf '%s Downloaded script is invalid (no shebang).' "$E_ERR")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
                 return
             fi
-            send_or_edit "$mid" "$(printf '%s Installing podkop...\n\n<i>This may take up to 60 seconds.</i>' "$E_TIME")" ""
-            sh "$_upd_tmp" >"$_upd_log" 2>&1
+            # Pre-flight "проверятор": confirm (over forced IPv4) that the feed
+            # and GitHub raw are reachable. If they aren't even with -4, it's a
+            # real egress block — tell the user instead of letting opkg/apk hang.
+            local _net_verdict; _net_verdict=$(_pkg_net_check)
+            if [ "$_net_verdict" != "ok" ]; then
+                send_or_edit "$mid" "$(printf '%s <b>Package network unreachable</b>\n\n<code>%s</code>\n\n<i>Even over IPv4 the package feed/GitHub did not respond — this is an egress block, not the DNS issue. Update would fail.</i>' "$E_ERR" "$(html_escape "$_net_verdict")")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
+                return
+            fi
+            send_or_edit "$mid" "$(printf '%s Installing podkop...\n\n<i>Package network OK. This may take up to 60 seconds.</i>' "$E_TIME")" ""
+            # opkg/apk inside install.sh resolve via the system resolver (musl),
+            # which stalls on AAAA under podkop. Point the router's own resolver
+            # at public IPv4 DNS for the install; restore on exit (subshell trap
+            # keeps the parent's traps untouched and guarantees restore).
+            (
+                trap '_resolv_v4_restore' EXIT INT TERM
+                _resolv_v4_override
+                sh "$_upd_tmp"
+            ) >"$_upd_log" 2>&1
             local _exit=$?
+            _resolv_v4_restore   # belt-and-suspenders if the subshell was killed
             # Tail of log — last 20 non-empty lines
             local _log_tail; _log_tail=$(grep -v '^[[:space:]]*$' "$_upd_log" 2>/dev/null | tail -20)
             if [ "$_exit" -eq 0 ]; then
-                local _new_ver; _new_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
-                [ -z "$_new_ver" ] && _new_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+                local _new_ver; _new_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+                [ -z "$_new_ver" ] && _new_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
                 send_or_edit "$mid" "$(printf '%s Podkop updated successfully.\n\n<b>Version:</b> %s\n\n<pre>%s</pre>' \
                     "$E_OK" "${_new_ver:-unknown}" "$(html_escape "$_log_tail")")" \
                     "{\"inline_keyboard\":[[{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             else
                 send_or_edit "$mid" "$(printf '%s Installation failed (exit %s).\n\n<pre>%s</pre>' \
                     "$E_ERR" "$_exit" "$(html_escape "$_log_tail")")" \
-                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"}]]}"
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"}]]}"
             fi
             rm -f "$_upd_tmp" "$_upd_log"
             ;;
@@ -6552,7 +7865,7 @@ EOF
             esac
 
             if [ -z "$remote_ver" ] || [ "$remote_ver" = "null" ]; then
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$(printf '%s Cannot reach GitHub. Check connectivity.' "$E_ERR")" "$kb"
                 return
             fi
@@ -6566,7 +7879,7 @@ EOF
                 else
                     text=$(printf '%s Bot is up to date: <b>v%s</b>%s' "$E_OK" "$BOT_VERSION" "$_via_note")
                 fi
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_force_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_RST} Force Update\",\"callback_data\":\"ask_update_bot_force_${remote_ver}\"}],[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             else
                 if [ -n "$highlights" ]; then
@@ -6577,7 +7890,7 @@ EOF
                     text=$(printf '%s <b>Bot Update Available!</b>\n\n<b>Installed:</b> v%s\n<b>Available:</b> v%s\n\n<a href="%s">Full changelog</a>%s' \
                         "$E_NEW" "$BOT_VERSION" "$remote_ver" "$changelog_link" "$_via_note")
                 fi
-                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+                kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Update to v${remote_ver}\",\"callback_data\":\"ask_update_bot_${remote_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 send_or_edit "$mid" "$text" "$kb"
             fi
             ;;
@@ -6588,7 +7901,7 @@ EOF
             local _disp_ver="${target_ver#force_}"
             text=$(printf '%s <b>Update bot to v%s?</b>\n\nThe bot will download the new version and restart.\nAll active menus will be interrupted.\n\nSection: <code>%s</code>' \
                 "$E_WARN" "$_disp_ver" "$(get_active_section)")
-            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Update & Restart\",\"callback_data\":\"do_update_bot_${target_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            kb="{\"inline_keyboard\":[[{\"text\":\"${E_OK} Yes, Update & Restart\",\"callback_data\":\"do_update_bot_${target_ver}\"}],[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
             ;;
 
@@ -6599,7 +7912,7 @@ EOF
             case "$target_ver" in force_*) _force=1; target_ver="${target_ver#force_}" ;; esac
             local bot_tmp="/tmp/podkop_bot_update.$$"
             local bot_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
-            local kb_err="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_info\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
+            local kb_err="{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"cmd_maintenance\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
 
             send_or_edit "$mid" "$(printf '%s <b>Downloading bot v%s...</b>' "$E_TIME" "$target_ver")" ""
 
@@ -6623,7 +7936,7 @@ EOF
             # replayed after a restart (e.g. offset migration or BOT_DIR change).
             if [ "$_force" = "0" ] && [ -n "$new_ver" ] && [ "$new_ver" = "$BOT_VERSION" ]; then
                 rm -f "$bot_tmp"
-                send_or_edit "$mid" "$(printf '%s Already running v%s — no update needed.' "$E_OK" "$BOT_VERSION")"                     "{"inline_keyboard":[[{"text":"🏠 Menu","callback_data":"/menu"}]]}"
+                send_or_edit "$mid" "$(printf '%s Already running v%s — no update needed.' "$E_OK" "$BOT_VERSION")"                     "{\"inline_keyboard\":[[{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
                 logger -t podkop-bot "[Self-update] Skipped: already at v${BOT_VERSION}"
                 return
             fi
@@ -6684,7 +7997,7 @@ EOF
             fi
             ;;
         "cmd_start")
-            /etc/init.d/podkop start
+            ${PODKOP_INIT} start
             send_or_edit "$mid" "$(printf '%s <b>Podkop Starting...</b>' "$E_ON")" \
                 "{\"inline_keyboard\":[[{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
             ;;
@@ -6767,7 +8080,7 @@ handle_command() {
         outbound_info)
             _handle_url_links "$cmd" "$mid" "" "" ;;
 
-        sections_menu|set_sec_*)
+        sections_menu|set_sec_*|do_set_sec_*)
             _handle_sections "$cmd" "$mid" ;;
 
         main_settings_menu|advanced_settings|\
@@ -6784,10 +8097,29 @@ handle_command() {
         badwan_details|cmd_set_bw_ifaces|cmd_set_bw_delay)
             _handle_section_extras "$cmd" "$mid" "" "" ;;
 
-        dns_settings|dns_proto_menu|do_dns_pr_*|cmd_dns_server|cmd_boot_dns|\
-        yacd_settings|yacd_secret_menu|\
-        ask_toggle_yacd|ask_toggle_yacd_wan|do_toggle_yacd|do_toggle_yacd_wan|\
-        ask_yacd_*|do_yacd_*)
+        dns_settings|dns_proto_menu|do_dns_pr_*|cmd_dns_server|cmd_boot_dns)
+            _handle_dns "$cmd" "$mid" "" "" ;;
+        section_settings|global_settings|\
+        zapret_section_menu|byedpi_section_menu|\
+        do_dpi_toggle_*)
+            _handle_settings "$cmd" "$mid" "$cid" "$cb_id" ;;
+
+        urltest_filters_menu|\
+        do_utfilter_mode_*|do_utfilter_toggle_dc|do_utfilter_toggle_hide)
+            _handle_section_extras "$cmd" "$mid" "$cid" "$cb_id" ;;
+
+        wait_utfilter_exc_*|wait_utfilter_inc_*|\
+        wait_utfilter_excob_*|wait_utfilter_incob_*)
+            _handle_section_extras "$cmd" "$mid" "$cid" "$cb_id" ;;
+
+        wait_dpi_strategy_*)
+            _handle_settings "$cmd" "$mid" "$cid" "$cb_id" ;;
+        cmd_maintenance)
+            _handle_bot "$cmd" "$mid" "" "" ;;
+        yacd_settings|\
+        ask_toggle_yacd|do_toggle_yacd|\
+        ask_toggle_yacd_wan|do_toggle_yacd_wan|\
+        yacd_secret_menu|ask_yacd_*|do_yacd_*)
             _handle_dns "$cmd" "$mid" "" "" ;;
 
         community_lists|community_lists_edit|toggle_cl_*|\
@@ -6800,7 +8132,7 @@ handle_command() {
         cmd_user_add_*|cmd_user_del_*|cmd_user_download_*)
             _handle_lists "$cmd" "$mid" "" "" ;;
 
-        do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|\
+        do_cmd_stop|cmd_start|ask_cmd_stop|ask_reload_podkop|do_reload_podkop|do_close_connections|\
         cmd_tunnel_health|cmd_support_bundle|\
         cmd_diagnostics|ask_upstream_health|ask_run_podkop_tests|ask_run_internal_diag|ask_support_bundle|\
         ask_probe_outbound|ask_probe_outbound_px_*|ask_probe_outbound_url|cmd_probe_outbound_back_*|\
@@ -6899,7 +8231,7 @@ send_startup_notification_async() {
     else
         logger -t podkop-bot "[Startup] Warning: config.json not ready after 10s, skipping early cache build"
     fi
-    refresh_public_ip_cache &  # Pre-warm public IP cache on startup
+    refresh_public_ip_cache >/dev/null 2>&1 &  # Pre-warm public IP cache on startup
 
     while [ "$i" -le 12 ]; do
         if api_request_fast "getMe" "{}" "5" >/dev/null; then
@@ -6909,8 +8241,8 @@ send_startup_notification_async() {
             if [ "$(uci -q get podkop_bot.settings.startup_notify || echo "1")" = "1" ]; then
                 logger -t podkop-bot "Connected via: ${LAST_ROUTE_NAME} (fast=${LAST_ROUTE_FAST})"
                 hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
-                p_ver=$(opkg info podkop 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
-            [ -z "$p_ver" ] && p_ver=$(apk info podkop 2>/dev/null | head -1 | awk '{print $1}' | sed 's/^podkop-//' | sed 's/^v//' | cut -d'-' -f1)
+                p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
+            [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
                 active_proxy=$(get_active_proxy_display "")
                 tg_lat=$(get_tg_latency)
                 sec=$(get_active_section)
@@ -6918,7 +8250,7 @@ send_startup_notification_async() {
 ${E_BOT} <b>Bot Online</b> v${BOT_VERSION}
 <code>────────────────────</code>
 <b>Host:</b> ${hostname}
-<b>Podkop:</b> ${p_ver:-Unknown}
+<b>Podkop:</b> ${p_ver:-Unknown} (${PODKOP_DISPLAY_NAME})
 <b>Active Route:</b> <code>${active_proxy}</code>
 <b>Bot Path:</b> ${LAST_ROUTE_NAME} (${tg_lat})
 <b>Section:</b> <code>${sec}</code>
@@ -6938,8 +8270,8 @@ EOF
 # Initialize active section file BEFORE launching daemons so build_all_caches
 # inside send_startup_notification_async uses the correct section.
 if [ ! -f "$ACTIVE_SECTION_FILE" ]; then
-    _first_sec=$(uci -q show podkop 2>/dev/null \
-        | grep "^podkop\.[^.]*=section$" \
+    _first_sec=$(uci -q show ${PODKOP_UCI} 2>/dev/null \
+        | grep "^${PODKOP_UCI}\.[^.]*=section$" \
         | head -1 | cut -d. -f2 | cut -d= -f1)
     echo "${_first_sec:-main}" > "$ACTIVE_SECTION_FILE"
 fi
@@ -7063,6 +8395,9 @@ EOF
         fi
 
         if [ -n "$text" ] && [ "$text" != "null" ]; then
+            # Normalize persistent keyboard button presses to commands
+            [ -z "$callback_id" ] && text=$(normalize_reply_button "$text")
+
             now=$(date +%s)
             safe_text=$(echo "$text" | tr '\n' ' ' | tr '|' '_')
             echo "${now}|${u_name:-Unknown}|${safe_text}" > "$LAST_CMD_FILE"
