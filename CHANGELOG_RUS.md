@@ -1,5 +1,73 @@
 # История изменений
 
+---
+
+## v0.15.2 (текущая)
+
+- **ИСПРАВЛЕНО:** Флаг `-4` добавлен на прямую ветку `_curl_via_best_socks` — устраняет зависание на AAAA DNS при каждом GitHub-запросе перед переходом на SOCKS. Исправляет зависание проверки обновлений под DNS-редиректом podkop.
+- **ИСПРАВЛЕНО:** `-4` на прямых ветках проверки GitHub (`api.github.com`, `raw.githubusercontent.com`) — результат "direct" в Tunnel Health теперь отражает реальную TCP-достижимость, а не таймаут AAAA.
+- **НОВОЕ:** Предварительная проверка `_pkg_net_check` — перед запуском `install.sh` при обновлении podkop проверяется доступность сети (IPv4); возвращает "Package network unreachable" вместо молчаливого зависания opkg/apk.
+- **НОВОЕ:** Временный редирект `/etc/resolv.conf` на публичный IPv4 DNS при установке podkop — позволяет opkg/apk резолвить хосты без зависания на AAAA; исходный конфиг восстанавливается атомарно через trap.
+- **ИСПРАВЛЕНО:** Бесконечная рекурсия в `cmd_status` при разрешении маршрута — `cmd_status` и `/status` теперь отдельные ветки; добавлен счётчик глубины в `_resolve_leaf` против циклических ссылок.
+- **UX:** Status — публичный IP скрывается если не резолвится (убран мусорный `· Unavailable`); метка RAM унифицирована; модель устройства перенесена в Runtime Info.
+- **UX:** Список Outbounds — каждая кнопка показывает `[idx] ▶/● имя` с задержкой.
+- **НОВОЕ:** Интеграция Plus CLI — хелперы `_plus_has_cmd()` (определяет команды через grep диспетчера CLI, а не неполный `show_help`), `_plus_json()`, `_plus_format_sub_meta()` для всех Plus-специфичных вызовов.
+- **НОВОЕ:** Интеграция `get_system_info` — версии и наличие обновления (`podkop_latest_version ≠ podkop_version` → "→ X.X.X available") в Status и Maintenance; версии zapret/byedpi при их наличии; fallback на `opkg info` для original/evolution.
+- **НОВОЕ:** `get_subscription_metadata` — использование трафика и срок действия (`📊 3.2/50 GB · exp 15.07`) в главном меню для подписочных секций Plus.
+- **НОВОЕ:** `get_outbound_link_states` — серверы, отфильтрованные urltest-фильтрами по стране/regex, помечаются `⊘` в списке прокси.
+- **НОВОЕ:** Кнопка `close_all_connections` в Runtime Info (только Plus, через `clash_api`).
+- **НОВОЕ:** Меню секций Zapret/ByeDPI — статус (запущен, версия), toggle вкл/выкл, редактирование стратегии с предварительной валидацией через `validate_nfqws_strategy_json`/`validate_byedpi_strategy_json`. `section_settings` автоматически редиректит zapret/byedpi-секции в своё меню.
+- **НОВОЕ:** Меню URLTest Filters (`🔬 URLTest Filters (country/regex)`) — `urltest_filter_mode`, `detect_server_country`, `urltest_hide_filtered_outbounds`, списки стран и outbounds. Показывает реальные имена исключённых outbounds (первые 3 + счётчик) вместо просто числа.
+- **НОВОЕ:** `_utf_postcheck_warn()` — после применения urltest-фильтров проверяет через Clash `/proxies` остались ли серверы в URLTest-группе; предупреждает если фильтр убрал все серверы. Привязан к конкретной секции (не глобальный первый селектор).
+- **ИСПРАВЛЕНО:** Все write-хендлеры DPI/urltest (`do_dpi_toggle_*`, `do_utfilter_*`) защищены проверкой `[ "$PODKOP_VARIANT" = "plus" ]` — залипшая старая кнопка на non-Plus не может случайно отключить секцию.
+- **НОВОЕ:** Блок GitHub Connectivity в Tunnel Health — проверяет `api.github.com` и `raw.githubusercontent.com` напрямую (через WAN, обходит fakeip) и через SOCKS; показывает `✅ Xms` / `❌ unreachable` для каждого пути.
+- **НОВОЕ:** Единая точка входа в диагностику — Runtime Info → одна кнопка `Diagnostics`; хаб `cmd_diagnostics` содержит Tunnel Health+GitHub, Probe, Proxy Latency Test, Internal Diag, Support Bundle.
+- **НОВОЕ:** `_in_tg_range()` — glob-проверка принадлежности IP к CIDR-префиксам Telegram (AS62041, все 10 префиксов, граница 95.161.64/20 корректна).
+- **НОВОЕ:** `resolve_tg_emergency_ips()` — параллельный DoH-запрос к 1.1.1.1, 8.8.8.8, dns.quad9.net через WAN+`--noproxy`; валидация IP через `_in_tg_range` (защита от DNS-poisoning); обновляет `TG_EMERGENCY_IPS` в памяти каждые 6 часов и при входе в tier5.
+- **ИСПРАВЛЕНО:** Определение SOCKS inbound расширено до `mixed|socks|socks5` в `_load_transport_ctx` и `get_proxy_ip`.
+- **НОВОЕ:** Модель устройства в Status и Maintenance — читает `device_model` из `get_system_info` (Plus), fallback на `/tmp/sysinfo/model`; значение `"unknown"` от Plus игнорируется в пользу fallback.
+- **НОВОЕ:** Reply keyboard — постоянная нижняя клавиатура `🏠 Menu | 📊 Status`; устанавливается один раз за сессию через `install_reply_keyboard_once`; nav escape в state machine (очищает STATE_FILE, выходит в Menu/Status); `/status` как slash-команда.
+- **НОВОЕ:** Подтверждение переключения секции — `set_sec_X` показывает "Switch to X? Podkop will reload" перед действием; `do_set_sec_X` выполняет переключение.
+- **ИСПРАВЛЕНО:** Watchdog — алерт "Telegram reachable" читает `MAIN_ROUTE_FILE` вместо `LAST_ROUTE_NAME` (в subshell всегда "Initializing…"); пустое/Initializing → "via SOCKS (recovered)".
+- **ИСПРАВЛЕНО:** Watchdog — алерт auto-switch: иконка `🔀`, компактный формат `🔀 old → new (urltest)`; дебаунс 120 сек группирует частое переключение в `🔀 Proxy switched ×N in Xm`.
+- **ИСПРАВЛЕНО:** Watchdog — `_recovery_ts` подавляет дублирующий алерт "Telegram reachable" в течение 30 секунд после "Primary SOCKS recovered".
+- **ИСПРАВЛЕНО:** `cmd_get_config` использует `/etc/config/${PODKOP_UCI}` — был хардкод `/etc/config/podkop`, ломал Config & Logs на Plus.
+- **UX:** URL подписки показывается в меню Outbounds для подписочных секций (первые 3 URL, обрезаны до 60 символов).
+- **ИСПРАВЛЕНО:** Dispatch URLTest Filters — `urltest_filters_menu` и `do_utfilter_*` правильно роутятся в `_handle_section_extras` (был ошибочно `_handle_settings` → молчаливый no-op).
+- **ИСПРАВЛЕНО:** Валидатор протоколов приведён в соответствие с Plus-парсером: `ss, vmess, vless, trojan, hy2, hysteria2, socks, socks4, socks4a, socks5`; `tuic` убран (не поддерживается Plus-парсером).
+- **UX:** Экран Routing & Lists переименован — `FR IP → Device → Tunnel (➡️)`, `Excl IP → Device → Bypass (↩️)`, `R-Domain → Domain List URL`, `R-Subnet → Subnet List URL`, `Custom Domains/Subnets → My Domains/Subnets`, `Community Lists → Service Lists`; добавлена легенда "Что направлять в туннель, а что мимо".
+- **ИСПРАВЛЕНО:** `section_is_subscription` и `get_section_type` используют `uci show` вместо `uci get` для list-поля `subscription_urls` — BusyBox ash `uci -q get` возвращает пустоту для list-полей.
+- **ИСПРАВЛЕНО:** `get_subscription_urls` использует `sed`-парсинг вывода `uci show`; отображение строится через `awk` во избежание потери переменных в subshell ash при `while+pipe`.
+
+---
+
+## v0.15.1
+
+- **НОВОЕ:** `section_settings` и `global_settings` — `advanced_settings` разделён на per-section и global экраны; `advanced_settings` оставлен как redirect для обратной совместимости.
+- **НОВОЕ:** Экран `cmd_maintenance` — версии, Check Update, Restart Bot, ссылка на GitHub releases для каждого варианта.
+- **НОВОЕ:** `cmd_info` редиректит в `cmd_status`.
+- **НОВОЕ:** DNS перемещён в Global Settings; убран из Section Settings.
+- **НОВОЕ:** `log_level` убран из UI бота → notice "Use LuCI or SSH".
+- **НОВОЕ:** Управление YACD secret/WAN убрано из бота → notice; остался только toggle вкл/выкл.
+- **НОВОЕ:** Рефакторинг Status — агрегированный заголовок-диагноз (`✅ работает` / `⚠️ с ограничениями` / `🟡 на fallback` / `❌ требует внимания`); человекочитаемый блок Connectivity; блок Bot route с метками тиров; footer с версиями.
+- **НОВОЕ:** Хелперы `_status_severity()` и `format_age()`.
+- **ИСПРАВЛЕНО:** `do_switch_mode_*`, `do_set_conn_*`, `do_toggle_mixed` возвращают в `section_settings` (не `global_settings`).
+- **ИСПРАВЛЕНО:** `wait_outbound_iface` возвращает в `global_settings`; `wait_vpn_iface` в `section_settings`.
+- **ИСПРАВЛЕНО:** Dispatch: `section_settings/global_settings` → `_handle_settings`; `cmd_maintenance` → `_handle_bot`; `dns_settings` → `_handle_dns` (были ошибочно объединены в один блок).
+
+---
+
+##  **v0.15.0 - добавлен дектект и частичная поддержка функционала форков - Podkop Plus, Evolution. **
+
+- **НОВОЕ:** `_detect_podkop_variant()` — автодетект original/evolution/plus; устанавливает `PODKOP_VARIANT`, `PODKOP_UCI`, `PODKOP_BIN`, `PODKOP_INIT`, `PODKOP_PKG`, `PODKOP_GITHUB_REPO`, `PODKOP_DISPLAY_NAME`.
+- **НОВОЕ:** `set_section_action()` — пишет `action` (Plus) или `connection_type` (original/evolution); маппит `exclusion→direct` для Plus.
+- **НОВОЕ:** `get_section_type()`, `_get_wan_interface()`, `section_is_subscription()`, `_variant_has_subscription()`, `get_subscription_cache_path()`.
+- **ИСПРАВЛЕНО:** Ложный `direct ✅` — проверка через `--interface WAN --noproxy '*'` для обхода fakeip-маршрутизации.
+- **ИСПРАВЛЕНО:** Plus urltest-флаг — читает/пишет `urltest_enabled` вместо `proxy_config_type=urltest`.
+- **ИСПРАВЛЕНО:** Запись прокси-ссылок на Plus всегда идёт в `selector_proxy_links` (`urltest_proxy_links`/`proxy_string` — поля только для миграции, стираются Plus при загрузке).
+- **ИСПРАВЛЕНО:** При добавлении в `*_text`-списки выставляется `user_domain_list_type=text` / `user_subnet_list_type=text` (оба варианта — поля игнорируются при list_type≠text).
+- **ИСПРАВЛЕНО:** `conn_type_menu` показывает `Direct` вместо `Exclusion` на Plus; `do_switch_mode_url/outbound` заблокированы на Plus с уведомлением.
+
 ## v0.14.4
 
 - **ИСПРАВЛЕНО:** На некоторых прошивках `opkg` возвращает версию с префиксом `v` (например, `v0.7.14-r1`). Пайплайн убирал суффикс `-r1` через `cut -d'-' -f1`, но оставлял `v`, в результате чего получалось `v0.7.14`. При арифметическом сравнении `v0` vs `0` shell выдавал `Illegal number`, `_upd` оставался 0, и бот всегда показывал «Up to date» вне зависимости от реальной версии. Исправлено добавлением `sed 's/^v//'` в пайплайны для `opkg` и `apk`. Аналогичная очистка уже была добавлена в `cmd_check_update` (в v0.14.2), однако отсутствовала в четырёх других точках чтения `p_ver`: `_handle_status` (экран Status), `cmd_info` (экран Info), `cmd_diag` (экспорт диагностики) и уведомление при запуске. Все пять точек теперь унифицированы.
