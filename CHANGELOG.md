@@ -2,7 +2,22 @@
 
 ---
 
-## v0.15.2 (current)
+## v0.15.3
+- **NEW:** Subscription URL replacement — `✏️ Edit Subscription URL` button in `proxy_menu` for subscription sections (replaces `+ Add`, which has no meaning for auto-managed server lists). Two-step flow: send new URL → confirmation card shows old vs new URL → Confirm applies, Cancel returns without changes.
+- **NEW:** Plus: replaces all `subscription_urls` list entries via `uci delete` + `uci add_list`; Evolution/NetShift: replaces single `subscription_url` via `uci set`. Supports `URL | User-Agent` format — trim removes only leading/trailing whitespace, internal spaces preserved.
+- **NEW:** `cmd_proxy_add` guard for subscription sections — old cached `+ Add` button redirects to `Edit Subscription URL` with an explanation instead of opening the manual outbound form, preventing accidental corruption of subscription-managed sections.
+- **NEW:** `section_display_kind()` helper — returns `subscription` when `section_is_subscription()` is true, regardless of `get_section_type()` result. Ensures sections with both `subscription_urls` and `urltest_enabled=1` are labeled as subscription in display contexts.
+- **FIXED:** `pending_sub_url_*` state check moved before `rm -f "$STATE_FILE"` — pending URL stored on line 2 of STATE_FILE is no longer lost if the user sends a text message while on the confirmation screen. Confirmation still works correctly after accidental text input.
+- **FIXED:** `do_confirm_sub_url_*` validates STATE_FILE header (`pending_sub_url_<sec>`) before reading the URL from line 2 — stale confirmation buttons from a previous session cannot apply a mismatched URL.
+- **FIXED:** Subscription URL display in `proxy_menu`, `cmd_edit_sub_url` prompt and confirmation card now runs through `html_escape` — `&` in query strings no longer causes Telegram HTML parse errors.
+- **FIXED:** JSON keyboard escaping in `cmd_edit_sub_url` unsupported-variant notice and `pending_sub_url_*` warning — unescaped braces caused `jq --argjson` to receive invalid JSON at runtime (not caught by `sh -n`).
+- **UX:** Status card — section dividers (`─────────────────────`) added between System / Podkop / Telegram / Bot blocks; LAN IP line added (`🏠 LAN: <ip>`); footer reduced to `bot vX.Y.Z` only, eliminating duplicate version display.
+- **UX:** Routing & Lists card — `Service Lists` renamed to `Community Lists` (matches LuCI label); `Domain List URLs` → `External Domain Lists`; `Subnet List URLs` → `External Subnet Lists`; buttons: `+ Domain List URL` → `+ Add Domain List URL`, `+ Device → Tunnel` → `+ Device to Tunnel`, `Edit Tunnel Devices` → `Tunnel Devices`, `+ Device → Bypass` → `+ Device to Bypass`, `Edit Bypass Devices` → `Bypass Devices`.
+- **UX:** Routing & Lists card (Plus only) — `rule_set` and `rule_set_with_subnets` fields now displayed with URL list and entry count. Read-only; edit note directs to `LuCI → Podkop → Conditions`. Hidden on non-Plus variants.
+
+---
+
+## v0.15.2
 - **NEW:** NetShift support — podkop-evolution was renamed to NetShift (`/usr/bin/netshift`, UCI namespace `netshift`). `_detect_podkop_variant()` now detects NetShift before falling through to the `podkop` binary check; variant config sets `PODKOP_UCI=netshift`, `PODKOP_BIN=/usr/bin/netshift`, `PODKOP_GITHUB_REPO=yandexru45/netshift`. UCI schema is identical to evolution (`connection_type`, `proxy_config_type`, `subscription_url`); all variant-aware logic reused without changes. Subscription cache path corrected to `/etc/netshift/subscriptions/<sec>.json`.
 - **FIXED:** `domain_ip_lists` field not read on Podkop Plus — current LuCI Plus writes external URL lists to `domain_ip_lists` (label «Domain and IP Lists»), not `remote_domain_lists`. Bot only read `remote_domain_lists`, so lists added via LuCI showed as «No lists configured». Fixed: on Plus, bot reads both fields (merged for display) and writes new entries to `domain_ip_lists`. On original/evolution/netshift, `remote_domain_lists` behaviour is unchanged.
 - **FIXED:** `-4` flag added to the direct leg of `_curl_via_best_socks` — eliminates AAAA DNS stall on every GitHub fetch before SOCKS fallback. Fixes update check hanging/failing under podkop's DNS redirect.
