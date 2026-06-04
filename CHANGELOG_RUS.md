@@ -14,6 +14,9 @@
 - **UX:** Карточка Status — добавлены разделители между блоками (`─────────────────────`): System / Podkop / Telegram / Bot; добавлена строка LAN IP (`🏠 LAN: <ip>`); футер сокращён до `bot vX.Y.Z` — устранено двойное отображение версий.
 - **UX:** Карточка Routing & Lists — `Service Lists` переименован в `Community Lists` (как в LuCI); `Domain List URLs` → `External Domain Lists`; `Subnet List URLs` → `External Subnet Lists`; кнопки: `+ Domain List URL` → `+ Add Domain List URL`, `+ Device → Tunnel` → `+ Device to Tunnel`, `Edit Tunnel Devices` → `Tunnel Devices`, `+ Device → Bypass` → `+ Device to Bypass`, `Edit Bypass Devices` → `Bypass Devices`.
 - **UX:** Карточка Routing & Lists (только Plus) — поля `rule_set` и `rule_set_with_subnets` теперь отображаются со списком URL и счётчиком записей. Только чтение; указание редактировать через `LuCI → Podkop → Conditions`. Скрыто на non-Plus вариантах.
+- **ИСПРАВЛЕНО (критично):** Экран Outbounds не открывался — при рефакторинге keyboard-блока `proxy_menu` в if/else потеряна одна закрывающая `]` в обеих ветках (`}]}"` вместо `}]]}"` ). `jq --argjson kb` падал молча, `payload` был пустым, карточка не отправлялась совсем.
+- **НОВОЕ:** `_validate_kb()` — guard перед `send_message` и `edit_message`: проверяет JSON клавиатуры через `jq -e` перед передачей в `--argjson`; при невалидном JSON пишет в лог `[UI] Invalid reply_markup JSON (cmd=...)` и отправляет карточку без кнопок вместо молчаливого провала. `bash -n` / `busybox ash -n` такие ошибки не ловят.
+
 
 ---
 
