@@ -1,6 +1,6 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.15.2
+# Podkop Telegram Bot v0.15.3
 # Variant-aware (original / evolution / plus), OpenWrt/BusyBox ash.
 # ==============================================================================
 
@@ -31,7 +31,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 BOT_DIR="/tmp/podkop_bot"
 mkdir -p "$BOT_DIR"
 
-BOT_VERSION="0.15.2"
+BOT_VERSION="0.15.3"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
@@ -437,6 +437,13 @@ section_is_subscription() {
     fi
     [ "$(get_section_type "$1")" = "proxy:subscription" ]
 }
+# section_display_kind: returns display class for UX labeling.
+# Differs from get_section_type: subscription takes precedence over urltest for display.
+section_display_kind() {
+    section_is_subscription "$1" && { printf 'subscription'; return; }
+    get_section_type "$1"
+}
+
 # section_has_links: true when proxy links are manually managed (not subscription)
 section_has_links() {
     section_is_subscription "$1" && return 1
@@ -3492,7 +3499,59 @@ _handle_proxy() {
     local per_page=10
 
     if [ "$cmd" = "STATE_INPUT" ]; then
+        # Nav escape: persistent keyboard buttons cancel current state
+        case "$text" in
+            "🏠 Menu"|"/menu"|"main_menu")
+                rm -f "$STATE_FILE"
+                delete_message "$mid"
+                _handle_bot "/menu" "" "" ""
+                return ;;
+            "📊 Status"|"cmd_status"|"/status")
+                rm -f "$STATE_FILE"
+                delete_message "$mid"
+                _handle_bot "cmd_status" "" "" ""
+                return ;;
+        esac
+
+        # During confirm step: user sends text while pending_sub_url_* is active.
+        # Must be checked BEFORE rm -f STATE_FILE to preserve the pending URL on line 2.
+        if printf '%s' "$state" | grep -qE '^pending_sub_url_'; then
+            send_message "$(printf '%s Please use the <b>Confirm</b> or <b>Cancel</b> buttons above.' "$E_WARN")" \
+                "{\"inline_keyboard\":[[{\"text\":\"❌ Cancel\",\"callback_data\":\"proxy_menu\"}]]}"
+            return
+        fi
+
         rm -f "$STATE_FILE"
+
+        # Subscription URL edit: wait_sub_url_<sec>
+        if printf '%s' "$state" | grep -qE '^wait_sub_url_'; then
+            delete_message "$mid"
+            local _sub_sec="${state#wait_sub_url_}"
+            local _new_url; _new_url=$(printf '%s' "$text" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if ! printf '%s' "$_new_url" | grep -qE '^https?://'; then
+                send_message "$(printf '%s <b>Invalid URL.</b>\nMust start with <code>http://</code> or <code>https://</code>.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
+                return
+            fi
+            local _old_urls="" _ou_line
+            while IFS= read -r _ou_line; do
+                [ -z "$_ou_line" ] && continue
+                local _ou_short; _ou_short=$(printf '%s' "$_ou_line" | cut -c1-67)
+                [ "$(printf '%s' "$_ou_line" | wc -c | tr -d ' ')" -gt 67 ] && _ou_short="${_ou_short}..."
+                _old_urls="${_old_urls}  <code>$(html_escape "$_ou_short")</code>
+"
+            done <<SUBURLS
+$(get_subscription_urls "$_sub_sec" | head -3)
+SUBURLS
+            [ -z "$_old_urls" ] && _old_urls="  <i>none</i>"
+            local _new_url_html; _new_url_html=$(html_escape "$_new_url")
+            printf '%s\n%s' "pending_sub_url_${_sub_sec}" "$_new_url" > "$STATE_FILE"
+            send_message "$(printf '%s <b>Replace subscription URL?</b>\n\n<b>Current:</b>\n%s\n\n<b>New:</b>\n  <code>%s</code>\n\n<i>Replaces all URLs for section <code>%s</code> and triggers reload.</i>' \
+                "$E_WARN" "$_old_urls" "$_new_url_html" "$_sub_sec")" \
+                "{\"inline_keyboard\":[[{\"text\":\"✅ Confirm\",\"callback_data\":\"do_confirm_sub_url_${_sub_sec}\"},{\"text\":\"❌ Cancel\",\"callback_data\":\"proxy_menu\"}]]}"
+            return
+        fi
+
         if [ "$state" = "wait_proxy_link" ]; then
             delete_message "$mid"
             local safe_link=$(printf "%s" "$text" | tr -d '\r\n')
@@ -3728,15 +3787,28 @@ EOF
                 fi
                 # URLTest auto ✓ indicator shown in list text, no standalone button needed
             fi
-            kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
+            # For subscription sections: replace Add with Edit Subscription URL
+            if section_is_subscription "$sec"; then
+                kb="${kb}[{\"text\":\"✏️ Edit Subscription URL\",\"callback_data\":\"cmd_edit_sub_url\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]}"
+            else
+                kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]}"
+            fi
             local _card_title _sub_url_line=""
             # Show subscription URL(s) for subscription sections
             if section_is_subscription "$sec"; then
                 local _sub_urls _sub_url_disp="" _sub_meta_str=""
                 _sub_urls=$(get_subscription_urls "$sec")
                 if [ -n "$_sub_urls" ]; then
-                    _sub_url_disp=$(printf '%s' "$_sub_urls" | head -3 | \
-                        awk '{ if(length($0)>60) $0=substr($0,1,57)"..."; printf "  <code>%s</code>\n", $0 }')
+                    local _pm_u_line
+                    while IFS= read -r _pm_u_line; do
+                        [ -z "$_pm_u_line" ] && continue
+                        local _pm_u_short; _pm_u_short=$(printf '%s' "$_pm_u_line" | cut -c1-57)
+                        [ "$(printf '%s' "$_pm_u_line" | wc -c | tr -d ' ')" -gt 57 ] && _pm_u_short="${_pm_u_short}..."
+                        _sub_url_disp="${_sub_url_disp}  <code>$(html_escape "$_pm_u_short")</code>
+"
+                    done <<PMURLEOF
+$(printf '%s' "$_sub_urls" | head -3)
+PMURLEOF
                 fi
                 # Traffic/expiry from Plus CLI
                 if _plus_has_cmd "get_subscription_metadata"; then
@@ -4070,10 +4142,80 @@ EOF
             ;;
 
         "cmd_proxy_add")
+            if section_is_subscription "$sec"; then
+                send_or_edit "$mid" \
+                    "$(printf '%s This is a subscription section — servers are managed automatically.\nTo change the source, use <b>Edit Subscription URL</b>.' "$E_WARN")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"✏️ Edit Subscription URL\",\"callback_data\":\"cmd_edit_sub_url\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
+                return
+            fi
             echo "wait_proxy_link" > "$STATE_FILE"
             send_or_edit "$mid" \
                 "$(printf '%s <b>Send outbound link.</b>\n<i>vless://, vmess://, ss://, trojan://, hy2://, socks5://…</i>' "$E_EDIT")" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_menu\"}]]}"
+            ;;
+
+        "cmd_edit_sub_url")
+            # Prompt user to send a new subscription URL for the active section
+            _variant_has_subscription || {
+                send_or_edit "$mid" "$(printf '%s Subscription management is not supported for this variant.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
+                return
+            }
+            local _ese_sec; _ese_sec=$(get_active_section)
+            local _ese_urls="" _eu_line
+            while IFS= read -r _eu_line; do
+                [ -z "$_eu_line" ] && continue
+                local _eu_short; _eu_short=$(printf '%s' "$_eu_line" | cut -c1-67)
+                [ "$(printf '%s' "$_eu_line" | wc -c | tr -d ' ')" -gt 67 ] && _eu_short="${_eu_short}..."
+                _ese_urls="${_ese_urls}  <code>$(html_escape "$_eu_short")</code>
+"
+            done <<ESUURLS
+$(get_subscription_urls "$_ese_sec" | head -3)
+ESUURLS
+            [ -z "$_ese_urls" ] && _ese_urls="  <i>none configured</i>"
+            printf '%s' "wait_sub_url_${_ese_sec}" > "$STATE_FILE"
+            send_or_edit "$mid" \
+                "$(printf '%s <b>Edit Subscription URL</b>\n\n<b>Current URL(s):</b>\n%s\n\nSend the new subscription URL.\n<i>http:// or https:// required.\nFor Plus: replaces all existing URLs.\nFor Evolution/NetShift: replaces the single URL.</i>' \
+                    "$E_EDIT" "$_ese_urls")" \
+                "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Cancel\",\"callback_data\":\"proxy_menu\"}]]}"
+            ;;
+
+        do_confirm_sub_url_*)
+            # Execute the confirmed subscription URL replacement
+            local _conf_sec="${cmd#do_confirm_sub_url_}"
+            # Validate STATE_FILE header matches this section before reading URL
+            local _state_head _pending_url
+            _state_head=$(head -n 1 "$STATE_FILE" 2>/dev/null)
+            if [ "$_state_head" != "pending_sub_url_${_conf_sec}" ]; then
+                rm -f "$STATE_FILE"
+                send_or_edit "$mid" "$(printf '%s Session expired or mismatched. Please try again.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
+                return
+            fi
+            _pending_url=$(sed -n '2p' "$STATE_FILE" 2>/dev/null)
+            rm -f "$STATE_FILE"
+            if [ -z "$_pending_url" ]; then
+                send_or_edit "$mid" "$(printf '%s Session expired. Please try again.' "$E_ERR")" \
+                    "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_menu\"}]]}"
+                return
+            fi
+            send_or_edit "$mid" "$(printf '%s <b>Applying...</b>' "$E_RST")" ""
+            if [ "$PODKOP_VARIANT" = "evolution" ] || [ "$PODKOP_VARIANT" = "netshift" ]; then
+                # Single URL field
+                uci set ${PODKOP_UCI}.${_conf_sec}.subscription_url="$_pending_url"
+            else
+                # Plus: list field — replace all existing entries
+                uci -q delete ${PODKOP_UCI}.${_conf_sec}.subscription_urls 2>/dev/null || true
+                uci add_list ${PODKOP_UCI}.${_conf_sec}.subscription_urls="$_pending_url"
+            fi
+            if ! uci_commit_safe ${PODKOP_UCI}; then
+                send_message "$(printf '%s <b>UCI commit failed.</b>\nCheck logs.' "$E_ERR")" ""
+                return
+            fi
+            safe_reload_podkop "force"; sleep 2
+            send_message "$(printf '%s <b>Subscription URL updated.</b>\nSection: <code>%s</code>\nPodkop will fetch the new subscription on next update cycle.' \
+                "$E_OK" "$_conf_sec")" ""
+            _handle_proxy "proxy_menu" "$mid" "" ""
             ;;
     esac
 }
@@ -5705,6 +5847,30 @@ EOF
             # Treat domain_ip_lists as domain list entries for display
             [ "${_dip_count:-0}" -gt 0 ] && r_dom_count=$(( r_dom_count + _dip_count ))
             excl_count=$(uci -q show ${PODKOP_UCI}.settings 2>/dev/null | grep -c "^${PODKOP_UCI}\.settings\.routing_excluded_ips=")
+            # Plus-only: rule_set (domains only) and rule_set_with_subnets (.srs/.json)
+            local rs_count=0 rsws_count=0 rs_text="" rsws_text=""
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                rs_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.rule_set=")
+                rsws_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.rule_set_with_subnets=")
+                if [ "$rs_count" -gt 0 ]; then
+                    raw=$(uci -q show ${PODKOP_UCI}.${sec}.rule_set 2>/dev/null | cut -d= -f2-)
+                    [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
+                        clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
+                        rs_text=$(printf '%s\n• <a href="%s">%s</a>' "$rs_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
+                    done
+                else
+                    rs_text=$(printf '\n<i>None</i>')
+                fi
+                if [ "$rsws_count" -gt 0 ]; then
+                    raw=$(uci -q show ${PODKOP_UCI}.${sec}.rule_set_with_subnets 2>/dev/null | cut -d= -f2-)
+                    [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
+                        clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
+                        rsws_text=$(printf '%s\n• <a href="%s">%s</a>' "$rsws_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
+                    done
+                else
+                    rsws_text=$(printf '\n<i>None</i>')
+                fi
+            fi
 
             # Use safe_set_args for list parsing (glob-safe; uci get N broken on BusyBox)
             r_dom_text=""
@@ -5749,17 +5915,23 @@ EOF
                 | grep "^${PODKOP_UCI}\.${sec}\.community_lists=" \
                 | sed "s/^[^']*'//g; s/'$//g; s/' '/, /g" || echo "<i>None</i>")
 
+            local _rs_section=""
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                _rs_section=$(printf '\n<b>Rule Sets — domains only</b> (.srs/.json):%s\n\n<b>Rule Sets — domains + subnets</b> (.srs/.json):%s\n<i>Edit rule sets in LuCI → Podkop → Conditions</i>' \
+                    "$rs_text" "$rsws_text")
+            fi
+
             text=$(cat <<EOF
 ${E_FILE} <b>Routing & Lists</b> [<code>${sec}</code>]
 <i>What goes through the tunnel — and what bypasses it.</i>
 
-<b>Service Lists</b> (predefined sets — which services to tunnel):
+<b>Community Lists</b> (predefined sets — which services to tunnel):
 <code>${active_lists}</code>
 
-<b>Domain List URLs</b> (external domain lists by URL):${r_dom_text}
+<b>External Domain Lists</b> (by URL):${r_dom_text}
 
-<b>Subnet List URLs</b> (external subnet lists by URL):${r_sub_text}
-
+<b>External Subnet Lists</b> (by URL):${r_sub_text}
+${_rs_section}
 <b>Devices → Tunnel</b> (all their traffic via tunnel):${fr_ips_text}
 
 <b>Devices → Bypass:</b> ${excl_count} entries (go direct, skip tunnel)
@@ -5768,11 +5940,11 @@ EOF
 )
             local kb
             kb="{\"inline_keyboard\":["
-            kb="${kb}[{\"text\":\"${E_SET} Service Lists\",\"callback_data\":\"community_lists_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_ADD} + Domain List URL\",\"callback_data\":\"cmd_add_r_dom\"},{\"text\":\"${E_SET} Domain Lists\",\"callback_data\":\"r_dom_edit\"}],"
-            kb="${kb}[{\"text\":\"${E_ADD} + Subnet List URL\",\"callback_data\":\"cmd_add_r_sub\"},{\"text\":\"${E_SET} Subnet Lists\",\"callback_data\":\"r_sub_edit\"}],"
-            kb="${kb}[{\"text\":\"➡️ + Device → Tunnel\",\"callback_data\":\"cmd_add_fr_ip\"},{\"text\":\"➡️ Edit Tunnel Devices\",\"callback_data\":\"fr_ips_edit\"}],"
-            kb="${kb}[{\"text\":\"↩️ + Device → Bypass\",\"callback_data\":\"cmd_add_excl_ip\"},{\"text\":\"↩️ Edit Bypass Devices\",\"callback_data\":\"excl_ips_edit\"}],"
+            kb="${kb}[{\"text\":\"${E_SET} Community Lists\",\"callback_data\":\"community_lists_edit\"}],"
+            kb="${kb}[{\"text\":\"${E_ADD} + Add Domain List URL\",\"callback_data\":\"cmd_add_r_dom\"},{\"text\":\"${E_SET} Domain Lists\",\"callback_data\":\"r_dom_edit\"}],"
+            kb="${kb}[{\"text\":\"${E_ADD} + Add Subnet List URL\",\"callback_data\":\"cmd_add_r_sub\"},{\"text\":\"${E_SET} Subnet Lists\",\"callback_data\":\"r_sub_edit\"}],"
+            kb="${kb}[{\"text\":\"➡️ + Device to Tunnel\",\"callback_data\":\"cmd_add_fr_ip\"},{\"text\":\"➡️ Tunnel Devices\",\"callback_data\":\"fr_ips_edit\"}],"
+            kb="${kb}[{\"text\":\"↩️ + Device to Bypass\",\"callback_data\":\"cmd_add_excl_ip\"},{\"text\":\"↩️ Bypass Devices\",\"callback_data\":\"excl_ips_edit\"}],"
             kb="${kb}[{\"text\":\"${E_EDIT} My Domains\",\"callback_data\":\"user_domains_menu\"},{\"text\":\"${E_EDIT} My Subnets\",\"callback_data\":\"user_subnets_menu\"}],"
             kb="${kb}[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"main_settings_menu\"}]]}"
             send_or_edit "$mid" "$text" "$kb"
@@ -6700,24 +6872,25 @@ EOF
 
             text=$(printf '%s' "${_sev_title}
 <i>${_sev_note}</i>
-
+─────────────────────────
 ${E_RTR} <b>${_hostname_html}</b> | ${uptime_sys}${_device_model_inline}
 ${E_PENGUIN} ${_os_ver_html}
 ${E_GLOB} WAN: <code>${wan_ip}</code>${_pub_ip_inline}
+${E_HOME} LAN: <code>${lan_ip}</code>
 ${extra_ifs}${E_CPU} <code>${loadavg}</code> | ${E_RAM} <code>${mem_free} MB</code> RAM free
-
+─────────────────────────
 ${E_DOG} ${PODKOP_DISPLAY_NAME} <code>${p_ver_short:-?}</code> ${_pk_icon}${_update_avail}
    autostart: ${_as_icon}
 ${E_BOX} Sing-box <code>${sb_ver_short}</code> ${_sb_icon}${_sb_ram_inline}
 ${E_GLOB} <code>${active_proxy_display}</code> — ${_mode_lbl_html}
-
+─────────────────────────
 ${E_ENVELOPE} Telegram: ${_tg_line}
 ${E_NET} Direct: ${_tg_direct_line}${_tier2_inline}
-
+─────────────────────────
 ${E_SHLD} Bot: ${_route_icon} ${_route_name_html} <code>${tg_lat}</code>
 ${E_NET} DNS: <code>${_strategy_html}</code> — YACD: ${_yacd_icon}
-
-<i>${PODKOP_DISPLAY_NAME} ${p_ver_short:-?} · sb ${sb_ver_short} · bot v${BOT_VERSION}</i>")
+─────────────────────────
+<i>bot v${BOT_VERSION}</i>")
             kb='{"inline_keyboard":['
             kb="${kb}[{\"text\":\"🧭 Runtime Info\",\"callback_data\":\"cmd_runtime\"}],"
             if [ "$podkop_running" = "1" ]; then
@@ -8078,7 +8251,9 @@ handle_command() {
             rm -f "$STATE_FILE"; _handle_bot "main_menu" "$mid" "" ""; return
         fi
         case "$state" in
-            wait_proxy_link)
+            wait_proxy_link|pending_sub_url_*)
+                _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
+            wait_sub_url_*)
                 _handle_proxy "STATE_INPUT" "$mid" "$cmd" "$state" ;;
             wait_url_link)
                 _handle_url_links "STATE_INPUT" "$mid" "$cmd" "$state" ;;
@@ -8105,7 +8280,8 @@ handle_command() {
         "delete_msg")     delete_message "$mid" ;;
 
         proxy_menu|proxy_menu_p_*|px_view_*|do_px_*|do_del_px_*|test_px_*|\
-        cmd_proxy_add|ask_del_px_*|do_del_px_confirmed_*|cmd_all_delay_test)
+        cmd_proxy_add|ask_del_px_*|do_del_px_confirmed_*|cmd_all_delay_test|\
+        cmd_edit_sub_url|do_confirm_sub_url_*)
             _handle_proxy "$cmd" "$mid" "" "" ;;
 
         url_links_menu|url_links_p_*|\
