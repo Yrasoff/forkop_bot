@@ -6618,13 +6618,11 @@ _handle_bot() {
             # Latency is still available in Status and Bot Settings screens.
             text=$(cat <<EOF
 <b>${E_RTR} Podkop Manager</b>
-<code>────────────────────</code>
 <b>Host:</b> ${hostname}
 <b>Podkop:</b> ${p_ver:-Unknown} (${PODKOP_DISPLAY_NAME}) | <b>Bot:</b> v${BOT_VERSION}
 ${sec_str:+${sec_str}
 }<b>Active Route:</b> <code>${active_proxy_display}</code>
 <b>Bot route:</b> ${LAST_ROUTE_NAME}
-<code>────────────────────</code>
 EOF
 )
             kb="{\"inline_keyboard\":["
@@ -8472,7 +8470,6 @@ send_startup_notification_async() {
                 sec=$(get_active_section)
                 startup_txt=$(cat <<EOF
 ${E_BOT} <b>Bot Online</b> v${BOT_VERSION}
-<code>────────────────────</code>
 <b>Host:</b> ${hostname}
 <b>Podkop:</b> ${p_ver:-Unknown} (${PODKOP_DISPLAY_NAME})
 <b>Active Route:</b> <code>${active_proxy}</code>
