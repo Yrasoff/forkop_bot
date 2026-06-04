@@ -2,7 +2,7 @@
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
-Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
+Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md)
 > 
@@ -29,7 +29,7 @@ ash /tmp/install_podkop_bot.sh
 ## 📋 Требования
 
 * OpenWrt 24.x / 25.x или ImmortalWrt
-* Установленный и настроенный podkop (original, evolution или plus) 0.7.x с включённым Mixed Proxy Port
+* Установленный и настроенный podkop (original, netshift/evolution или plus) 0.7.x с включённым Mixed Proxy Port
 * Пакеты: `curl`, `jq` (устанавливаются автоматически)
 * Токен Telegram-бота (получить у [@BotFather](https://t.me/BotFather))
 * TG User ID администратора(-ов) — например через [@Getmyid_Work_Bot](https://t.me/Getmyid_Work_Bot)
