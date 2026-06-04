@@ -45,6 +45,11 @@ _detect_podkop_variant() {
         echo "plus"
         return
     fi
+    # netshift = renamed podkop-evolution (same UCI schema, new binary/package name)
+    if [ -f /usr/bin/netshift ]; then
+        echo "netshift"
+        return
+    fi
     if [ -f /usr/bin/podkop ]; then
         if grep -q "subscription_update" /usr/bin/podkop 2>/dev/null; then
             echo "evolution"
@@ -73,6 +78,14 @@ case "$PODKOP_VARIANT" in
         PODKOP_GITHUB_REPO="yandexru45/podkop-evolution"
         PODKOP_DISPLAY_NAME="Podkop Evolution"
         ;;
+    netshift)
+        PODKOP_UCI="netshift"
+        PODKOP_BIN="/usr/bin/netshift"
+        PODKOP_INIT="/etc/init.d/netshift"
+        PODKOP_PKG="netshift"
+        PODKOP_GITHUB_REPO="yandexru45/netshift"
+        PODKOP_DISPLAY_NAME="NetShift"
+        ;;
     *)
         PODKOP_UCI="podkop"
         PODKOP_BIN="/usr/bin/podkop"
@@ -86,7 +99,7 @@ esac
 # Helper: does this variant support subscriptions?
 _variant_has_subscription() {
     case "$PODKOP_VARIANT" in
-        plus|evolution) return 0 ;;
+        plus|evolution|netshift) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -2116,6 +2129,7 @@ get_subscription_cache_path() {
     local sec="$1"
     case "$PODKOP_VARIANT" in
         evolution) printf '/var/run/podkop/subscription/%s.json' "$sec" ;;
+        netshift)  printf '/etc/netshift/subscriptions/%s.json' "$sec" ;;
         plus)      printf '/var/run/podkop-plus/subscription-links/%s.json' "$sec" ;;
         *)         printf '' ;;
     esac
@@ -2136,7 +2150,7 @@ get_subscription_metadata_path() {
 get_subscription_urls() {
     local sec="$1"
     section_is_subscription "$sec" || return 1
-    if [ "$PODKOP_VARIANT" = "evolution" ]; then
+    if [ "$PODKOP_VARIANT" = "evolution" ] || [ "$PODKOP_VARIANT" = "netshift" ]; then
         local url; url=$(uci -q get ${PODKOP_UCI}.${sec}.subscription_url 2>/dev/null)
         [ -n "$url" ] && printf '%s\n' "$url"
     else
@@ -5521,8 +5535,14 @@ _handle_lists() {
                 return
             fi
             if [ "$state" = "wait_remote_domain" ]; then
-                uci add_list ${PODKOP_UCI}.${sec}.remote_domain_lists="$safe_link"
+                # Plus: write to domain_ip_lists (what LuCI uses); original: remote_domain_lists
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    uci add_list ${PODKOP_UCI}.${sec}.domain_ip_lists="$safe_link"
+                else
+                    uci add_list ${PODKOP_UCI}.${sec}.remote_domain_lists="$safe_link"
+                fi
             else
+                # remote_subnet_lists — Plus has no domain_ip_lists equivalent for subnets
                 uci add_list ${PODKOP_UCI}.${sec}.remote_subnet_lists="$safe_link"
             fi
             uci_commit_safe ${PODKOP_UCI}
@@ -5675,14 +5695,27 @@ EOF
             cd_count=$(uci -q get ${PODKOP_UCI}.${sec}.user_domains_text 2>/dev/null | grep -c "[^[:space:]]")
             sn_count=$(uci -q get ${PODKOP_UCI}.${sec}.user_subnets_text  2>/dev/null | grep -c "[^[:space:]]")
             fr_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.fully_routed_ips=")
+            # Plus: LuCI writes combined lists to domain_ip_lists; legacy remote_domain/subnet_lists also read
+            local _dip_count=0
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                _dip_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.domain_ip_lists=")
+            fi
             r_dom_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.remote_domain_lists=")
             r_sub_count=$(uci -q show ${PODKOP_UCI}.${sec} 2>/dev/null | grep -c "^${PODKOP_UCI}\.${sec}\.remote_subnet_lists=")
+            # Treat domain_ip_lists as domain list entries for display
+            [ "${_dip_count:-0}" -gt 0 ] && r_dom_count=$(( r_dom_count + _dip_count ))
             excl_count=$(uci -q show ${PODKOP_UCI}.settings 2>/dev/null | grep -c "^${PODKOP_UCI}\.settings\.routing_excluded_ips=")
 
             # Use safe_set_args for list parsing (glob-safe; uci get N broken on BusyBox)
             r_dom_text=""
             if [ "$r_dom_count" -gt 0 ]; then
-                raw=$(uci -q show ${PODKOP_UCI}.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
+                # Merge remote_domain_lists + domain_ip_lists (Plus)
+                local _rdl_raw _dip_raw
+                _rdl_raw=$(uci -q show ${PODKOP_UCI}.${sec}.remote_domain_lists 2>/dev/null | cut -d= -f2-)
+                _dip_raw=""
+                [ "$PODKOP_VARIANT" = "plus" ] &&                     _dip_raw=$(uci -q show ${PODKOP_UCI}.${sec}.domain_ip_lists 2>/dev/null | cut -d= -f2-)
+                raw=$(printf '%s
+%s' "$_rdl_raw" "$_dip_raw" | grep -v "^[[:space:]]*$")
                 [ -n "$raw" ] && { _ucl=$(uci_list_clean "$raw"); eval "set -- $_ucl"; } && for list_url in "$@"; do
                     clean_url="${list_url%%#*}"; clean_url="${clean_url%%\?*}"; filename="${clean_url##*/}"
                     r_dom_text=$(printf '%s\n• <a href="%s">%s</a>' "$r_dom_text" "$(html_escape "$list_url")" "$(html_escape "$filename")")
