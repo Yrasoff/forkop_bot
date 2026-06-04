@@ -2,7 +2,22 @@
 
 ---
 
-## v0.15.2 (текущая)
+## v0.15.3 - Текущая
+- **НОВОЕ:** Замена URL подписки — кнопка `✏️ Edit Subscription URL` в `proxy_menu` для subscription-секций (заменяет `+ Add`, который не имеет смысла для автоматически управляемых списков серверов). Двухшаговый flow: ввод нового URL → карточка подтверждения со сравнением старого и нового → Confirm применяет, Cancel возвращает без изменений.
+- **НОВОЕ:** Plus: заменяет все записи list-поля `subscription_urls` через `uci delete` + `uci add_list`; Evolution/NetShift: заменяет одиночный `subscription_url` через `uci set`. Поддерживает формат `URL | User-Agent` — trim удаляет только пробелы по краям, внутренние пробелы сохраняются.
+- **НОВОЕ:** Защита `cmd_proxy_add` для subscription-секций — залипшая старая кнопка `+ Add` редиректит на `Edit Subscription URL` с пояснением вместо открытия формы добавления outbound-а, предотвращая случайную порчу subscription-управляемых секций.
+- **НОВОЕ:** Хелпер `section_display_kind()` — возвращает `subscription` если `section_is_subscription()` истинно, независимо от результата `get_section_type()`. Обеспечивает корректный display-label для секций с одновременно заданными `subscription_urls` и `urltest_enabled=1`.
+- **ИСПРАВЛЕНО:** Проверка состояния `pending_sub_url_*` перенесена до `rm -f "$STATE_FILE"` — pending URL, хранящийся во второй строке STATE_FILE, больше не теряется если пользователь отправит текст пока открыта карточка подтверждения. Подтверждение корректно работает после случайного ввода.
+- **ИСПРАВЛЕНО:** `do_confirm_sub_url_*` проверяет заголовок STATE_FILE (`pending_sub_url_<sec>`) перед чтением URL из второй строки — залипшая старая кнопка Confirm из предыдущей сессии не может применить чужой URL.
+- **ИСПРАВЛЕНО:** Отображение subscription URL в `proxy_menu`, в prompt `cmd_edit_sub_url` и в карточке подтверждения теперь проходит через `html_escape` — символ `&` в query string больше не вызывает ошибку Telegram HTML parse.
+- **ИСПРАВЛЕНО:** Экранирование JSON-клавиатуры в уведомлении unsupported-variant в `cmd_edit_sub_url` и в предупреждении `pending_sub_url_*` — неэкранированные фигурные скобки передавали невалидный JSON в `jq --argjson` во время выполнения (не обнаруживается `sh -n`).
+- **UX:** Карточка Status — добавлены разделители между блоками (`─────────────────────`): System / Podkop / Telegram / Bot; добавлена строка LAN IP (`🏠 LAN: <ip>`); футер сокращён до `bot vX.Y.Z` — устранено двойное отображение версий.
+- **UX:** Карточка Routing & Lists — `Service Lists` переименован в `Community Lists` (как в LuCI); `Domain List URLs` → `External Domain Lists`; `Subnet List URLs` → `External Subnet Lists`; кнопки: `+ Domain List URL` → `+ Add Domain List URL`, `+ Device → Tunnel` → `+ Device to Tunnel`, `Edit Tunnel Devices` → `Tunnel Devices`, `+ Device → Bypass` → `+ Device to Bypass`, `Edit Bypass Devices` → `Bypass Devices`.
+- **UX:** Карточка Routing & Lists (только Plus) — поля `rule_set` и `rule_set_with_subnets` теперь отображаются со списком URL и счётчиком записей. Только чтение; указание редактировать через `LuCI → Podkop → Conditions`. Скрыто на non-Plus вариантах.
+
+---
+
+## v0.15.2
 - **НОВОЕ:** Поддержка NetShift — podkop-evolution переименован в NetShift (`/usr/bin/netshift`, UCI namespace `netshift`). `_detect_podkop_variant()` проверяет `/usr/bin/netshift` до обращения к бинарю `podkop`; конфиг варианта задаёт `PODKOP_UCI=netshift`, `PODKOP_BIN=/usr/bin/netshift`, `PODKOP_GITHUB_REPO=yandexru45/netshift`. Схема UCI идентична evolution (`connection_type`, `proxy_config_type`, `subscription_url`); вся variant-aware логика переиспользуется без изменений. Путь кэша подписки исправлен на `/etc/netshift/subscriptions/<sec>.json`.
 - **ИСПРАВЛЕНО:** На Podkop Plus не читалось поле `domain_ip_lists` — актуальный LuCI Plus пишет внешние URL-списки в `domain_ip_lists` («Domain and IP Lists»), а не в `remote_domain_lists`. Бот читал только `remote_domain_lists`, поэтому списки добавленные через LuCI показывались как «No lists configured». Исправлено: на Plus бот читает оба поля (объединяет для отображения) и пишет новые записи в `domain_ip_lists`. На original/evolution/netshift поведение `remote_domain_lists` не изменилось.
 - **ИСПРАВЛЕНО:** Флаг `-4` добавлен на прямую ветку `_curl_via_best_socks` — устраняет зависание на AAAA DNS при каждом GitHub-запросе перед переходом на SOCKS. Исправляет зависание проверки обновлений под DNS-редиректом podkop.
