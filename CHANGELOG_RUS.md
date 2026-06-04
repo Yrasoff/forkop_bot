@@ -3,7 +3,8 @@
 ---
 
 ## v0.15.2 (текущая)
-
+- **НОВОЕ:** Поддержка NetShift — podkop-evolution переименован в NetShift (`/usr/bin/netshift`, UCI namespace `netshift`). `_detect_podkop_variant()` проверяет `/usr/bin/netshift` до обращения к бинарю `podkop`; конфиг варианта задаёт `PODKOP_UCI=netshift`, `PODKOP_BIN=/usr/bin/netshift`, `PODKOP_GITHUB_REPO=yandexru45/netshift`. Схема UCI идентична evolution (`connection_type`, `proxy_config_type`, `subscription_url`); вся variant-aware логика переиспользуется без изменений. Путь кэша подписки исправлен на `/etc/netshift/subscriptions/<sec>.json`.
+- **ИСПРАВЛЕНО:** На Podkop Plus не читалось поле `domain_ip_lists` — актуальный LuCI Plus пишет внешние URL-списки в `domain_ip_lists` («Domain and IP Lists»), а не в `remote_domain_lists`. Бот читал только `remote_domain_lists`, поэтому списки добавленные через LuCI показывались как «No lists configured». Исправлено: на Plus бот читает оба поля (объединяет для отображения) и пишет новые записи в `domain_ip_lists`. На original/evolution/netshift поведение `remote_domain_lists` не изменилось.
 - **ИСПРАВЛЕНО:** Флаг `-4` добавлен на прямую ветку `_curl_via_best_socks` — устраняет зависание на AAAA DNS при каждом GitHub-запросе перед переходом на SOCKS. Исправляет зависание проверки обновлений под DNS-редиректом podkop.
 - **ИСПРАВЛЕНО:** `-4` на прямых ветках проверки GitHub (`api.github.com`, `raw.githubusercontent.com`) — результат "direct" в Tunnel Health теперь отражает реальную TCP-достижимость, а не таймаут AAAA.
 - **НОВОЕ:** Предварительная проверка `_pkg_net_check` — перед запуском `install.sh` при обновлении podkop проверяется доступность сети (IPv4); возвращает "Package network unreachable" вместо молчаливого зависания opkg/apk.
