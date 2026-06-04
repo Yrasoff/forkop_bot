@@ -1593,8 +1593,22 @@ is_reply_to_bot() {
 # SECTION 4: Messaging Functions
 # ==============================================================================
 
+# _validate_kb: check reply_markup JSON is valid before passing to jq --argjson.
+# Invalid kb silently kills the whole jq payload, leaving the card un-sent.
+# On failure: logs the bad JSON with calling context, clears kb so card sends without buttons.
+_validate_kb() {
+    local _kb="$1" _ctx="${2:-unknown}"
+    [ -z "$_kb" ] || [ "$_kb" = "null" ] && return 0
+    if ! printf '%s' "$_kb" | jq -e . >/dev/null 2>&1; then
+        logger -t podkop-bot "[UI] Invalid reply_markup JSON (cmd=${_ctx}): $(printf '%s' "$_kb" | head -c 120)"
+        return 1
+    fi
+    return 0
+}
+
 send_message() {
     local txt="$1" kb="$2" payload resp new_mid
+    _validate_kb "$kb" "${cmd:-send}" || kb=""
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         if [ -n "$TARGET_REPLY_THREAD_ID" ] && [ "$TARGET_REPLY_THREAD_ID" != "null" ]; then
             payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg txt "$txt" --arg tid "$TARGET_REPLY_THREAD_ID" --argjson kb "$kb" \
@@ -1621,6 +1635,7 @@ send_message() {
 edit_message() {
     local mid="$1" txt="$2" kb="$3" payload
     [ -z "$mid" ] && { send_message "$txt" "$kb"; return; }
+    _validate_kb "$kb" "${cmd:-edit}" || kb=""
     if [ -n "$kb" ] && [ "$kb" != "null" ]; then
         payload=$(jq -n -c --arg cid "$TARGET_CHAT_ID" --arg mid "$mid" --arg txt "$txt" --argjson kb "$kb" \
             '{chat_id:$cid,message_id:($mid|tonumber),text:$txt,parse_mode:"HTML",reply_markup:$kb}')
@@ -3789,9 +3804,9 @@ EOF
             fi
             # For subscription sections: replace Add with Edit Subscription URL
             if section_is_subscription "$sec"; then
-                kb="${kb}[{\"text\":\"✏️ Edit Subscription URL\",\"callback_data\":\"cmd_edit_sub_url\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]}"
+                kb="${kb}[{\"text\":\"✏️ Edit Subscription URL\",\"callback_data\":\"cmd_edit_sub_url\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
             else
-                kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]}"
+                kb="${kb}[{\"text\":\"${E_ADD} Add\",\"callback_data\":\"cmd_proxy_add\"},{\"text\":\"${E_TEST} Test All\",\"callback_data\":\"cmd_all_delay_test\"},{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"proxy_menu_p_${page}\"}],[{\"text\":\"${E_TEST} Diagnostics\",\"callback_data\":\"cmd_diagnostics\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"main_menu\"}]]}"
             fi
             local _card_title _sub_url_line=""
             # Show subscription URL(s) for subscription sections
