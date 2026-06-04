@@ -3,7 +3,8 @@
 ---
 
 ## v0.15.2 (current)
-
+- **NEW:** NetShift support — podkop-evolution was renamed to NetShift (`/usr/bin/netshift`, UCI namespace `netshift`). `_detect_podkop_variant()` now detects NetShift before falling through to the `podkop` binary check; variant config sets `PODKOP_UCI=netshift`, `PODKOP_BIN=/usr/bin/netshift`, `PODKOP_GITHUB_REPO=yandexru45/netshift`. UCI schema is identical to evolution (`connection_type`, `proxy_config_type`, `subscription_url`); all variant-aware logic reused without changes. Subscription cache path corrected to `/etc/netshift/subscriptions/<sec>.json`.
+- **FIXED:** `domain_ip_lists` field not read on Podkop Plus — current LuCI Plus writes external URL lists to `domain_ip_lists` (label «Domain and IP Lists»), not `remote_domain_lists`. Bot only read `remote_domain_lists`, so lists added via LuCI showed as «No lists configured». Fixed: on Plus, bot reads both fields (merged for display) and writes new entries to `domain_ip_lists`. On original/evolution/netshift, `remote_domain_lists` behaviour is unchanged.
 - **FIXED:** `-4` flag added to the direct leg of `_curl_via_best_socks` — eliminates AAAA DNS stall on every GitHub fetch before SOCKS fallback. Fixes update check hanging/failing under podkop's DNS redirect.
 - **FIXED:** `-4` on direct legs of GitHub health probes (`api.github.com`, `raw.githubusercontent.com`) — "direct" result in Tunnel Health now reflects true TCP reachability, not AAAA timeout.
 - **NEW:** `_pkg_net_check` pre-flight — verifies network reachability (IPv4) before running `install.sh` for podkop updates; reports "Package network unreachable" instead of silently hanging opkg/apk.
