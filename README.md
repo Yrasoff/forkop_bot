@@ -1,4 +1,4 @@
-# 🤖 podkop_bot v0.15.3
+# 🤖 podkop_bot v0.15.4
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
@@ -10,6 +10,83 @@ Telegram-бот для удалённого управления [podkop](https:
 
 ---
 
+## ✨ Возможности
+
+```text
+🛡️  Статус и управление    — podkop, sing-box, автозапуск, перезагрузка роутера
+🔀  Outbounds               — список с задержкой, переключение, добавление/удаление ссылок
+📋  Маршрутизация           — Service Lists, Domain/Subnet URL, My Domains/Subnets
+🔧  Настройки секций        — тип, режим прокси, URLTest, DNS resolver, интерфейс
+🌐  DNS и YACD              — тип DNS, сервер, bootstrap, YACD доступ и ключ
+📊  Диагностика             — Status, Tunnel Health, Runtime Info, Active Probe, Support Bundle
+🔔  Watchdog                — алерты sing-box, SOCKS, смены прокси, аварийные IP через DoH
+🤖  Транспорт бота          — tier1–5 fallback, Fallback SOCKS, Custom Proxy, Bind Interface
+👤  Администраторы          — добавление/удаление прямо из TG, анонимные группы
+⬆️  Обновления              — бот и podkop из меню, Force Update, What's New карточка
+```
+
+**Только на Podkop Plus:**
+
+```text
+🔬  URLTest Filters         — фильтрация outbounds по стране и regex
+📊  Трафик подписки         — «18.5 GB / ∞ · exp 28.08» в карточке секции
+⚙️  Zapret / ByeDPI         — статус, вкл/выкл, редактирование стратегии с валидацией
+🔗  Ручные ссылки           — добавление вручную в subscription-секцию (сосуществуют с подпиской)
+🔌  Close Connections       — сброс всех соединений через Clash API
+```
+
+---
+
+## 🗺️ Главное меню
+
+```text
+🏠 Menu
+├── 📊 Status
+├── 🔀 Outbounds
+├── 📋 Routing & Lists
+├── ⚙️ Section Settings
+├── 🌍 DNS & YACD
+├── 🔧 Bad WAN
+├── 🔧 Maintenance
+│   ├── ⬆️ Update Bot / Force Update
+│   ├── ⬆️ Update Podkop
+│   ├── 🔁 Reboot Router
+│   └── 🔌 Runtime Info → Diagnostics
+└── ⚙️ Bot Settings
+    ├── 🤖 Transport Policy
+    ├── 📡 Fallback SOCKS
+    ├── 👤 Admins
+    └── 🔗 Bind Interface
+```
+
+> Постоянная навигация `🏠 Menu | 📊 Status` доступна в любой момент, включая watchdog-алерты.
+
+---
+
+## 🔀 Поддержка форков podkop
+
+| Функция | original | evolution / netshift | plus |
+|---------|:--------:|:--------------------:|:----:|
+| Управление сервисом (старт/стоп/reload) | ✅ | ✅ | ✅ |
+| Outbound Selector — просмотр и переключение | ✅ | ✅ | ✅ |
+| Добавление / удаление ссылок | ✅ | ✅ | ✅ |
+| Single URL (proxy_string) | ✅ | ✅ | ✅ |
+| Subscription URL (просмотр, замена) | ❌ | ✅ | ✅ |
+| Ручные ссылки в subscription-секции | ❌ | ❌ | ✅ |
+| URLTest Filters (страна, regex) | ❌ | ❌ | ✅ |
+| Трафик и срок подписки | ❌ | ❌ | ✅ |
+| Zapret / ByeDPI секции | ❌ | ❌ | ✅ |
+| Close All Connections | ❌ | ❌ | ✅ |
+| Service Lists (готовые наборы) | ✅ | ✅ | ✅ |
+| Domain/Subnet List URLs | ✅ | ✅ | ✅ |
+| My Domains / My Subnets | ✅ | ✅ | ✅ |
+| Rule Sets (rule_set, rule_set_with_subnets) | ❌ | ❌ | 👁 только просмотр |
+| Версии zapret / byedpi в Status | ❌ | ❌ | ✅ |
+| Watchdog и Tunnel Health | ✅ | ✅ | ✅ |
+| Diagnostics / Support Bundle | ✅ | ✅ | ✅ |
+
+---
+
 ## 🚀 Быстрая установка
 
 ```sh
@@ -17,12 +94,52 @@ wget -O /tmp/install_podkop_bot.sh https://raw.githubusercontent.com/Medvedolog/
 ash /tmp/install_podkop_bot.sh
 ```
 
-Установщик поддерживает 4 режима:
+Установщик автоматически определяет вариант podkop (original / evolution / netshift / plus), устанавливает зависимости (`curl`, `jq`) и поддерживает **4 интерактивных режима**:
 
 1. **Update** — обновить скрипт, сохранить конфиг
 2. **Reinstall** — переустановить с новыми настройками
 3. **Exit** — выйти без изменений
 4. **Uninstall** — полное удаление бота (двойное подтверждение: `YES` → `REMOVE`)
+
+### 🌐 Установка за блокировками
+
+Если GitHub недоступен напрямую (ISP блокирует), установщик предложит ввести прокси для скачивания бота и зависимостей. Поддерживается HTTP-прокси (`http://host:port`); SOCKS принимается только после того, как `curl` уже установлен. Прокси применяется временно, только на время работы установщика — в UCI и системные файлы ничего не пишется.
+
+### 🤖 Unattended-режим (для luci-app и скриптов)
+
+```sh
+ash install.sh --unattended \
+               --action install|update|uninstall|status|check \
+               --config /tmp/podkop_bot_install.json \
+               --lang en|ru
+```
+
+Предназначен для вызова из rpcd-бэкенда luci-app без TTY. Конфиг передаётся JSON-файлом (chmod 600), не через аргументы командной строки. `--action status` возвращает машиночитаемый JSON с версиями, вариантом podkop и состоянием сервиса.
+
+Структурированные exit-коды:
+
+| Код | Значение |
+|-----|----------|
+| 0   | Успех |
+| 10  | Installer уже запущен (lock) |
+| 11  | Не OpenWrt |
+| 12  | Отсутствует обязательное поле конфига |
+| 13  | Невалидный JSON конфига |
+| 14  | Установка зависимостей не удалась |
+| 15  | Скачивание файла не удалось |
+| 16  | Запись UCI не удалась |
+| 17  | Токен бота отклонён Telegram |
+| 18  | Запуск сервиса не удался (бот мёртв после старта) |
+
+### 🔄 Безопасное обновление с откатом
+
+При обновлении бота (`--action update` или интерактивный режим 1) установщик:
+
+1. Скачивает новый скрипт во временный файл `/tmp/podkop_bot.new`
+2. Проверяет его синтаксис (`ash -n`) — HTML-страницы с ошибками не применяются
+3. Создаёт резервную копию текущего бинаря
+4. Атомарно заменяет файл и перезапускает сервис
+5. Если новая версия не стартует — автоматически восстанавливает предыдущий бинарь
 
 ---
 
@@ -36,21 +153,8 @@ ash /tmp/install_podkop_bot.sh
 
 ---
 
-## ✨ Что умеет бот
+## 📖 Подробное описание функций
 
-### 🔀 Поддержка вариантов podkop
-
-Начиная с v0.15.0 бот автоматически определяет установленный вариант и адаптирует все операции:
-
-* **original** ([itdoginfo/podkop](https://github.com/itdoginfo/podkop)) — полная поддержка
-* **evolution** ([yandexru45/podkop-evolution](https://github.com/yandexru45/podkop-evolution)) — полная поддержка включая subscription
-* **plus** ([ushan0v/podkop-plus](https://github.com/ushan0v/podkop-plus)) — расширенная поддержка Plus CLI:
-  * Версии zapret / byedpi, наличие обновлений
-  * Меню секций zapret и byedpi с валидацией стратегий
-  * URLTest Filters — фильтрация серверов по стране, имени и regex прямо из бота
-  * Трафик и срок действия подписки (`📊 18.5 GB / ∞ · exp 28.08.2026`) в Outbounds
-  * Состояние фильтрации outbound'ов (`⊘` у серверов, исключённых URLTest-фильтром)
-  * Закрытие всех соединений (Close Connections) из Runtime Info
 
 ### 🛡️ Управление сервисом
 
@@ -254,7 +358,7 @@ uci commit podkop_bot
 **OpenWrt 24.10.x — баг в BusyBox `tr`:**
 Символьный класс `[:space:]` обрабатывается некорректно и удаляет букву `e` (`0x65`). Исправлено в `v0.13.90` заменой на явное перечисление символов `\n\r\t `. Затрагивает сборки OpenWrt 24.10.x вне зависимости от архитектуры.
 
-**Podkop Plus — UCIполя для списков:**
+**Podkop Plus — UCI-поля для списков:**
 `uci -q get` на list-полях (`subscription_urls`, `selector_proxy_links` и др.) в BusyBox ash возвращает пустую строку. Бот использует `uci show` с последующим парсингом — это корректный обход, прозрачный для пользователя.
 
 **URLTest режим** требует заполненного списка ссылок перед переключением — иначе `podkop` не запустится. Бот предупреждает и предлагает клонировать ссылки из Selector одной кнопкой.
@@ -286,7 +390,11 @@ MIT
 
 ## 🇬🇧 Summary
 
-**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all three podkop variants: [original](https://github.com/itdoginfo/podkop), [evolution](https://github.com/yandexru45/podkop-evolution), and [plus](https://github.com/ushan0v/podkop-plus) (ushan0v). Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (with human-readable labels — Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings, subscription traffic/expiry display (Plus), URLTest filters by country/regex (Plus), zapret/byedpi section management (Plus), and GitHub connectivity health check with real latency via WAN and SOCKS.
+**podkop_bot** is a Telegram bot for remote management of [podkop](https://github.com/itdoginfo/podkop) — a sing-box-based traffic routing service for OpenWrt routers. Supports all three podkop forks: [original](https://github.com/itdoginfo/podkop), [evolution/netshift](https://github.com/yandexru45/podkop-evolution), and [plus](https://github.com/ushan0v/podkop-plus) (ushan0v) — see the [fork comparison table](#-поддержка-форков-podkop) for per-variant feature availability.
+
+Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
+
+The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for luci-app rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure).
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Menu | 📊 Status`) is available at all times including during watchdog alerts.
 
