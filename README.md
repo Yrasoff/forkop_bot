@@ -1,4 +1,4 @@
-# 🤖 podkop_bot v0.15.4
+# 🤖 podkop_bot v0.15.5
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
@@ -23,6 +23,7 @@ Telegram-бот для удалённого управления [podkop](https:
 🤖  Транспорт бота          — tier1–5 fallback, Fallback SOCKS, Custom Proxy, Bind Interface
 👤  Администраторы          — добавление/удаление прямо из TG, анонимные группы
 ⬆️  Обновления              — бот и podkop из меню, Force Update, What's New карточка
+📅  Ежедневный отчёт       — автоматический утренний дайджест в Telegram (время настраивается)
 ```
 
 **Только на Podkop Plus:**
@@ -33,6 +34,7 @@ Telegram-бот для удалённого управления [podkop](https:
 ⚙️  Zapret / ByeDPI         — статус, вкл/выкл, редактирование стратегии с валидацией
 🔗  Ручные ссылки           — добавление вручную в subscription-секцию (сосуществуют с подпиской)
 🔌  Close Connections       — сброс всех соединений через Clash API
+🖧  Server Instances        — live статус серверных инстансов (VLESS, VMess, Trojan, SOCKS, Hysteria2, MTProto, Tailscale)
 ```
 
 ---
@@ -52,9 +54,11 @@ Telegram-бот для удалённого управления [podkop](https:
 │   ├── ⬆️ Update Podkop
 │   ├── 🔁 Reboot Router
 │   └── 🔌 Runtime Info → Diagnostics
+├── 🖧 Server Instances (Plus)
 └── ⚙️ Bot Settings
     ├── 🤖 Transport Policy
     ├── 📡 Fallback SOCKS
+    ├── 📅 Daily Report
     ├── 👤 Admins
     └── 🔗 Bind Interface
 ```
@@ -82,6 +86,9 @@ Telegram-бот для удалённого управления [podkop](https:
 | My Domains / My Subnets | ✅ | ✅ | ✅ |
 | Rule Sets (rule_set, rule_set_with_subnets) | ❌ | ❌ | 👁 только просмотр |
 | Версии zapret / byedpi в Status | ❌ | ❌ | ✅ |
+| Версия Zapret2 в Maintenance | ❌ | ❌ | ✅ |
+| Server Instances (live статус серверов) | ❌ | ❌ | ✅ |
+| Ежедневный отчёт | ✅ | ✅ | ✅ |
 | Watchdog и Tunnel Health | ✅ | ✅ | ✅ |
 | Diagnostics / Support Bundle | ✅ | ✅ | ✅ |
 
@@ -223,6 +230,7 @@ ash install.sh --unattended \
 * Custom Proxy (tier3)
 * Bind Interface — привязка исходящего интерфейса бота
 * **Автодобавление mixed_proxy других секций** как fallback tier'ов
+* **Daily Report** — ежедневный дайджест в Telegram. Настраивается время отправки (`HH:MM`, default `08:00`), включается/выключается toggle в Bot Settings. Ручная отправка: Maintenance → `📊 Send Daily Report Now`. Содержит: uptime/RAM/CPU, WAN+LAN+внешний IP+флаг, TG direct/tunnel статус, виртуальные адаптеры, режим секции и активный outbound с флагом страны, время последнего переключения (вручную или URLTest), рестарты sing-box, трафик за период uptime sing-box, транспорт бота с резервными каналами. На Podkop Plus дополнительно: URL подписки (секреты скрыты), трафик и дата истечения.
 * **Admins** — см. раздел ниже
 
 ### 👤 Управление администраторами
@@ -255,6 +263,16 @@ ash install.sh --unattended \
   * Доступность сервисов: YouTube, Telegram API, ChatGPT, Claude.ai, Gemini, Discord
   * Двухэтапный тест скорости: 32 KB (детект РКН-обрыва) + 1 MB замер
 * **Support Bundle**: UCI-конфиг, маршруты, nft, syslog одной кнопкой
+
+### 🖧 Server Instances (только Plus)
+
+* Live статус всех серверных инстансов из UCI (`type=server` секции podkop-plus)
+* Поддерживаемые протоколы: **VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto (extended), Tailscale**
+* Для каждого инстанса: протокол, порт, публичный хост, режим безопасности (Reality/TLS/none) + SNI, режим маршрутизации
+* Статус порта: 🟢 слушает (TCP+UDP) · 🟡 включено в UCI, порт не обнаружен · ⚫ выключено
+* Tailscale: статус через sing-box процесс + state directory; IP — в панели Tailscale
+* Статистика соединений из Clash API (кол-во, ↓↑ трафик) при наличии
+* Кнопка в главном меню видна только на Podkop Plus
 
 ### 🔔 Watchdog и алерты
 
@@ -326,7 +344,9 @@ uci commit podkop_bot
 ├── settings.bind_interface  — привязка к интерфейсу
 ├── settings.health_interval — интервал watchdog (сек, default 60)
 ├── settings.alert_notify    — 1/0 алерты watchdog
-└── settings.startup_notify  — 1/0 уведомление при старте
+├── settings.startup_notify  — 1/0 уведомление при старте
+├── settings.daily_report    — 1/0 ежедневный отчёт (default 0)
+└── settings.daily_report_time — время отправки HH:MM (default 08:00)
 ```
 
 > **Важно:** `admin_ids` добавляются через `uci add_list`, а не через `uci set` — иначе несколько ID не сохранятся корректно.
@@ -397,5 +417,7 @@ Provides full control without SSH or LuCI: start/stop/reload, outbound proxy swi
 The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for luci-app rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure).
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Menu | 📊 Status`) is available at all times including during watchdog alerts.
+
+v0.15.5 adds **Server Instances** (Plus only) — live UCI-based status of sing-box server-mode inbounds with TCP+UDP port check — and **Daily Report** — a configurable scheduled Telegram digest with system stats, WAN/IP, TG connectivity, active outbound with country flag and last-switch info, sing-box restarts, traffic, bot transport chain, and Plus subscription data.
 
 Full [changelog](CHANGELOG.md) and [menu structure reference](BOT_STRUCTURE.md) available.
