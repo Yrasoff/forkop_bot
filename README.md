@@ -2,7 +2,7 @@
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
-Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
+Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH. Имеет встроенную 5-уровневую подсистему работы в условиях блокировок TG. 
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md)
 > 
