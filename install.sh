@@ -18,6 +18,69 @@
 #   ash install.sh --unattended --action check
 #   See UNATTENDED CONFIG FORMAT comment below for the JSON schema.
 #
+# INSTALLER_VERSION="2.3.0"
+#
+# CHANGELOG v2.3.0:
+# - NEW: --action check-token for the LuCI Setup Wizard (TZ 9.4). Validates a
+#        bot token via Telegram getMe using the same _curl_socks_fallover
+#        transport as the installer (direct -> SOCKS tiers), so validation works
+#        behind ISP blocks instead of a naive direct curl. Reads bot_token from
+#        --config; emits a flat JSON result on fd: {valid:true,username,route} or
+#        {valid:false,reason,detail} with reason in
+#        empty_token|token_invalid|telegram_unreachable|network_timeout. No
+#        mutation, network-only, runs before heavy init.
+#
+# INSTALLER_VERSION="2.2.0"
+# INSTALLER_VERSION="2.2.0"
+#
+# CHANGELOG v2.2.0:
+# - NEW: Legacy init.d auto-heal on update. Bot <=0.15.1 shipped a procd-only
+#        init with no stop_service and no fork cleanup; `init stop` left forked
+#        children (health daemon + startup-notify poll) alive, so repeated
+#        updates/respawns accumulated zombie instances (seen up to 6) fighting
+#        over the Telegram API (409 Conflict / getUpdates race). The update flow
+#        now: (1) reaps all live /usr/bin/podkop_bot forks BEFORE swapping the
+#        binary via _reap_bot_forks (kill → wait → kill -9 → clear pidfile);
+#        (2) detects a legacy init via _init_is_legacy (marker: absence of the
+#        _kill_all_podkop_bot function) and force-replaces it with the canonical
+#        working init via _write_working_init, backed up to .bak under the same
+#        rollback umbrella as the binary.
+# - NEW: _write_working_init() is now the single source of the init.d body —
+#        both first-install and update call it, so the generated init can't
+#        drift between flows. Carries _kill_all_podkop_bot in both start_service
+#        and stop_service.
+# - CHANGED: post-(re)start verification in the update flow uses _bot_alive (a
+#        /proc scan) instead of `init status`, which lies on legacy scripts;
+#        rollback uses _reap_bot_forks instead of `init stop`.
+#
+# INSTALLER_VERSION="2.1.1"
+#
+# CHANGELOG v2.1.1:
+# - FIXED: --action status running-state detection no longer trusts
+#        `/etc/init.d/podkop_bot status`. Routers running bot <=0.15.1 shipped
+#        incomplete init.d scripts whose status returns 0 even when the process
+#        is dead, so status reported running:true on a stopped bot (and
+#        luci-app-podkop-bot then showed a green lamp on a dead bot). Liveness
+#        is now read from a /proc cmdline scan for /usr/bin/podkop_bot, with the
+#        init wrapper and rc.common excluded. The pidfile check remains as a
+#        secondary fallback. Same detection method luci-app-podkop-bot's rpcd
+#        backend now uses, keeping one source of truth across the project.
+#
+# INSTALLER_VERSION="2.1.0"
+#
+# CHANGELOG v2.1.0:
+# - NEW: Offline bootstrap fallback. download_file() and download_file_optional()
+#        try a vendored local copy as a final tier, after direct + SOCKS are
+#        exhausted. Copies live in $VENDOR_DIR (/usr/lib/podkop_bot), matched by
+#        URL basename (podkop_bot.sh→podkop_bot, podkop_bot_init→podkop_bot_init).
+#        Lets the bot install where raw.githubusercontent.com is blocked and no
+#        SOCKS exists yet — the primary case for an anti-censorship tool. The
+#        luci-app-podkop-bot package ships these copies, making the system a
+#        self-contained offline bootstrap. Pure headless run (no LuCI package) →
+#        $VENDOR_DIR absent, tier skipped, behaviour identical to v2.0.0.
+# - NOTE: Vendored copies reflect bot version at package build time; online
+#        install/update always prefers the network copy.
+#
 # INSTALLER_VERSION="2.0.0"
 #
 # CHANGELOG v2.0.0:
@@ -172,12 +235,19 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.0.0"
+INSTALLER_VERSION="2.3.0"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
 INIT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot_init"
+# Vendored fallback copies shipped inside luci-app-podkop-bot (.ipk/.apk). Used
+# as a LAST-resort transport tier in download_file()/download_file_optional()
+# when direct + SOCKS all fail — enables offline bootstrap of the bot when
+# GitHub is blocked (primary case for an anti-censorship tool). Matched to a URL
+# by basename, so one tier covers both bot body and init.d. Absent on a pure
+# headless install → tier skipped, behaviour unchanged.
+VENDOR_DIR="/usr/lib/podkop_bot"
 UCI_PKG="podkop_bot"
 UCI_SEC="settings"
 OS_RELEASE_FILE="/etc/os-release"
@@ -216,9 +286,9 @@ done
 
 if [ "$UNATTENDED" = "1" ]; then
     case "$UA_ACTION" in
-        install|update|uninstall|status|check) ;;
+        install|update|uninstall|status|check|check-token) ;;
         *)
-            echo "ERROR: --unattended requires --action install|update|uninstall|status|check"
+            echo "ERROR: --unattended requires --action install|update|uninstall|status|check|check-token"
             exit 2
             ;;
     esac
@@ -703,6 +773,10 @@ msg() {
             ru) printf "\n  [!!] Все SOCKS-тиры не сработали.\n" ;;
             *)  printf "\n  [!!] All SOCKS tiers failed.\n" ;;
             esac ;;
+        dl_used_vendor) case "$UI_LANG" in
+            ru) printf "    → использую встроенную офлайн-копию: %s\n" ;;
+            *)  printf "    → using bundled offline copy: %s\n" ;;
+            esac ;;
         dl_check_podkop_running) case "$UI_LANG" in
             ru) printf "  Проверьте, что podkop запущен и Mixed Proxy включён:\n" ;;
             *)  printf "  Check that podkop is running and Mixed Proxy is enabled:\n" ;;
@@ -915,6 +989,26 @@ variant_label() {
 _podkop_uci_pkg() {
     [ "$PODKOP_VARIANT" = "plus" ] && printf 'podkop-plus' || printf 'podkop'
 }
+# _vendor_fallback: last-resort offline source. Given the same url/dest as
+# download_file(), copies a vendored copy from $VENDOR_DIR matched by URL
+# basename (podkop_bot.sh→podkop_bot, podkop_bot_init→podkop_bot_init).
+# Returns 0 if copied, 1 if no vendored copy applies.
+_vendor_fallback() {
+    local url="$1" dest="$2"
+    local _base _src
+    _base=$(basename "$url")
+    case "$_base" in
+        podkop_bot.sh)   _src="$VENDOR_DIR/podkop_bot" ;;
+        podkop_bot_init) _src="$VENDOR_DIR/podkop_bot_init" ;;
+        *) return 1 ;;
+    esac
+    [ -f "$_src" ] || return 1
+    cp "$_src" "$dest" 2>/dev/null || return 1
+    [ -s "$dest" ] || return 1
+    printf "$(msg dl_used_vendor)" "$_src" 2>/dev/null || printf "    -> using bundled offline copy: %s\n" "$_src"
+    return 0
+}
+
 download_file() {
     local url="$1" dest="$2"
     # Try direct (wget, then curl), then SOCKS fallover.
@@ -927,10 +1021,11 @@ download_file() {
 
     local _socks_list; _socks_list=$(_get_socks_endpoints)
     if [ -z "$_socks_list" ]; then
+        _vendor_fallback "$url" "$dest" && return 0
         printf "$(msg dl_no_socks_configured)"
         printf "$(msg dl_fix_mixed_proxy1)"
         printf "$(msg dl_fix_mixed_proxy2)"
-        die "Failed to download $url — direct blocked, no SOCKS available." 15
+        die "Failed to download $url — direct blocked, no SOCKS available, no offline copy." 15
     fi
 
     printf "$(msg dl_trying_socks)"
@@ -944,11 +1039,13 @@ download_file() {
         printf "$(msg dl_failed_word)"
     done
 
+    _vendor_fallback "$url" "$dest" && return 0
+
     printf "$(msg dl_all_socks_failed)"
     printf "$(msg dl_check_podkop_running)"
     printf "    uci show %s | grep mixed_proxy\n" "$(_podkop_uci_pkg)"
     printf "$(msg dl_or_add_fallback)"
-    die "Failed to download $url — no working transport (direct or SOCKS)." 15
+    die "Failed to download $url — no working transport (direct, SOCKS, or offline copy)." 15
 }
 
 # download_file_optional: NON-FATAL download for optional assets (e.g. init.d
@@ -967,11 +1064,135 @@ download_file_optional() {
         curl -fsSL --connect-timeout 6 --max-time 30 -x "$_ep" -o "$dest" "$url" 2>/dev/null && return 0
     done
 
+    _vendor_fallback "$url" "$dest" && return 0
+
     rm -f "$dest"
     return 1
 }
 
 uci_get() { uci -q get "${UCI_PKG}.${UCI_SEC}.${1}" 2>/dev/null; }
+
+# _bot_alive: 0 (true) if a live /usr/bin/podkop_bot process exists. Same /proc
+# scan as _reap_bot_forks (minus the killing) — used to verify a (re)start
+# actually produced a running bot, instead of trusting `init status` which lies
+# on legacy init scripts.
+_bot_alive() {
+    local _p _cl
+    for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$_p" = "$$" ] && continue
+        _cl=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null) || continue
+        case "$_cl" in
+            *"/etc/init.d/podkop_bot"*) continue ;;
+            *rc.common*) continue ;;
+            *"/usr/bin/podkop_bot"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# _reap_bot_forks: kill every live `/usr/bin/podkop_bot` process via a /proc
+# scan, escalating to kill -9, then clear the pidfile. Legacy init scripts
+# (bot <=0.15.1) had no stop_service and no fork cleanup, so `init stop` left
+# forked children alive; repeated updates/respawns accumulated zombie instances
+# (observed up to 6) that fought over the Telegram API (409 Conflict / getUpdates
+# race). This reaps them deterministically, independent of the installed init.
+# SYNC: mirrors _kill_all_podkop_bot() in the generated init.d (search that
+# name); keep both in step if the match/exclude logic changes.
+_reap_bot_forks() {
+    local _pids="" _p _cl
+    for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$_p" = "$$" ] && continue
+        _cl=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null) || continue
+        case "$_cl" in
+            *"/etc/init.d/podkop_bot"*) continue ;;
+            *rc.common*) continue ;;
+            *"/usr/bin/podkop_bot"*) _pids="$_pids $_p" ;;
+        esac
+    done
+    [ -z "$_pids" ] && { rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null; return 0; }
+    kill $_pids 2>/dev/null
+    local _i=0
+    while [ "$_i" -lt 8 ]; do
+        local _alive=""
+        for _p in $_pids; do [ -d "/proc/$_p" ] && _alive="$_alive $_p"; done
+        [ -z "$_alive" ] && break
+        sleep 1; _i=$((_i + 1))
+    done
+    for _p in $_pids; do [ -d "/proc/$_p" ] && kill -9 "$_p" 2>/dev/null; done
+    rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null
+    return 0
+}
+
+# _init_is_legacy: returns 0 (true) if the installed init.d is a legacy script
+# that lacks fork cleanup. Marker: a working init carries the _kill_all_podkop_bot
+# function; legacy ones (no stop_service, procd-only) do not. A missing file is
+# also treated as "needs the working init".
+_init_is_legacy() {
+    [ -f "$INIT_PATH" ] || return 0
+    grep -q '_kill_all_podkop_bot' "$INIT_PATH" 2>/dev/null && return 1
+    return 0
+}
+
+# _write_working_init: write the canonical procd init.d to $INIT_PATH. Single
+# source of the init body — both first-install and update call this, so the
+# generated init never drifts between flows. The bot FORKS a health daemon +
+# startup-notify child; procd supervises only the main PID, so a plain stop
+# leaves children alive → multiple getUpdates pollers on one token → Telegram
+# 409 + zombie accumulation. Hence the explicit _kill_all_podkop_bot in both
+# start_service and stop_service.
+# SYNC: _kill_all_podkop_bot here mirrors _reap_bot_forks() above; keep in step.
+_write_working_init() {
+    cat > "$INIT_PATH" << 'INITEOF'
+#!/bin/sh /etc/rc.common
+START=99
+STOP=10
+USE_PROCD=1
+PROG=/usr/bin/podkop_bot
+
+_kill_all_podkop_bot() {
+    local _pids="" _p
+    for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        [ "$_p" = "$$" ] && continue
+        grep -qa 'podkop_bot' "/proc/$_p/cmdline" 2>/dev/null || continue
+        grep -qa '/etc/init.d/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && continue
+        grep -qa 'rc.common' "/proc/$_p/cmdline" 2>/dev/null && continue
+        grep -qa '/usr/bin/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && _pids="$_pids $_p"
+    done
+    [ -z "$_pids" ] && { rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null; return 0; }
+    kill $_pids 2>/dev/null
+    local _i=0
+    while [ "$_i" -lt 8 ]; do
+        local _alive=""
+        for _p in $_pids; do [ -d "/proc/$_p" ] && _alive="$_alive $_p"; done
+        [ -z "$_alive" ] && break
+        sleep 1; _i=$((_i + 1))
+    done
+    for _p in $_pids; do [ -d "/proc/$_p" ] && kill -9 "$_p" 2>/dev/null; done
+    rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null
+}
+
+start_service() {
+    _kill_all_podkop_bot
+    procd_open_instance
+    procd_set_param command "$PROG"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}
+
+stop_service() {
+    _kill_all_podkop_bot
+}
+
+reload_service() {
+    stop
+    start
+}
+INITEOF
+    chmod +x "$INIT_PATH"
+}
+
 
 # _get_socks_endpoints: read tier1 (podkop mixed_proxy) and fallback_socks from
 # UCI for use before the bot starts. Outputs space-separated "socks5h://IP:PORT"
@@ -1618,16 +1839,62 @@ else
 fi
 
 # ── Unattended: status / check actions exit here, before any mutation ─────────
+# ── Unattended: check-token — validate a bot token via Telegram getMe with
+# SOCKS fallover, emit a flat JSON result, exit. Used by the LuCI Setup Wizard
+# (TZ 9.4) so token validation goes through the same fallback-aware transport
+# as the installer, not a naive direct curl. Reads the token from --config
+# (bot_token field). Network-only, no mutation, runs before OS/dep heavy init.
+if [ "$UNATTENDED" = "1" ] && [ "$UA_ACTION" = "check-token" ]; then
+    _load_unattended_config
+    _ct_token="$UA_BOT_TOKEN"
+    # fd3 is the clean output channel (banner noise suppressed below for status/
+    # check; replicate the same guard so check-token output is pure JSON).
+    if [ -z "$_ct_token" ]; then
+        printf '{"valid":false,"reason":"empty_token","detail":"bot_token not provided in config"}\n'
+        _release_lock 2>/dev/null
+        exit 0
+    fi
+    _ct_resp=$(_curl_socks_fallover 10 "https://api.telegram.org/bot${_ct_token}/getMe")
+    if echo "$_ct_resp" | grep -q '"ok":true'; then
+        _ct_user=$(echo "$_ct_resp" | jq -r '.result.username // "unknown"' 2>/dev/null)
+        [ -z "$_ct_user" ] && _ct_user="unknown"
+        if [ -n "$_last_socks_route" ]; then _ct_route="$_last_socks_route"; else _ct_route="direct"; fi
+        printf '{"valid":true,"username":"%s","route":"%s"}\n' "$_ct_user" "$_ct_route"
+    else
+        # Distinguish "Telegram reachable but rejected token" from "no transport".
+        if [ -z "$(_get_socks_endpoints)" ] && ! curl -fsS --connect-timeout 6 --max-time 8 -o /dev/null "https://api.telegram.org" 2>/dev/null; then
+            _ct_reason="telegram_unreachable"
+            _ct_detail="Telegram direct blocked and no SOCKS available"
+        elif echo "$_ct_resp" | grep -q '"ok":false'; then
+            _ct_reason="token_invalid"
+            _ct_detail="Telegram rejected the token"
+        else
+            _ct_reason="network_timeout"
+            _ct_detail="No response from Telegram (timeout or all transports failed)"
+        fi
+        printf '{"valid":false,"reason":"%s","detail":"%s"}\n' "$_ct_reason" "$_ct_detail"
+    fi
+    _release_lock 2>/dev/null
+    exit 0
+fi
+
 if [ "$UNATTENDED" = "1" ] && { [ "$UA_ACTION" = "status" ] || [ "$UA_ACTION" = "check" ]; }; then
-    _ua_installed=0
-    _ua_running=0
-    _ua_bot_ver="unknown"
     [ -f "$BOT_PATH" ] && _ua_installed=1
     _ua_bot_ver=$(grep '^BOT_VERSION=' "$BOT_PATH" 2>/dev/null | cut -d'"' -f2)
     [ -z "$_ua_bot_ver" ] && _ua_bot_ver="unknown"
-    if [ -f "$INIT_PATH" ] && "$INIT_PATH" status >/dev/null 2>&1; then
-        _ua_running=1
-    fi
+    # Liveness via /proc scan, NOT `init.d status`: bot <=0.15.1 shipped
+    # incomplete init scripts whose `status` returns 0 even when dead, which
+    # made both this installer and luci-app-podkop-bot report a running bot
+    # when it was stopped. The bot runs as `/bin/sh /usr/bin/podkop_bot` (plus a
+    # forked child); one live match suffices. Exclude the init wrapper/rc.common.
+    for _c in /proc/[0-9]*/cmdline; do
+        _cl=$(tr '\0' ' ' < "$_c" 2>/dev/null) || continue
+        case "$_cl" in
+            *"/etc/init.d/podkop_bot"*) continue ;;
+            *rc.common*) continue ;;
+            *"/usr/bin/podkop_bot"*) _ua_running=1; break ;;
+        esac
+    done
     # Fallback: bot may be running directly (not via init.d). Check the
     # single-instance lock file the bot writes at startup — if the PID in
     # it is alive and belongs to a podkop_bot process, the bot is running.
@@ -1638,13 +1905,30 @@ if [ "$UNATTENDED" = "1" ] && { [ "$UA_ACTION" = "status" ] || [ "$UA_ACTION" = 
             _ua_running=1
         fi
     fi
+    # Lightweight boolean flags for the LuCI Setup Wizard (18t.7 / 18b.3) — all
+    # cheap, no network. Wizard uses these to decide intercept-to-setup vs Overview
+    # without a heavy UCI parse from the frontend.
+    _ua_config_exists=0
+    [ -f /etc/config/podkop_bot ] && _ua_config_exists=1
+    _ua_service_enabled=0
+    [ -f "$INIT_PATH" ] && "$INIT_PATH" enabled >/dev/null 2>&1 && _ua_service_enabled=1
+    _ua_token_set=0
+    [ -n "$(uci -q get podkop_bot.settings.bot_token 2>/dev/null)" ] && _ua_token_set=1
+    _ua_chatid_set=0
+    [ -n "$(uci -q get podkop_bot.settings.chat_id 2>/dev/null)" ] && _ua_chatid_set=1
+
     # Restore real stdout (fd 3) for the ONLY output this mode ever emits.
     exec 1>&3 3>&-
     if [ "$UA_ACTION" = "status" ]; then
-        printf '{"installed":%s,"running":%s,"bot_version":"%s","podkop_variant":"%s","podkop_version":"%s","pkg_manager":"%s","openwrt_version":"%s"}\n' \
+        printf '{"installed":%s,"running":%s,"bot_version":"%s","podkop_variant":"%s","podkop_version":"%s","pkg_manager":"%s","openwrt_version":"%s","installer_version":"%s","config_exists":%s,"service_enabled":%s,"bot_token_configured":%s,"chat_id_configured":%s}\n' \
             "$([ "$_ua_installed" = "1" ] && echo true || echo false)" \
             "$([ "$_ua_running" = "1" ] && echo true || echo false)" \
-            "$_ua_bot_ver" "$PODKOP_VARIANT" "${PODKOP_VER:-unknown}" "$PKG_MANAGER" "${OWRT_VERSION:-unknown}"
+            "$_ua_bot_ver" "$PODKOP_VARIANT" "${PODKOP_VER:-unknown}" "$PKG_MANAGER" "${OWRT_VERSION:-unknown}" \
+            "$INSTALLER_VERSION" \
+            "$([ "$_ua_config_exists" = "1" ] && echo true || echo false)" \
+            "$([ "$_ua_service_enabled" = "1" ] && echo true || echo false)" \
+            "$([ "$_ua_token_set" = "1" ] && echo true || echo false)" \
+            "$([ "$_ua_chatid_set" = "1" ] && echo true || echo false)"
     else
         # check: just verify environment is sane for an install — exit 0 if
         # OK to proceed, non-zero codes per the header's exit-code table.
@@ -1921,6 +2205,11 @@ if [ "$HAS_EXISTING" = "1" ]; then
             chmod +x "$_bot_new"
             echo "OK"
 
+            # Reap any live/zombie bot forks BEFORE swapping the binary, so a
+            # legacy init that left children running can't leave them polling
+            # the old token alongside the new one (409 / zombie accumulation).
+            _reap_bot_forks
+
             [ -f "$BOT_PATH" ] && cp -f "$BOT_PATH" "$_bot_bak" 2>/dev/null
             mv -f "$_bot_new" "$BOT_PATH"
 
@@ -1940,6 +2229,19 @@ if [ "$HAS_EXISTING" = "1" ]; then
                 : # init.d script unchanged (no repo update available)
             fi
 
+            # Force-heal a legacy init.d (bot <=0.15.1: no stop_service, no fork
+            # cleanup — the root cause of zombie accumulation). If the installed
+            # init still lacks fork cleanup after the repo-update attempt above,
+            # replace it with the canonical working init. Back up first so the
+            # rollback path below can restore it if the new service won't start.
+            if _init_is_legacy; then
+                printf "$(msg updating_init)"
+                [ -f "$INIT_PATH" ] && [ ! -f "$_init_bak" ] && cp -f "$INIT_PATH" "$_init_bak" 2>/dev/null
+                _write_working_init
+                "$INIT_PATH" enable >/dev/null 2>&1
+                echo "OK"
+            fi
+
             ok "$(printf "$(msg updated_to_v)" "${REMOTE_VER}")"
             echo ""
 
@@ -1949,7 +2251,7 @@ if [ "$HAS_EXISTING" = "1" ]; then
                 printf "$(msg starting_service)"
                 "$INIT_PATH" start >/dev/null 2>&1
                 sleep 2
-                if "$INIT_PATH" status >/dev/null 2>&1; then
+                if _bot_alive; then
                     echo "OK"
                     ok "$(msg service_restarted_ok)"
                     _update_start_ok=1
@@ -1963,14 +2265,14 @@ if [ "$HAS_EXISTING" = "1" ]; then
 
             if [ "$_update_start_ok" = "0" ]; then
                 warn "$(msg rollback_warn)"
-                "$INIT_PATH" stop >/dev/null 2>&1
+                _reap_bot_forks
                 if [ -f "$_bot_bak" ]; then
                     mv -f "$_bot_bak" "$BOT_PATH"
                     chmod +x "$BOT_PATH"
                     [ -f "$_init_bak" ] && mv -f "$_init_bak" "$INIT_PATH" && chmod +x "$INIT_PATH"
                     "$INIT_PATH" start >/dev/null 2>&1
                     sleep 2
-                    if "$INIT_PATH" status >/dev/null 2>&1; then
+                    if _bot_alive; then
                         warn "$(msg rollback_ok)"
                     else
                         warn "$(msg rollback_also_failed)"
@@ -2316,61 +2618,9 @@ if [ "$SETUP_INIT" != "n" ] && [ "$SETUP_INIT" != "N" ]; then
     fi
 
     if [ "$INIT_OK" = "0" ]; then
-        # Generate procd init script — compatible with OpenWrt 23.05 / 24.10 / 25.x+
-        # IMPORTANT: the bot FORKS a health daemon + startup-notify poll child.
-        # procd supervises only the main PID, so a plain stop leaves those
-        # children alive → two getUpdates pollers on one token → Telegram 409
-        # Conflict + duplicated processes after every restart. Hence the explicit
-        # stop_service that kills ALL podkop_bot processes (matched via cmdline,
-        # because busybox shows the process as {podkop_bot} and killall misses it).
-        cat > "$INIT_PATH" << 'INITEOF'
-#!/bin/sh /etc/rc.common
-START=99
-STOP=10
-USE_PROCD=1
-PROG=/usr/bin/podkop_bot
-
-_kill_all_podkop_bot() {
-    local _pids="" _p
-    for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-        [ "$_p" = "$$" ] && continue
-        grep -qa 'podkop_bot' "/proc/$_p/cmdline" 2>/dev/null || continue
-        grep -qa '/etc/init.d/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && continue
-        grep -qa 'rc.common' "/proc/$_p/cmdline" 2>/dev/null && continue
-        grep -qa '/usr/bin/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && _pids="$_pids $_p"
-    done
-    [ -z "$_pids" ] && { rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null; return 0; }
-    kill $_pids 2>/dev/null
-    local _i=0
-    while [ "$_i" -lt 8 ]; do
-        local _alive=""
-        for _p in $_pids; do [ -d "/proc/$_p" ] && _alive="$_alive $_p"; done
-        [ -z "$_alive" ] && break
-        sleep 1; _i=$((_i + 1))
-    done
-    for _p in $_pids; do [ -d "/proc/$_p" ] && kill -9 "$_p" 2>/dev/null; done
-    rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null
-}
-
-start_service() {
-    _kill_all_podkop_bot
-    procd_open_instance
-    procd_set_param command "$PROG"
-    procd_set_param respawn 3600 5 5
-    procd_set_param stdout 0
-    procd_set_param stderr 0
-    procd_close_instance
-}
-
-stop_service() {
-    _kill_all_podkop_bot
-}
-
-reload_service() {
-    stop
-    start
-}
-INITEOF
+        # No repo init available — write the canonical procd init (single source
+        # in _write_working_init; carries fork-cleanup to prevent 409/zombies).
+        _write_working_init
         info "$(msg generated_init_script)"
     fi
 
