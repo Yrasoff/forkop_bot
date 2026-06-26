@@ -18,6 +18,15 @@
 #   ash install.sh --unattended --action check
 #   See UNATTENDED CONFIG FORMAT comment below for the JSON schema.
 #
+# INSTALLER_VERSION="2.3.1"
+#
+# CHANGELOG v2.3.1:
+# - FIXED: --action check-token printed the startup banner + variant-detection
+#        log BEFORE its JSON, so callers parsing the output saw non-JSON and
+#        treated a valid token as installer_error. check-token now joins the
+#        _QUIET_STATUS fd3 guard (like status/check): banner/log go to /dev/null
+#        and only the JSON result is emitted on the restored stdout.
+#
 # INSTALLER_VERSION="2.3.0"
 #
 # CHANGELOG v2.3.0:
@@ -235,7 +244,7 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.3.0"
+INSTALLER_VERSION="2.3.1"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
@@ -1692,7 +1701,7 @@ _acquire_lock
 # (or the plain-text "check" result) is printed via fd 3 and is the only
 # thing that ever reaches the caller's stdout.
 _QUIET_STATUS=0
-if [ "$UNATTENDED" = "1" ] && { [ "$UA_ACTION" = "status" ] || [ "$UA_ACTION" = "check" ]; }; then
+if [ "$UNATTENDED" = "1" ] && { [ "$UA_ACTION" = "status" ] || [ "$UA_ACTION" = "check" ] || [ "$UA_ACTION" = "check-token" ]; }; then
     _QUIET_STATUS=1
     exec 3>&1 1>/dev/null
 fi
@@ -1847,8 +1856,9 @@ fi
 if [ "$UNATTENDED" = "1" ] && [ "$UA_ACTION" = "check-token" ]; then
     _load_unattended_config
     _ct_token="$UA_BOT_TOKEN"
-    # fd3 is the clean output channel (banner noise suppressed below for status/
-    # check; replicate the same guard so check-token output is pure JSON).
+    # Restore real stdout (fd 3) — banner/log went to /dev/null via the
+    # _QUIET_STATUS guard above; from here, printf emits pure JSON to the caller.
+    exec 1>&3 3>&-
     if [ -z "$_ct_token" ]; then
         printf '{"valid":false,"reason":"empty_token","detail":"bot_token not provided in config"}\n'
         _release_lock 2>/dev/null
