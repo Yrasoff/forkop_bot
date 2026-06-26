@@ -1,8 +1,8 @@
-# 🤖 podkop_bot v0.15.5
+# 🤖 podkop_bot v0.15.6
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
-Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH. Имеет встроенную 5-уровневую подсистему работы в условиях блокировок TG. 
+Поддерживает все три варианта podkop: **[original](https://github.com/itdoginfo/podkop)** (itdoginfo), **[netshift aka evolution](https://github.com/yandexru45/podkop-evolution)** (yandexru45) и **[plus](https://github.com/ushan0v/podkop-plus)** (ushan0v). Позволяет управлять службой и выполнять диагностику прямо из Telegram — без доступа к LuCI и SSH.
 
 > 📋 История изменений — [CHANGELOG_RUS.md](CHANGELOG_RUS.md)
 > 
@@ -13,7 +13,7 @@ Telegram-бот для удалённого управления [podkop](https:
 ## ✨ Возможности
 
 ```text
-🛡️  Статус и управление     — podkop, sing-box, автозапуск, перезагрузка роутера
+🛡️  Статус и управление    — podkop, sing-box, автозапуск, перезагрузка роутера
 🔀  Outbounds               — список с задержкой, переключение, добавление/удаление ссылок
 📋  Маршрутизация           — Service Lists, Domain/Subnet URL, My Domains/Subnets
 🔧  Настройки секций        — тип, режим прокси, URLTest, DNS resolver, интерфейс
@@ -23,7 +23,7 @@ Telegram-бот для удалённого управления [podkop](https:
 🤖  Транспорт бота          — tier1–5 fallback, Fallback SOCKS, Custom Proxy, Bind Interface
 👤  Администраторы          — добавление/удаление прямо из TG, анонимные группы
 ⬆️  Обновления              — бот и podkop из меню, Force Update, What's New карточка
-📅  Ежедневный отчёт        — автоматический утренний дайджест в Telegram (время настраивается)
+📅  Ежедневный отчёт       — автоматический утренний дайджест в Telegram (время настраивается)
 ```
 
 **Только на Podkop Plus:**
