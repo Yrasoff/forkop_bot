@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
-# Podkop Telegram Bot v0.15.5
-# Variant-aware (original / evolution / plus), OpenWrt/BusyBox ash.
+# Podkop Telegram Bot v0.15.6
+# Variant-aware (original / evolution / netshift / plus), OpenWrt/BusyBox ash.
 # ==============================================================================
 
 #
@@ -31,14 +31,30 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 BOT_DIR="/tmp/podkop_bot"
 mkdir -p "$BOT_DIR"
 
-BOT_VERSION="0.15.5"
+# Bot version. NOTE: also update the "Podkop Telegram Bot vX.Y.Z" line in the
+# header comment at the top of this file when bumping (it is not auto-derived).
+BOT_VERSION="0.15.6"
 
 # ==============================================================================
 # PODKOP VARIANT AUTO-DETECTION
 # Must run before any UCI/binary access. Sets PODKOP_UCI, PODKOP_BIN, etc.
-# Three variants: original (itdoginfo/podkop), evolution (subscription support
-# via 'subscription_update' CLI), plus (podkop-plus binary, action= field).
+# Four variants:
+#   original  (itdoginfo/podkop)            — connection_type + proxy_config_type
+#   evolution (subscription_update CLI)     — .outbounds[] subscription cache
+#   netshift  (yandexru45/netshift fork)    — like evolution, netshift paths
+#   plus      (ushan0v/podkop-plus binary)  — action= field, see PLUS MODEL below
 # NOTE: paths here are intentionally hardcoded — PODKOP_* vars not yet set.
+#
+# PLUS MODEL (important — differs from original's single proxy_config_type):
+#   On Plus, "subscription" is a SOURCE, not a mode. A section has TWO orthogonal
+#   axes that coexist: source (subscription_urls present?) and mode (urltest_enabled
+#   flag → urltest, else selector). get_section_type() collapses these to one value
+#   (urltest wins over subscription), so for Plus the real mode must be read from
+#   the urltest_enabled flag directly, and subscription shown as a separate line.
+#   Server count + subscription metadata come from /var/run/podkop-plus/section-cache/
+#   <sec>.json (.servers map / .subscriptionMetadata array), preferred via Clash
+#   /proxies; the subscription-links/ dir is NOT the node cache. See get_section_type,
+#   get_subscription_server_count, _plus_sub_metadata, and the proxy_mode_menu handler.
 # ==============================================================================
 _detect_podkop_variant() {
     if [ -f /usr/bin/podkop-plus ]; then
@@ -131,6 +147,31 @@ _plus_json() {
     [ "$PODKOP_VARIANT" = "plus" ] || return 1
     _plus_has_cmd "$_cmd" || return 1
     ${PODKOP_BIN} "$_cmd" "$@" 2>/dev/null
+}
+
+# _plus_sub_metadata: subscription metadata array for a section, WITHOUT spawning
+# the Plus binary. Plus' own `get_subscription_metadata` CLI just reads
+# section-cache/<sec>.json and returns its .subscriptionMetadata array
+# (confirmed in podkop-plus status_diagnostics.sh + subscription_cache.uc).
+# We read the same file directly — avoids a Go/ucode subprocess (RSS spike,
+# OOM risk on 256 MB routers). Falls back to the CLI if the file is missing.
+# Output: the subscriptionMetadata JSON array, same shape _plus_format_sub_meta expects.
+_plus_sub_metadata() {
+    local _sec="$1"
+    [ "$PODKOP_VARIANT" = "plus" ] || return 1
+    local _cache="/var/run/podkop-plus/section-cache/${_sec}.json"
+    if [ -f "$_cache" ]; then
+        local _arr
+        _arr=$(jq -ce '.subscriptionMetadata // []' "$_cache" 2>/dev/null)
+        # Use the file only if it parsed AND actually carries metadata.
+        if [ -n "$_arr" ] && [ "$_arr" != "[]" ] && [ "$_arr" != "null" ]; then
+            printf '%s' "$_arr"
+            return 0
+        fi
+    fi
+    # Fallback: ask the Plus CLI (older builds, or cache not yet written).
+    _plus_has_cmd "get_subscription_metadata" || return 1
+    _plus_json get_subscription_metadata "$_sec" 2>/dev/null
 }
 
 # _plus_format_sub_meta: format subscription metadata JSON to human-readable string.
@@ -542,10 +583,42 @@ _get_wan_interface() {
     printf '%s' "${_if:-}"
 }
 
-# get_singbox_version_display: returns full sing-box version string (e.g. "1.13.11-extended")
+# get_singbox_version_display: returns sing-box version from package manager metadata.
+# IMPORTANT: never call "sing-box version" — it spawns a second Go binary (+20-30 MB RSS)
+# which can trigger OOM-killer on low-memory routers (AX3000T, 256 MB devices).
+SB_VER_CACHE="${BOT_DIR}/singbox_version"
 get_singbox_version_display() {
-    local ver; ver=$(sing-box version 2>/dev/null | head -1 | awk '{print $NF}')
-    printf '%s' "${ver:-unknown}"
+    if [ -s "$SB_VER_CACHE" ]; then
+        cat "$SB_VER_CACHE"
+        return
+    fi
+    local ver=""
+
+    # 1. Podkop-plus writes version to state file after each install — no process spawn,
+    #    works for out-of-repo binaries (sing-box-extended not in official opkg feeds).
+    local _sb_state="/etc/podkop-plus/sing-box-version"
+    [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
+
+    # 2. opkg (OpenWrt 24.10 and earlier)
+    if [ -z "$ver" ] && command -v opkg >/dev/null 2>&1; then
+        ver=$(opkg list-installed 2>/dev/null | awk '/^sing-box/ && $2 == "-" {print $3; exit}')
+    fi
+
+    # 3. apk (OpenWrt 25.x+) — strip package name prefix to get version
+    if [ -z "$ver" ] && command -v apk >/dev/null 2>&1; then
+        local _apk_line
+        _apk_line=$(apk list --installed 2>/dev/null | grep '^sing-box' | head -1)
+        [ -n "$_apk_line" ] && ver=$(printf '%s' "$_apk_line" | \
+            sed 's/^sing-box-extended-//; s/^sing-box-//; s/[[:space:]].*//')
+    fi
+
+    # Do NOT spawn sing-box binary here — on low-RAM routers (256 MB) the Go runtime
+    # adds 20-30 MB RSS and can trigger OOM-killer in hot paths like Maintenance.
+    [ -z "$ver" ] && ver="unknown"
+
+    mkdir -p "$BOT_DIR" 2>/dev/null
+    printf '%s' "$ver" > "$SB_VER_CACHE" 2>/dev/null
+    printf '%s' "$ver"
 }
 
 # is_singbox_extended: returns 0 if running sing-box-extended build
@@ -2255,7 +2328,31 @@ get_active_proxy_display() {
     tag=$(get_active_proxy_name "$proxies")
     _sec=$(get_active_section)
     _stype=$(get_section_type "$_sec")
-    # Subscription sections: show server count instead of proxy tag
+    # Plus: subscription is a SOURCE, selector/urltest is the MODE — they coexist.
+    # Show both axes instead of collapsing to one. For URLTest auto, show the
+    # picked node; for Selector, show the active node + "from subscription".
+    if [ "$PODKOP_VARIANT" = "plus" ] && section_is_subscription "$_sec"; then
+        local _count _ut_flag _node
+        _count=$(get_subscription_server_count "$_sec")
+        _ut_flag=$(uci -q get ${PODKOP_UCI}.${_sec}.urltest_enabled 2>/dev/null)
+        _node=$(display_proxy_name_with_tag "$tag")
+        if [ "$_ut_flag" = "1" ]; then
+            # URLTest active: name the picked node when known, else generic
+            if [ -n "$_node" ] && [ "$_node" != "Unknown" ]; then
+                printf 'subscription · urltest → %s (%s)' "$_node" "$_count"
+            else
+                printf 'subscription · urltest (%s servers)' "$_count"
+            fi
+        else
+            if [ -n "$_node" ] && [ "$_node" != "Unknown" ]; then
+                printf 'subscription · selector → %s (%s)' "$_node" "$_count"
+            else
+                printf 'subscription · selector (%s servers)' "$_count"
+            fi
+        fi
+        return 0
+    fi
+    # original / evolution / netshift: subscription is exclusive (no coexisting mode)
     if [ "$_stype" = "proxy:subscription" ]; then
         local _count; _count=$(get_subscription_server_count "$_sec")
         printf 'subscription (%s servers)' "$_count"
@@ -2274,13 +2371,39 @@ get_active_proxy_display() {
 # get_subscription_server_count: count real outbound servers in subscription cache.
 # Excludes meta-outbounds (selector, urltest, direct, dns, block).
 get_subscription_server_count() {
-    local sec="$1"
-    local cache; cache=$(get_subscription_cache_path "$sec")
+    local sec="$1" cnt cache
+    # Primary: Clash /proxies — reflects what is actually loaded into sing-box,
+    # independent of how each variant lays out its /var/run cache files.
+    local proxies sel
+    proxies=$(clash_request "/proxies" 2>/dev/null)
+    if [ -n "$proxies" ] && [ "$proxies" != "null" ]; then
+        sel=$(get_selector_tag "$proxies")
+        if [ -n "$sel" ]; then
+            cnt=$(echo "$proxies" | jq -r --arg s "$sel" '
+                [ (.proxies[$s].all // [])[]
+                  | ascii_downcase
+                  | select(. != "direct" and . != "block" and . != "dns-out") ]
+                | length' 2>/dev/null)
+            if [ -n "$cnt" ] && [ "$cnt" -gt 0 ] 2>/dev/null; then
+                echo "$cnt"; return
+            fi
+        fi
+    fi
+    # Fallback: per-variant file cache. Schemas differ:
+    #   plus      → section-cache/<sec>.json, .servers is an OBJECT (tag→host) map
+    #   evolution → subscription/<sec>.json,  .outbounds[] array (sing-box style)
+    #   netshift  → subscriptions/<sec>.json, .outbounds[] array
+    cache=$(get_subscription_cache_path "$sec")
     [ -f "$cache" ] || { echo "0"; return; }
-    jq -r '[.outbounds[] | select(
-        .type != "selector" and .type != "urltest" and
-        .type != "direct" and .type != "dns" and .type != "block"
-    )] | length' "$cache" 2>/dev/null || echo "0"
+    if [ "$PODKOP_VARIANT" = "plus" ]; then
+        cnt=$(jq -r '(.servers // {}) | length' "$cache" 2>/dev/null)
+    else
+        cnt=$(jq -r '[.outbounds[] | select(
+            .type != "selector" and .type != "urltest" and
+            .type != "direct" and .type != "dns" and .type != "block"
+        )] | length' "$cache" 2>/dev/null)
+    fi
+    echo "${cnt:-0}"
 }
 
 # get_subscription_cache_path: path to outbound list cache for a subscription section.
@@ -2289,7 +2412,7 @@ get_subscription_cache_path() {
     case "$PODKOP_VARIANT" in
         evolution) printf '/var/run/podkop/subscription/%s.json' "$sec" ;;
         netshift)  printf '/var/run/netshift/subscriptions/%s.json' "$sec" ;;
-        plus)      printf '/var/run/podkop-plus/subscription-links/%s.json' "$sec" ;;
+        plus)      printf '/var/run/podkop-plus/section-cache/%s.json' "$sec" ;;
         *)         printf '' ;;
     esac
 }
@@ -3232,6 +3355,15 @@ send_daily_report() {
         vpn:*)              _sec_mode_disp="VPN" ;;
         *)                  _sec_mode_disp="$_sec_mode" ;;
     esac
+    # Plus: subscription is a source, not a mode — show both axes (e.g. "Subscription · URLTest")
+    if [ "$PODKOP_VARIANT" = "plus" ] && section_is_subscription "$_sec"; then
+        local _smode_ut; _smode_ut=$(uci -q get ${PODKOP_UCI}.${_sec}.urltest_enabled 2>/dev/null)
+        if [ "$_smode_ut" = "1" ]; then
+            _sec_mode_disp="Subscription · URLTest"
+        else
+            _sec_mode_disp="Subscription · Selector"
+        fi
+    fi
     _p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | awk '/^Version/{print $2}' | head -1)
     [ -z "$_p_ver" ] && _p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | \
         awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//")
@@ -3308,11 +3440,11 @@ send_daily_report() {
                 sed 's/:[^:@]*@/:**@/')
             _sub_url_disp=$(html_escape "$_sub_url_disp")
         fi
-        # Use get_subscription_metadata + _plus_format_sub_meta (same as outbound card)
+        # Use file-first metadata (no binary spawn), CLI fallback inside helper
         local _sub_meta_str=""
-        if _plus_has_cmd "get_subscription_metadata"; then
-            local _smj; _smj=$(_plus_json get_subscription_metadata "$_sec" 2>/dev/null)
-            _sub_meta_str=$(_plus_format_sub_meta "$_smj")
+        if [ "$PODKOP_VARIANT" = "plus" ]; then
+            local _smj; _smj=$(_plus_sub_metadata "$_sec" 2>/dev/null)
+            [ -n "$_smj" ] && _sub_meta_str=$(_plus_format_sub_meta "$_smj")
         fi
         if [ -n "$_sub_url_disp" ] || [ -n "$_sub_meta_str" ]; then
             _sub_block="$(printf '\n\n📋 <b>Подписка</b>')"
@@ -3364,7 +3496,7 @@ send_daily_report() {
 
     [ -n "$_sub_block" ] && _text="${_text}${_sub_block}"
 
-    send_message "$(printf '%b' "$_text")" \
+    send_message "$_text" \
         "{\"inline_keyboard\":[[{\"text\":\"📊 Status\",\"callback_data\":\"cmd_status\"},{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
     rmdir "$_dr_lock" 2>/dev/null
 }
@@ -3384,6 +3516,8 @@ start_health_daemon() {
         local sec m_ip m_port admin_payload last_ok_route="tier1"
         # Latency probe runs every PROBE_EVERY cycles (not every cycle — heavier)
         local probe_cycle=0 PROBE_EVERY=5
+        local _ram_alert_sent=0  # epoch of last low-RAM alert (hysteresis)
+        local _ram_alert_active=0  # 1 = currently in low-RAM state
         # Track probe background PID to reap it before launching next one.
         # Without this, probe subshells accumulate as zombies over months of uptime
         # (one probe every ~5min = ~8640/month, each leaving an ash zombie entry).
@@ -3445,6 +3579,41 @@ start_health_daemon() {
                 fi
                 probe_all_socks_write &
                 _last_probe_pid=$!
+
+                # ── RAM low-memory alert (every 5 cycles = PROBE_EVERY×interval) ──
+                if [ "$(uci -q get podkop_bot.settings.alert_notify || echo 1)" = "1" ]; then
+                    local _ram_free_kb _ram_free_mb _now_ts
+                    _ram_free_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 999999)
+                    _ram_free_mb=$(( _ram_free_kb / 1024 ))
+                    _now_ts=$(date +%s)
+                    if [ "$_ram_free_mb" -lt 30 ] && [ "$_ram_alert_active" = "0" ]; then
+                        # Enter low-RAM state — send alert
+                        _ram_alert_active=1
+                        _ram_alert_sent=$_now_ts
+                        logger -t podkop-bot "[Watchdog] Low RAM: ${_ram_free_mb} MB free"
+                        local _ram_total_mb
+                        _ram_total_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
+                        send_message "$(printf '%s <b>[%s] Low Memory Warning</b>\n\n<b>Free RAM: %s MB</b> / %s MB\n\n<i>Risk of OOM-killer. Consider:</i>\n• Reduce URLTest outbound count\n• Increase <code>health_interval</code> to 120+\n• Use <code>sing-box stable</code> instead of extended' \
+                            "$E_RAM" "$_hn" "$_ram_free_mb" "$_ram_total_mb")" ""
+                    elif [ "$_ram_free_mb" -ge 40 ] && [ "$_ram_alert_active" = "1" ]; then
+                        # Recovered — send recovery notice
+                        _ram_alert_active=0
+                        logger -t podkop-bot "[Watchdog] RAM recovered: ${_ram_free_mb} MB free"
+                        send_message "$(printf '%s <b>[%s] Memory Recovered</b>\n\nFree RAM: <b>%s MB</b> — back to normal.' \
+                            "$E_OK" "$_hn" "$_ram_free_mb")" ""
+                    elif [ "$_ram_free_mb" -lt 30 ] && [ "$_ram_alert_active" = "1" ]; then
+                        # Still low — re-alert every hour
+                        local _elapsed_since_alert
+                        _elapsed_since_alert=$(( _now_ts - _ram_alert_sent ))
+                        if [ "$_elapsed_since_alert" -ge 3600 ]; then
+                            _ram_alert_sent=$_now_ts
+                            local _ram_total_mb
+                            _ram_total_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
+                            send_message "$(printf '%s <b>[%s] Low Memory (still)</b>\n\nFree RAM: <b>%s MB</b> / %s MB' \
+                                "$E_RAM" "$_hn" "$_ram_free_mb" "$_ram_total_mb")" ""
+                        fi
+                    fi
+                fi
             fi
 
             sec=$(get_active_section)
@@ -4262,10 +4431,10 @@ EOF
 $(printf '%s' "$_sub_urls" | head -3)
 PMURLEOF
                 fi
-                # Traffic/expiry from Plus CLI
-                if _plus_has_cmd "get_subscription_metadata"; then
-                    local _smj; _smj=$(_plus_json get_subscription_metadata "$sec")
-                    _sub_meta_str=$(_plus_format_sub_meta "$_smj")
+                # Traffic/expiry — file-first (no binary spawn), CLI fallback in helper
+                if [ "$PODKOP_VARIANT" = "plus" ]; then
+                    local _smj; _smj=$(_plus_sub_metadata "$sec" 2>/dev/null)
+                    [ -n "$_smj" ] && _sub_meta_str=$(_plus_format_sub_meta "$_smj")
                 fi
                 # Build combined subscription line
                 if [ -n "$_sub_url_disp" ] || [ -n "$_sub_meta_str" ]; then
@@ -5131,16 +5300,26 @@ EOF
             current_mode=$(get_section_type "$sec")
             local current_mode_short; current_mode_short="${current_mode#proxy:}"
             local pm_txt kb_pm
-            local _pm_modes _pm_desc
+            local _pm_modes _pm_desc _pm_src_line=""
             if [ "$PODKOP_VARIANT" = "plus" ]; then
                 _pm_modes="selector urltest"
+                # Plus: mode is the urltest_enabled flag, NOT get_section_type
+                # (which is overridden to 'subscription' when a sub URL exists).
+                # Without this the active button never gets a checkmark.
+                local _ut_flag; _ut_flag=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_enabled 2>/dev/null)
+                if [ "$_ut_flag" = "1" ]; then current_mode_short="urltest"; else current_mode_short="selector"; fi
+                # Subscription is a SOURCE shown alongside the mode, not a mode itself.
+                if section_is_subscription "$sec"; then
+                    local _pm_n; _pm_n=$(get_subscription_server_count "$sec")
+                    _pm_src_line=$(printf '\n%s <b>Source:</b> subscription (%s servers)' "$E_LINK" "$_pm_n")
+                fi
                 _pm_desc="<b>selector</b> — manual proxy selection\n<b>urltest</b> — auto best-ping (toggle urltest_enabled)"
             else
                 _pm_modes="url selector urltest outbound"
                 _pm_desc="<b>url</b> — single proxy URL (proxy_string)\n<b>selector</b> — manual proxy selection\n<b>urltest</b> — auto best-ping selection\n<b>outbound</b> — raw sing-box JSON (LuCI/console only)"
             fi
-            pm_txt=$(printf '%s <b>Proxy Mode</b> [<code>%s</code>]\n\nCurrent: <code>%s</code>\n\n%s' \
-                "$E_TGT" "$sec" "$current_mode_short" "$_pm_desc")
+            pm_txt=$(printf '%s <b>Proxy Mode</b> [<code>%s</code>]\n\nCurrent: <code>%s</code>%s\n\n%s' \
+                "$E_TGT" "$sec" "$current_mode_short" "$_pm_src_line" "$_pm_desc")
             kb_pm="{\"inline_keyboard\":[["
             for _m in $_pm_modes; do
                 if [ "$_m" = "$current_mode_short" ]; then
@@ -5158,6 +5337,19 @@ EOF
             local target_mode="${cmd#ask_switch_mode_}"
             local current_mode warn_txt kb
             current_mode=$(get_section_type "$sec")
+            # Plus: 'selector'/'urltest' are the urltest_enabled flag, not get_section_type
+            # (which collapses to 'subscription'). Guard against a no-op switch that would
+            # trigger a pointless sing-box reload when already in the requested mode.
+            if [ "$PODKOP_VARIANT" = "plus" ]; then
+                local _cur_ut _cur_mode
+                _cur_ut=$(uci -q get ${PODKOP_UCI}.${sec}.urltest_enabled 2>/dev/null)
+                if [ "$_cur_ut" = "1" ]; then _cur_mode="urltest"; else _cur_mode="selector"; fi
+                if [ "$target_mode" = "$_cur_mode" ]; then
+                    # No-op: already in this mode. Re-render the menu, skip reload.
+                    _handle_settings "proxy_mode_menu" "$mid" "" ""
+                    return
+                fi
+            fi
             case "$target_mode" in
                 urltest)
                     if [ "$PODKOP_VARIANT" = "plus" ]; then
@@ -7734,10 +7926,30 @@ EOF
                 grep -qsi ":${_hx} " /proc/net/tcp /proc/net/tcp6 \
                                       /proc/net/udp /proc/net/udp6 2>/dev/null
             }
+            # _si_safe_name: replicate Plus' server_safe_filename — any char outside
+            # [A-Za-z0-9_.-] becomes '_'. Used to locate the per-section TS state dir.
+            _si_safe_name() {
+                printf '%s' "$1" | sed 's/[^A-Za-z0-9_.-]/_/g'
+            }
+            # _si_ts_state_dir: per-section Tailscale state directory (Plus convention).
+            _si_ts_state_dir() {
+                printf '/etc/podkop-plus/tailscale/%s' "$(_si_safe_name "$1")"
+            }
+            # _si_ts_registered: node has provisioned state (tailscaled.state exists, non-empty).
+            # sing-box stores tsnet state in <state_dir>/tailscaled.state once the node logs in.
+            _si_ts_registered() {
+                local _d; _d=$(_si_ts_state_dir "$1")
+                [ -s "${_d}/tailscaled.state" ]
+            }
 
             local _text
             _text="${E_SRV} <b>Server Instances</b> (${_si_count})\n"
             _text="${_text}<code>────────────────────</code>"
+
+            # Compute sing-box liveness once (used by tailscale status); avoids one
+            # pgrep per server inside the loop.
+            local _sb_alive=0
+            pgrep -f sing-box >/dev/null 2>&1 && _sb_alive=1
 
             for _s in $_si_sections; do
                 local _proto _enabled _listen _port _pubhost _security _sni _routing_mode _routing_sec
@@ -7761,11 +7973,12 @@ EOF
                     _icon="${E_YLW}"  # enabled in UCI but port not detected (may be starting)
                 fi
 
-                # Tailscale via sing-box extended = userspace node, no tailscale0 interface
-                # or tailscaled process. Status = sing-box running + state dir exists.
+                # Tailscale via sing-box extended = userspace node (no tailscale0 iface,
+                # no tailscaled process). Status = sing-box running + node registered
+                # (per-section tailscaled.state exists). Yellow = configured but not yet
+                # logged in (empty state / sing-box not up).
                 [ "$_proto" = "tailscale" ] && {
-                    local _ts_state_dir="/etc/podkop-plus/tailscale"
-                    if pgrep -f sing-box >/dev/null 2>&1 && [ -d "$_ts_state_dir" ]; then
+                    if [ "$_sb_alive" = "1" ] && _si_ts_registered "$_s"; then
                         _icon="${E_ON}"
                     else
                         _icon="${E_YLW}"
@@ -7790,22 +8003,55 @@ EOF
 
                 # Port / address
                 if [ "$_proto" = "tailscale" ]; then
-                    # sing-box extended uses userspace Tailscale node — no tailscale0
-                    # interface or tailscaled. IP only visible in Tailscale admin panel.
-                    local _ts_hostname
+                    # sing-box extended runs Tailscale in userspace (tsnet) — no tailscale0
+                    # interface or tailscaled. The 100.64/10 IP is assigned at runtime and
+                    # only knowable from debug logs or the admin panel.
+                    local _ts_hostname _ts_ctrl _ts_exit _ts_accept _ts_ip _ts_safe _ts_state
+                    _ts_safe=$(_si_safe_name "$_s")
                     _ts_hostname=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_hostname 2>/dev/null || echo "")
-                    _text="${_text}\n    📍 <i>IP: see Tailscale admin panel</i>"
-                    [ -n "$_ts_hostname" ] && \
-                        _text="${_text}\n    🏷 Node: <code>$(html_escape "$_ts_hostname")</code>"
-                    local _ts_state_dir="/etc/podkop-plus/tailscale"
-                    [ -d "$_ts_state_dir" ] && \
-                        _text="${_text}\n    💾 State: <code>${_ts_state_dir}</code>"
+                    [ -z "$_ts_hostname" ] && _ts_hostname="podkop-${_ts_safe}"
+                    _ts_ctrl=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_control_url 2>/dev/null || echo "")
+                    _ts_exit=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_advertise_exit_node 2>/dev/null || echo "0")
+                    _ts_accept=$(uci -q get ${PODKOP_UCI}.${_s}.tailscale_accept_routes 2>/dev/null || echo "0")
+
+                    # Connectivity status line
+                    if _si_ts_registered "$_s"; then
+                        _text="${_text}\n    🔗 <b>connected</b> · userspace (tsnet)"
+                    else
+                        _text="${_text}\n    🔌 <i>not registered yet</i> · userspace (tsnet)"
+                    fi
+
+                    # Tailscale IP: only cheaply knowable if sing-box runs in
+                    # system_interface mode (real tailscale0 iface). Userspace tsnet
+                    # has no iface and no stable file — don't scan logs on every render.
+                    _ts_ip=$(ip -4 -o addr show tailscale0 2>/dev/null \
+                        | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+                    if [ -n "$_ts_ip" ]; then
+                        _text="${_text}\n    📍 <code>$(html_escape "$_ts_ip")</code>"
+                    else
+                        _text="${_text}\n    📍 <i>IP: see Tailscale admin panel</i>"
+                    fi
+
+                    _text="${_text}\n    🏷 Node: <code>$(html_escape "$_ts_hostname")</code>"
+
+                    # Custom control URL = self-hosted Headscale (only show if non-default)
+                    case "$_ts_ctrl" in
+                        ""|"https://controlplane.tailscale.com") : ;;
+                        *) _text="${_text}\n    🛰 Control: <code>$(html_escape "$_ts_ctrl")</code>" ;;
+                    esac
+
+                    # Routing role flags
+                    [ "$_ts_exit" = "1" ]   && _text="${_text}\n    🚪 advertises exit node"
+                    [ "$_ts_accept" = "1" ] && _text="${_text}\n    📥 accepts routes"
+
+                    _ts_state=$(_si_ts_state_dir "$_s")
+                    _text="${_text}\n    💾 State: <code>$(html_escape "$_ts_state")</code>"
                 else
                     _text="${_text}\n    🔌 ${_listen_disp}:<b>${_port:-?}</b>"
                 fi
 
-                # Public host
-                [ -n "$_pubhost_esc" ] && \
+                # Public host — skip for tailscale (public_host is router WAN/LAN, not TS IP)
+                [ -n "$_pubhost_esc" ] && [ "$_proto" != "tailscale" ] && \
                     _text="${_text}\n    🌐 <code>${_pubhost_esc}</code>"
 
                 # Security (TLS/Reality/none) — only for relevant protocols
@@ -7848,7 +8094,14 @@ EOF
             rm -f "$_conn_map_file"
             _text="${_text}\n\n<i>Status: 🟢 listening · 🟡 enabled, port not detected · ⚫ disabled</i>"
 
-            send_or_edit "$mid" "$(printf '%b' "$_text")" \
+            # Render: convert our literal "\n" markers to real newlines WITHOUT the
+            # fragile `printf '%b'` (which also interprets \t \xNN \c etc. that may appear
+            # inside UCI-sourced values like hostnames/paths, dropping or truncating text —
+            # the cause of the garbled card in v0.15.5). awk gsub touches only the exact
+            # two-byte sequence backslash-n; every other byte (UTF-8 emoji, stray '\') passes through.
+            local _text_nl
+            _text_nl=$(printf '%s' "$_text" | awk '{gsub(/\\n/,"\n")}1')
+            send_or_edit "$mid" "$_text_nl" \
                 "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
             ;;
         "cmd_tunnel_health")
@@ -8596,7 +8849,7 @@ EOF
             local hostname; hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "Router")
             local p_ver; p_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
             [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
-            local sb_ver; sb_ver=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
+            local sb_ver; sb_ver=$(get_singbox_version_display 2>/dev/null || echo "unknown")
             {
                 echo "=== Podkop Support Bundle ==="
                 echo "Date: $(date)"
@@ -8749,7 +9002,6 @@ EOF
                 [ -z "$p_ver" ] && p_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
             fi
             [ -z "$sb_ver" ] && sb_ver=$(get_singbox_version_display)
-            sb_ver=$(get_singbox_version_display)
             lan_ip=$(uci -q get network.lan.ipaddr || echo "127.0.0.1")
             # Device model for Maintenance screen.
             # Prefer the FULL model string from /tmp/sysinfo/model (what Runtime
@@ -8900,6 +9152,7 @@ EOF
             if [ "$_exit" -eq 0 ]; then
                 local _new_ver; _new_ver=$(opkg info ${PODKOP_PKG} 2>/dev/null | grep '^Version:' | tail -1 | cut -d' ' -f2 | sed 's/^v//' | cut -d'-' -f1)
                 [ -z "$_new_ver" ] && _new_ver=$(apk info ${PODKOP_PKG} 2>/dev/null | head -1 | awk '{print $1}' | sed "s/^${PODKOP_PKG}-//;s/^v//" | cut -d'-' -f1)
+                rm -f "$SB_VER_CACHE" 2>/dev/null  # sing-box may have updated — force re-read
                 send_or_edit "$mid" "$(printf '%s Podkop updated successfully.\n\n<b>Version:</b> %s\n\n<pre>%s</pre>' \
                     "$E_OK" "${_new_ver:-unknown}" "$(html_escape "$_log_tail")")" \
                     "{\"inline_keyboard\":[[{\"text\":\"🏠 Menu\",\"callback_data\":\"/menu\"}]]}"
