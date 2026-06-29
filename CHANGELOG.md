@@ -23,6 +23,9 @@
 - **NEW: `ram_week` tracking** — watchdog updates `min_free_mb|alert_count|last_ts` on every RAM check. Alert count increments when RAM alert fires. Weekly Report reads and resets this file.
 - **NEW: weekly traffic baseline** — `${BOT_DIR}/weekly_traffic_base` stores `ts|download|upload` after each weekly report. Delta = current counters − baseline. Baseline only updated when Clash API returns non-zero counters.
 
+- **FIXED: init.d not updated during bot self-update** — `do_update_bot_` now automatically downloads and installs the latest `podkop_bot_init` from GitHub when the current init.d is detected as outdated (missing `_kill_all_podkop_bot` or `return 0` markers from v0.15.5+). Old backup saved to `/etc/init.d/podkop_bot.bak`. Falls back to a warning message if download fails.
+- **NEW: init.d outdated warning in Maintenance card** — shown once per bot session (flag in `${BOT_DIR}/init_warn_shown`) when Maintenance is opened and init.d is detected as old. Previously the warning only appeared during self-update, which users missed if Telegram was unreachable at that moment.
+
 ## v0.15.6
 - **FIXED (OOM blocker): removed `sing-box version` last-resort fallback** in `get_singbox_version_display()` — spawned full Go runtime (+20-30 MB RSS), could trigger OOM-killer on 256 MB routers. Now falls through to `"unknown"` without binary spawn.
 - **FIXED: broken `sed` expression in apk version parser** — `s/ *//)` had unmatched `)`, causing `sed: unknown option to 's'` at runtime. Fixed to `s/[[:space:]].*//'`.

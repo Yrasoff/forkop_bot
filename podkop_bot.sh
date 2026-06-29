@@ -9638,6 +9638,17 @@ EOF
         "cmd_maintenance")
             # Clear upload state if user hit inline Cancel from Upload Bot Script
             { read -r _ms < "$STATE_FILE" 2>/dev/null; [ "$_ms" = "wait_bot_script_file" ] && rm -f "$STATE_FILE"; } || true
+            # Warn once per bot session if init.d is outdated
+            local _init_warn_f="${BOT_DIR}/init_warn_shown"
+            if [ ! -f "$_init_warn_f" ]; then
+                local _init_chk="/etc/init.d/podkop_bot"
+                if [ -f "$_init_chk" ] && \
+                   { ! grep -q "_kill_all_podkop_bot" "$_init_chk" 2>/dev/null || \
+                     ! grep -q "return 0" "$_init_chk" 2>/dev/null; }; then
+                    touch "$_init_warn_f" 2>/dev/null
+                    send_message "$(printf '%s <b>init.d устарел.</b>\nСтарая версия без smart lock — возможны Telegram 409 конфликты при перезапуске.\nОбновите через <code>install.sh</code> или используйте кнопку обновления бота.' "$E_WARN")" ""
+                fi
+            fi
             local p_ver sb_ver lan_ip y_en text kb
             local _mi_sysinfo _mi_update="" _mi_zapret="" _mi_byedpi="" _mi_zapret2=""
             if _plus_has_cmd "get_system_info"; then
@@ -9988,16 +9999,30 @@ EOF
                 "$(printf '%s <b>Bot updating to v%s</b>%s\nRestarting now — startup notification will confirm when back online.' \
                     "$E_RST" "${new_ver:-$target_ver}" "$_dl_route_note")" ""
 
-            # Backup current binary so a failed start can be rolled back manually
-            # (and leaves a known-good copy). Best-effort — don't abort on failure.
-            # Check init.d — warn if outdated (missing smart lock from v0.15.5+)
+            # Download and update init.d if outdated
             local _init_path="/etc/init.d/podkop_bot"
-            if [ -f "$_init_path" ]; then
-                if ! grep -q "_kill_all_podkop_bot" "$_init_path" 2>/dev/null || \
-                   ! grep -q "return 0" "$_init_path" 2>/dev/null; then
-                    send_message "$(printf '%s <b>Warning:</b> init.d script is outdated.\nUpdate it via <code>install.sh</code> to avoid Telegram 409 conflicts on bot restart.' "$E_WARN")" ""
-                    sleep 1
+            local _init_url="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot_init"
+            local _init_tmp="/tmp/podkop_bot_init_update.$$"
+            local _init_outdated=0
+            if [ -f "$_init_path" ] && \
+               { ! grep -q "_kill_all_podkop_bot" "$_init_path" 2>/dev/null || \
+                 ! grep -q "return 0" "$_init_path" 2>/dev/null; }; then
+                _init_outdated=1
+            fi
+            if [ "$_init_outdated" = "1" ]; then
+                send_message "$(printf '%s <b>Updating init.d...</b> (outdated version detected)' "$E_TIME")" ""
+                if _curl_via_best_socks 15 -o "$_init_tmp" "$_init_url" 2>/dev/null && \
+                   head -1 "$_init_tmp" | grep -q "rc.common" 2>/dev/null; then
+                    chmod +x "$_init_tmp"
+                    cp -f "$_init_path" "${_init_path}.bak" 2>/dev/null || true
+                    mv "$_init_tmp" "$_init_path"
+                    logger -t podkop-bot "[Self-update] init.d updated from GitHub"
+                    send_message "$(printf '%s init.d updated successfully.' "$E_OK")" ""
+                else
+                    rm -f "$_init_tmp"
+                    send_message "$(printf '%s <b>Warning:</b> init.d is outdated but failed to download update.\nUpdate manually via <code>install.sh</code>.' "$E_WARN")" ""
                 fi
+                sleep 1
             fi
 
             cp -f "$BOT_PATH" "${BOT_PATH}.bak" 2>/dev/null || true
