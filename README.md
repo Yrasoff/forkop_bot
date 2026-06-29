@@ -1,4 +1,4 @@
-# 🤖 podkop_bot v0.15.6
+# 🤖 podkop_bot v0.15.7
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
@@ -24,6 +24,9 @@ Telegram-бот для удалённого управления [podkop](https:
 👤  Администраторы          — добавление/удаление прямо из TG, анонимные группы
 ⬆️  Обновления              — бот и podkop из меню, Force Update, What's New карточка
 📅  Ежедневный отчёт       — автоматический утренний дайджест в Telegram (время настраивается)
+🗓  Еженедельный отчёт     — агрегаты за неделю: стабильность, трафик, подписка, версии, bot config
+📤  Upload Bot Script      — загрузка и установка бота прямо через Telegram (без GitHub)
+🔕  Тихие часы            — подавление watchdog-алертов в заданном временном диапазоне
 ```
 
 **Только на Podkop Plus:**
@@ -59,6 +62,9 @@ Telegram-бот для удалённого управления [podkop](https:
     ├── 🤖 Transport Policy
     ├── 📡 Fallback SOCKS
     ├── 📅 Daily Report
+    ├── 🗓 Weekly Report
+    ├── 🔕 Quiet Hours
+    ├── 🔔 Broadcast Alerts / RAM Alert
     ├── 👤 Admins
     └── 🔗 Bind Interface
 ```
@@ -91,6 +97,11 @@ Telegram-бот для удалённого управления [podkop](https:
 | Ежедневный отчёт | ✅ | ✅ | ✅ |
 | Watchdog и Tunnel Health | ✅ | ✅ | ✅ |
 | Diagnostics / Support Bundle | ✅ | ✅ | ✅ |
+| NetShift selector_text / urltest_text | ❌ | 👁 read-only | ❌ |
+| NetShift multi-subscription URL (list) | ❌ | ✅ | ❌ |
+
+
+> **NetShift:** базовое управление полностью поддерживается. Расширенные параметры (`enable_ipv6`, `block_doh`, `global_proxy`, `dns_via_outbound`, `selector_text`/`urltest_text` режимы) — отображаются read-only, редактируются в LuCI. После обновления с podkop-evolution на NetShift бот автоматически переключает runtime.
 
 ---
 
@@ -174,6 +185,7 @@ ash install.sh --unattended \
   * перед обновлением бот показывает доступную версию и краткий блок **What's New**
   * даёт ссылку на changelog
   * **Force Update** — принудительная переустановка текущей версии для применения патчей
+  * **📤 Upload Bot Script** — загрузка `.sh` файла через Telegram как документ; валидирует shebang, `BOT_VERSION` и синтаксис (`busybox ash -n`), делает backup `.bak`, устанавливает и перезапускает. Для тестирования патчей без GitHub и роутеров за ISP-блокировками.
 * **Перезагрузка роутера** с двойным подтверждением (кнопка + ввод `YES`)
 
 ### 🌐 Outbound Selector / URLTest / Subscription
@@ -230,7 +242,11 @@ ash install.sh --unattended \
 * Custom Proxy (tier3)
 * Bind Interface — привязка исходящего интерфейса бота
 * **Автодобавление mixed_proxy других секций** как fallback tier'ов
-* **Daily Report** — ежедневный дайджест в Telegram. Настраивается время отправки (`HH:MM`, default `08:00`), включается/выключается toggle в Bot Settings. Ручная отправка: Maintenance → `📊 Send Daily Report Now`. Содержит: uptime/RAM/CPU, WAN+LAN+внешний IP+флаг, TG direct/tunnel статус, виртуальные адаптеры, режим секции и активный outbound с флагом страны, время последнего переключения (вручную или URLTest), рестарты sing-box, трафик за период uptime sing-box, транспорт бота с резервными каналами. На Podkop Plus дополнительно: URL подписки (секреты скрыты), трафик и дата истечения.
+* **Daily Report** — ежедневный дайджест в Telegram. Настраивается время отправки (`HH:MM`, default `08:00`). Содержит: uptime/RAM, WAN+LAN+внешний IP, TG статус, туннель, трафик, транспорт бота, подписка Plus.
+* **Weekly Report** — еженедельный дайджест (default: воскресенье 09:00, выкл). В день weekly ежедневный отчёт подавляется. Содержит агрегаты за неделю: версии файлов с mtime и sha256[:8], стабильность (uptime бота/туннеля, рестарты sing-box, route switches, TG-статус), ресурсы (RAM snapshot + min за неделю + кол-во RAM-алертов), трафик delta с avg/day, подписка Plus с предупреждениями при истечении (<7 дней) или трафике >80%, bot config snapshot. UCI: `weekly_report=0`, `weekly_report_day=7` (1=Mon…7=Sun), `weekly_report_time=09:00`.
+* **Quiet Hours** — подавление watchdog-алертов в заданном диапазоне времени. Поддерживает overnight (23:00–07:00). Daily/Weekly Report не подавляются. UCI: `quiet_hours_enabled=0`, `quiet_hours_from=23:00`, `quiet_hours_to=07:00`.
+* **Broadcast Alerts** — рассылка watchdog-алертов всем `admin_ids` (default: только главный CHAT_ID).
+* **RAM Alert** — независимый toggle для алерта при RAM < 30 MB (default: вкл). Recovery при ≥ 40 MB, повтор раз в час. Настраивается время отправки (`HH:MM`, default `08:00`), включается/выключается toggle в Bot Settings. Ручная отправка: Maintenance → `📊 Send Daily Report Now`. Содержит: uptime/RAM/CPU, WAN+LAN+внешний IP+флаг, TG direct/tunnel статус, виртуальные адаптеры, режим секции и активный outbound с флагом страны, время последнего переключения (вручную или URLTest), рестарты sing-box, трафик за период uptime sing-box, транспорт бота с резервными каналами. На Podkop Plus дополнительно: URL подписки (секреты скрыты), трафик и дата истечения.
 * **Admins** — см. раздел ниже
 
 ### 👤 Управление администраторами
@@ -284,6 +300,9 @@ ash install.sh --unattended \
 * Alerts при деградации маршрута бота на Direct или Emergency IPs
 * **Аварийные Telegram IP** через DoH-discovery — список обновляется каждые 6 часов из трёх DoH-провайдеров (Cloudflare, Google, Quad9) с проверкой принадлежности AS62041; статичный список остаётся как fallback
 * Постоянная навигационная клавиатура `🏠 Menu | 📊 Status` — доступна всегда, в том числе при watchdog-алертах
+* **RAM watchdog alert** — срабатывает при свободной RAM < 30 MB, recovery при ≥ 40 MB, повтор раз в час. Советы: уменьшить URLTest outbounds, поднять `health_interval`, перейти на sing-box stable
+* **Тихие часы** — watchdog-алерты подавляются в заданном диапазоне (`quiet_hours_enabled`, `quiet_hours_from`, `quiet_hours_to`). Overnight диапазоны поддерживаются
+* **Broadcast Alerts** — при включении алерты рассылаются всем `admin_ids`
 
 ### 📡 Транспортная цепочка бота
 
@@ -346,7 +365,15 @@ uci commit podkop_bot
 ├── settings.alert_notify    — 1/0 алерты watchdog
 ├── settings.startup_notify  — 1/0 уведомление при старте
 ├── settings.daily_report    — 1/0 ежедневный отчёт (default 0)
-└── settings.daily_report_time — время отправки HH:MM (default 08:00)
+├── settings.daily_report_time — время отправки HH:MM (default 08:00)
+├── settings.weekly_report   — 1/0 еженедельный отчёт (default 0)
+├── settings.weekly_report_day — день недели 1-7 ISO (default 7=Sun)
+├── settings.weekly_report_time — время отправки HH:MM (default 09:00)
+├── settings.broadcast_alerts — 1/0 рассылка алертов всем admin_ids (default 0)
+├── settings.ram_alert       — 1/0 алерт при RAM < 30 MB (default 1)
+├── settings.quiet_hours_enabled — 1/0 тихие часы (default 0)
+├── settings.quiet_hours_from — начало тихих часов HH:MM (default 23:00)
+└── settings.quiet_hours_to  — конец тихих часов HH:MM (default 07:00)
 ```
 
 > **Важно:** `admin_ids` добавляются через `uci add_list`, а не через `uci set` — иначе несколько ID не сохранятся корректно.
@@ -418,6 +445,6 @@ The installer auto-detects the podkop variant, supports unattended mode (`--unat
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Menu | 📊 Status`) is available at all times including during watchdog alerts.
 
-v0.15.5 adds **Server Instances** (Plus only) — live UCI-based status of sing-box server-mode inbounds with TCP+UDP port check — and **Daily Report** — a configurable scheduled Telegram digest with system stats, WAN/IP, TG connectivity, active outbound with country flag and last-switch info, sing-box restarts, traffic, bot transport chain, and Plus subscription data.
+v0.15.7 adds **Weekly Report** (scheduled weekly digest with stability aggregates, traffic delta, subscription warnings, versions with mtime/hash, and bot config snapshot), **Upload Bot Script** (install bot updates via Telegram document — for testing patches without GitHub and routers behind ISP blocks), **Quiet Hours** (suppress watchdog alerts during configurable time range with overnight support), **Broadcast Alerts** / **RAM Alert** toggles, and 5-source public IP detection including Russian services for Crimea/RF. v0.15.5 adds **Server Instances** (Plus only) — live UCI-based status of sing-box server-mode inbounds with TCP+UDP port check — and **Daily Report** — a configurable scheduled Telegram digest with system stats, WAN/IP, TG connectivity, active outbound with country flag and last-switch info, sing-box restarts, traffic, bot transport chain, and Plus subscription data.
 
 Full [changelog](CHANGELOG.md) and [menu structure reference](BOT_STRUCTURE.md) available.

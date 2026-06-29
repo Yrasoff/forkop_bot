@@ -1,1 +1,1 @@
-Исправлены критичные баги для Plus: счётчик серверов подписки, путь кэша, активный outbound, режим в карточках. OOM-фиксы: убран spawn sing-box binary, _plus_sub_metadata читает кэш. Каша в Server Instances на мобильном устранена. Улучшена карточка Tailscale.
+v0.15.7: критический баг-фикс — local в main loop ломал бота при нажатии кнопки. Weekly Report (стабильность, трафик, подписка, версии за неделю). Upload Bot Script, Тихие часы, RAM-алерт, Broadcast Alerts, 5 IP-источников. Исправлено: sing-box version кеш, migration evolution→NetShift, subscription UI, broadcast дубли.
