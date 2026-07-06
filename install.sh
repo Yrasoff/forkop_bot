@@ -18,6 +18,55 @@
 #   ash install.sh --unattended --action check
 #   See UNATTENDED CONFIG FORMAT comment below for the JSON schema.
 #
+# INSTALLER_VERSION="2.4.1"
+#
+# CHANGELOG v2.4.1:
+# - FIXED: _podkop_uci_pkg() mapped netshift -> "podkop" (wrong UCI namespace).
+#        NetShift lives in the `netshift` namespace; detection already knew the
+#        variant but the mapping dropped it. Now plus->podkop-plus,
+#        netshift->netshift, *->podkop. (Same bug fixed in the rpcd backend.)
+#
+# INSTALLER_VERSION="2.4.0"
+#
+# CHANGELOG v2.4.0:
+# - FIXED: msg() ate %s/%d placeholders. Branches printed their format with
+#        printf "literal-with-%s", so $(msg X) executed that printf with no
+#        argument and the placeholder vanished before any caller could
+#        substitute — every version/path/count in install logs came out blank
+#        ("Installed: v", "Config: /etc/config/", "Downloading bot v..."). All
+#        54 placeholder-bearing msg branches now emit their format verbatim via
+#        printf '%s' "literal", so both single- and double-printf callsites
+#        substitute correctly. Non-placeholder messages and callsites with an
+#        immediate argument were left untouched.
+#
+# INSTALLER_VERSION="2.3.3"
+#
+# CHANGELOG v2.3.3:
+# - FIXED: /proc cmdline scan in _bot_alive() and _reap_bot_forks() leaked
+#        "can't open /proc/PID/cmdline: no such file" to stderr when a process
+#        exited mid-scan (race). The redirect-open error came from the shell
+#        setting up "< /proc/PID/cmdline", which the inner 2>/dev/null on tr did
+#        not catch. Wrapped the read in a subshell so the redirect error is
+#        suppressed too. Cosmetic (scan still works), but kept the log clean.
+# - KNOWN ISSUE (not fixed here): update-flow summary prints empty version /
+#        config fields ("Installed: v", "Config: /etc/config/"). Root cause is
+#        the msg() helper executing printf '...%s' with no argument, which eats
+#        the %s before the caller can substitute. Affects ~71 %s-bearing
+#        messages; needs a dedicated pass converting those msg branches to
+#        printf '%s' "literal-with-%s". Deferred to avoid a risky broad change.
+#
+# INSTALLER_VERSION="2.3.2"
+#
+# CHANGELOG v2.3.2:
+# - FIXED: read-only actions (status, check, check-token) no longer acquire the
+#        installer lock. check-token does a network getMe (seconds) and the
+#        Wizard may call it repeatedly; locking made it hang on — or get blocked
+#        by — a stale/concurrent install lock for no reason.
+# - FIXED: _release_lock now only releases a lock THIS process acquired
+#        (_LOCK_HELD guard). Previously the EXIT trap of a read-only action would
+#        remove a lock held by a concurrent install/update — so running the
+#        Wizard's token check during an install could yank that install's lock.
+#
 # INSTALLER_VERSION="2.3.1"
 #
 # CHANGELOG v2.3.1:
@@ -244,7 +293,7 @@ esac
 unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-INSTALLER_VERSION="2.3.1"
+INSTALLER_VERSION="2.4.2"
 BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
 VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
@@ -311,6 +360,7 @@ warn()    { echo "[!!] $1"; }
 step()    { echo ""; echo ">>> $1"; }
 section() { echo ""; echo "-------------------------------------------"; echo "  $1"; echo "-------------------------------------------"; echo ""; }
 
+_LOCK_HELD=0
 _acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         echo "ERROR: Another installer instance is already running (lock: $LOCK_DIR)."
@@ -318,9 +368,14 @@ _acquire_lock() {
         echo "  rmdir $LOCK_DIR"
         exit 10
     fi
+    _LOCK_HELD=1
     echo "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
 }
-_release_lock() { rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+# Only release a lock THIS process acquired. Read-only actions (status / check /
+# check-token) never acquire it, so their EXIT trap must not remove a lock held
+# by a concurrent install/update — otherwise running the Wizard's token check
+# during an install would yank that install's lock out from under it.
+_release_lock() { [ "$_LOCK_HELD" = "1" ] || return 0; rmdir "$LOCK_DIR" 2>/dev/null || rm -rf "$LOCK_DIR" 2>/dev/null || true; _LOCK_HELD=0; }
 trap '_teardown_user_proxy; _release_lock' EXIT
 trap '_teardown_user_proxy; _release_lock; exit 130' INT
 trap '_teardown_user_proxy; _release_lock; exit 143' TERM
@@ -519,16 +574,16 @@ msg() {
             *)  printf "This will remove:" ;;
             esac ;;
         uninstall_item_bin) case "$UI_LANG" in
-            ru) printf "  - Бинарь бота      : %s" ;;
-            *)  printf "  - Bot binary       : %s" ;;
+            ru) printf '%s' "  - Бинарь бота      : %s" ;;
+            *)  printf '%s' "  - Bot binary       : %s" ;;
             esac ;;
         uninstall_item_init) case "$UI_LANG" in
-            ru) printf "  - Скрипт init.d    : %s" ;;
-            *)  printf "  - Init.d script    : %s" ;;
+            ru) printf '%s' "  - Скрипт init.d    : %s" ;;
+            *)  printf '%s' "  - Init.d script    : %s" ;;
             esac ;;
         uninstall_item_uci) case "$UI_LANG" in
-            ru) printf "  - UCI-конфиг       : /etc/config/%s" ;;
-            *)  printf "  - UCI config       : /etc/config/%s" ;;
+            ru) printf '%s' "  - UCI-конфиг       : /etc/config/%s" ;;
+            *)  printf '%s' "  - UCI config       : /etc/config/%s" ;;
             esac ;;
         uninstall_item_uci_detail) case "$UI_LANG" in
             ru) printf "    (bot_token, chat_id, fallback_socks, все настройки)" ;;
@@ -559,8 +614,8 @@ msg() {
             *)  printf "Stopping bot service..." ;;
             esac ;;
         removed) case "$UI_LANG" in
-            ru) printf "Удалено: %s" ;;
-            *)  printf "Removed %s" ;;
+            ru) printf '%s' "Удалено: %s" ;;
+            *)  printf '%s' "Removed %s" ;;
             esac ;;
         removing_bot_binary) case "$UI_LANG" in
             ru) printf "Удаляем бинарь бота..." ;;
@@ -592,12 +647,12 @@ msg() {
             *)  printf "Checking for updates..." ;;
             esac ;;
         installed_label) case "$UI_LANG" in
-            ru) printf "  Установлено : v%s" ;;
-            *)  printf "  Installed : v%s" ;;
+            ru) printf '%s' "  Установлено : v%s" ;;
+            *)  printf '%s' "  Installed : v%s" ;;
             esac ;;
         available_label) case "$UI_LANG" in
-            ru) printf "  Доступно    : v%s" ;;
-            *)  printf "  Available : v%s" ;;
+            ru) printf '%s' "  Доступно    : v%s" ;;
+            *)  printf '%s' "  Available : v%s" ;;
             esac ;;
         already_up_to_date_noninteractive) case "$UI_LANG" in
             ru) printf "Уже последняя версия. Изменений не внесено." ;;
@@ -616,24 +671,24 @@ msg() {
             *)  printf "No changes made." ;;
             esac ;;
         update_confirm) case "$UI_LANG" in
-            ru) printf "Обновить v%s -> v%s? (Y/n): " ;;
-            *)  printf "Update v%s -> v%s? (Y/n): " ;;
+            ru) printf '%s' "Обновить v%s -> v%s? (Y/n): " ;;
+            *)  printf '%s' "Update v%s -> v%s? (Y/n): " ;;
             esac ;;
         update_cancelled) case "$UI_LANG" in
             ru) printf "Обновление отменено." ;;
             *)  printf "Update cancelled." ;;
             esac ;;
         downloading_bot_v) case "$UI_LANG" in
-            ru) printf "  Скачиваем бота v%s... " ;;
-            *)  printf "  Downloading bot v%s... " ;;
+            ru) printf '%s' "  Скачиваем бота v%s... " ;;
+            *)  printf '%s' "  Downloading bot v%s... " ;;
             esac ;;
         updating_init) case "$UI_LANG" in
             ru) printf "  Обновляем init.d-скрипт... " ;;
             *)  printf "  Updating init.d script... " ;;
             esac ;;
         updated_to_v) case "$UI_LANG" in
-            ru) printf "Обновлено до v%s." ;;
-            *)  printf "Updated to v%s." ;;
+            ru) printf '%s' "Обновлено до v%s." ;;
+            *)  printf '%s' "Updated to v%s." ;;
             esac ;;
         starting_service) case "$UI_LANG" in
             ru) printf "  Запускаем сервис... " ;;
@@ -644,8 +699,8 @@ msg() {
             *)  printf "Service restarted successfully." ;;
             esac ;;
         no_init_start_manually) case "$UI_LANG" in
-            ru) printf "Скрипт init.d не найден. Запустите вручную: %s &" ;;
-            *)  printf "No init.d script found. Start manually: %s &" ;;
+            ru) printf '%s' "Скрипт init.d не найден. Запустите вручную: %s &" ;;
+            *)  printf '%s' "No init.d script found. Start manually: %s &" ;;
             esac ;;
         rollback_warn) case "$UI_LANG" in
             ru) printf "Новая версия не запустилась — откатываемся на предыдущий бинарь." ;;
@@ -664,24 +719,24 @@ msg() {
             *)  printf "Check: logread | grep podkop-bot" ;;
             esac ;;
         rollback_no_backup) case "$UI_LANG" in
-            ru) printf "Резервная копия бинаря не найдена (%s отсутствует) — автоматический откат невозможен." ;;
-            *)  printf "No backup binary found (%s missing) — could not roll back automatically." ;;
+            ru) printf '%s' "Резервная копия бинаря не найдена (%s отсутствует) — автоматический откат невозможен." ;;
+            *)  printf '%s' "No backup binary found (%s missing) — could not roll back automatically." ;;
             esac ;;
         update_complete_title) case "$UI_LANG" in
             ru) printf "  Обновление завершено!" ;;
             *)  printf "  Update complete!" ;;
             esac ;;
         bot_script_label) case "$UI_LANG" in
-            ru) printf "  Скрипт бота : %s" ;;
-            *)  printf "  Bot script : %s" ;;
+            ru) printf '%s' "  Скрипт бота : %s" ;;
+            *)  printf '%s' "  Bot script : %s" ;;
             esac ;;
         version_v_label) case "$UI_LANG" in
-            ru) printf "  Версия      : v%s" ;;
-            *)  printf "  Version    : v%s" ;;
+            ru) printf '%s' "  Версия      : v%s" ;;
+            *)  printf '%s' "  Version    : v%s" ;;
             esac ;;
         config_label) case "$UI_LANG" in
-            ru) printf "  Конфиг      : /etc/config/%s" ;;
-            *)  printf "  Config     : /etc/config/%s" ;;
+            ru) printf '%s' "  Конфиг      : /etc/config/%s" ;;
+            *)  printf '%s' "  Config     : /etc/config/%s" ;;
             esac ;;
         useful_commands) case "$UI_LANG" in
             ru) printf "Полезные команды:" ;;
@@ -709,8 +764,8 @@ msg() {
             *)  printf "Downloading podkop_bot..." ;;
             esac ;;
         downloaded_v) case "$UI_LANG" in
-            ru) printf "Скачано v%s: %s" ;;
-            *)  printf "Downloaded v%s: %s" ;;
+            ru) printf '%s' "Скачано v%s: %s" ;;
+            *)  printf '%s' "Downloaded v%s: %s" ;;
             esac ;;
         section_bot_config) case "$UI_LANG" in
             ru) printf "Настройка бота" ;;
@@ -783,8 +838,8 @@ msg() {
             *)  printf "\n  [!!] All SOCKS tiers failed.\n" ;;
             esac ;;
         dl_used_vendor) case "$UI_LANG" in
-            ru) printf "    → использую встроенную офлайн-копию: %s\n" ;;
-            *)  printf "    → using bundled offline copy: %s\n" ;;
+            ru) printf '%s' "    → использую встроенную офлайн-копию: %s\n" ;;
+            *)  printf '%s' "    → using bundled offline copy: %s\n" ;;
             esac ;;
         dl_check_podkop_running) case "$UI_LANG" in
             ru) printf "  Проверьте, что podkop запущен и Mixed Proxy включён:\n" ;;
@@ -804,12 +859,12 @@ msg() {
             *)  printf "done" ;;
             esac ;;
         killing_main_pid) case "$UI_LANG" in
-            ru) printf "  Останавливаем основной процесс %s... " ;;
-            *)  printf "  Killing main PID %s... " ;;
+            ru) printf '%s' "  Останавливаем основной процесс %s... " ;;
+            *)  printf '%s' "  Killing main PID %s... " ;;
             esac ;;
         killing_remaining_procs) case "$UI_LANG" in
-            ru) printf "  Останавливаем оставшиеся процессы '%s'... " ;;
-            *)  printf "  Killing remaining '%s' processes... " ;;
+            ru) printf '%s' "  Останавливаем оставшиеся процессы '%s'... " ;;
+            *)  printf '%s' "  Killing remaining '%s' processes... " ;;
             esac ;;
 
         retry_opkg_update_hint) case "$UI_LANG" in
@@ -817,12 +872,12 @@ msg() {
             *)  printf "If dependency install fails below, run 'opkg update' manually and retry." ;;
             esac ;;
         pkg_already_installed) case "$UI_LANG" in
-            ru) printf "%s — уже установлен" ;;
-            *)  printf "%s — already installed" ;;
+            ru) printf '%s' "%s — уже установлен" ;;
+            *)  printf '%s' "%s — already installed" ;;
             esac ;;
         installing_pkg) case "$UI_LANG" in
-            ru) printf "  Устанавливаем %s... " ;;
-            *)  printf "  Installing %s... " ;;
+            ru) printf '%s' "  Устанавливаем %s... " ;;
+            *)  printf '%s' "  Installing %s... " ;;
             esac ;;
         unattended_uninstall_complete) case "$UI_LANG" in
             ru) printf "Удаление завершено (podkop и sing-box не затронуты)." ;;
@@ -830,8 +885,8 @@ msg() {
             esac ;;
 
         config_written) case "$UI_LANG" in
-            ru) printf "Конфиг записан в /etc/config/%s" ;;
-            *)  printf "Config written to /etc/config/%s" ;;
+            ru) printf '%s' "Конфиг записан в /etc/config/%s" ;;
+            *)  printf '%s' "Config written to /etc/config/%s" ;;
             esac ;;
         uci_summary_title) case "$UI_LANG" in
             ru) printf "  Сводка UCI-конфига:" ;;
@@ -854,12 +909,12 @@ msg() {
             *)  printf "Generated minimal procd init script." ;;
             esac ;;
         autostart_enabled) case "$UI_LANG" in
-            ru) printf "Автозапуск включён: %s" ;;
-            *)  printf "Autostart enabled: %s" ;;
+            ru) printf '%s' "Автозапуск включён: %s" ;;
+            *)  printf '%s' "Autostart enabled: %s" ;;
             esac ;;
         autostart_skipped) case "$UI_LANG" in
-            ru) printf "Автозапуск пропущен. Запустите вручную: %s &" ;;
-            *)  printf "Autostart skipped. Start manually: %s &" ;;
+            ru) printf '%s' "Автозапуск пропущен. Запустите вручную: %s &" ;;
+            *)  printf '%s' "Autostart skipped. Start manually: %s &" ;;
             esac ;;
         ask_start_now) case "$UI_LANG" in
             ru) printf "Запустить бота сейчас? (Y/n): " ;;
@@ -878,24 +933,24 @@ msg() {
             *)  printf "UNKNOWN — falling back to direct start" ;;
             esac ;;
         bot_started_directly) case "$UI_LANG" in
-            ru) printf "Бот запущен напрямую (PID: %s)." ;;
-            *)  printf "Bot started directly (PID: %s)." ;;
+            ru) printf '%s' "Бот запущен напрямую (PID: %s)." ;;
+            *)  printf '%s' "Bot started directly (PID: %s)." ;;
             esac ;;
         bot_started) case "$UI_LANG" in
-            ru) printf "Бот запущен (PID: %s)." ;;
-            *)  printf "Bot started (PID: %s)." ;;
+            ru) printf '%s' "Бот запущен (PID: %s)." ;;
+            *)  printf '%s' "Bot started (PID: %s)." ;;
             esac ;;
         bot_not_started) case "$UI_LANG" in
             ru) printf "Бот не запущен. Запустите когда будете готовы:" ;;
             *)  printf "Bot not started. Run when ready:" ;;
             esac ;;
         or_manually) case "$UI_LANG" in
-            ru) printf "  # или: %s &" ;;
-            *)  printf "  # or: %s &" ;;
+            ru) printf '%s' "  # или: %s &" ;;
+            *)  printf '%s' "  # or: %s &" ;;
             esac ;;
         skipping_invalid_admin) case "$UI_LANG" in
-            ru) printf "Пропущен некорректный admin ID (не число): %s" ;;
-            *)  printf "Skipping invalid admin ID (not numeric): %s" ;;
+            ru) printf '%s' "Пропущен некорректный admin ID (не число): %s" ;;
+            *)  printf '%s' "Skipping invalid admin ID (not numeric): %s" ;;
             esac ;;
 
         *) printf '%s' "$1" ;;  # fallback: unknown key, print key itself (helps catch typos)
@@ -980,6 +1035,17 @@ detect_podkop_variant() {
         return
     fi
 
+    # A podkop binary or podkop.* UCI exists but matched no fingerprint above —
+    # this is an original Podkop whose schema we don't specifically recognise
+    # (e.g. an old 0.4.x release predating connection_type). Treat it as original
+    # (safe default: same UCI package "podkop", same mixed_proxy fields) rather
+    # than "unknown", which breaks repo/version resolution downstream.
+    if [ -n "$_bin_path" ] || uci -q get podkop.settings >/dev/null 2>&1 \
+                           || uci -q show podkop >/dev/null 2>&1; then
+        printf 'original'
+        return
+    fi
+
     printf 'unknown'
 }
 
@@ -996,7 +1062,11 @@ variant_label() {
 # ── UCI package name for the detected variant ──────────────────────────────────
 # Plus uses its own UCI package "podkop-plus"; everything else uses "podkop".
 _podkop_uci_pkg() {
-    [ "$PODKOP_VARIANT" = "plus" ] && printf 'podkop-plus' || printf 'podkop'
+    case "$PODKOP_VARIANT" in
+        plus)     printf 'podkop-plus' ;;
+        netshift) printf 'netshift' ;;
+        *)        printf 'podkop' ;;
+    esac
 }
 # _vendor_fallback: last-resort offline source. Given the same url/dest as
 # download_file(), copies a vendored copy from $VENDOR_DIR matched by URL
@@ -1089,7 +1159,7 @@ _bot_alive() {
     local _p _cl
     for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
         [ "$_p" = "$$" ] && continue
-        _cl=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null) || continue
+        _cl=$( (tr '\0' ' ' < "/proc/$_p/cmdline") 2>/dev/null ) || continue
         case "$_cl" in
             *"/etc/init.d/podkop_bot"*) continue ;;
             *rc.common*) continue ;;
@@ -1111,7 +1181,7 @@ _reap_bot_forks() {
     local _pids="" _p _cl
     for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
         [ "$_p" = "$$" ] && continue
-        _cl=$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null) || continue
+        _cl=$( (tr '\0' ' ' < "/proc/$_p/cmdline") 2>/dev/null ) || continue
         case "$_cl" in
             *"/etc/init.d/podkop_bot"*) continue ;;
             *rc.common*) continue ;;
@@ -1153,44 +1223,89 @@ _init_is_legacy() {
 _write_working_init() {
     cat > "$INIT_PATH" << 'INITEOF'
 #!/bin/sh /etc/rc.common
+# podkop_bot init.d — fixed to reliably stop a FORKING bot.
+#
+# The bot forks a health daemon + startup-notify child that keep their own
+# getUpdates poll. procd supervises only the main PID, so a plain procd stop
+# leaves those children alive → two getUpdates pollers on one token → Telegram
+# 409 Conflict, flapping routes, duplicated processes after every restart.
+#
+# Fix: an explicit stop_service that kills ALL podkop_bot processes (main +
+# forked children), plus a clean start that waits for the old ones to die.
+
 START=99
 STOP=10
 USE_PROCD=1
 PROG=/usr/bin/podkop_bot
 
+# Kill every running podkop_bot process (main + forked daemons).
+# Matches the interpreter line "/bin/sh /usr/bin/podkop_bot" — busybox shows the
+# process as {podkop_bot}, so killall by name does NOT work; we match cmdline.
 _kill_all_podkop_bot() {
-    local _pids="" _p
+    local _pids _p
+    # Collect PIDs whose /proc/<pid>/cmdline contains the bot path, excluding self.
+    _pids=""
     for _p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
         [ "$_p" = "$$" ] && continue
-        grep -qa 'podkop_bot' "/proc/$_p/cmdline" 2>/dev/null || continue
-        grep -qa '/etc/init.d/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && continue
-        grep -qa 'rc.common' "/proc/$_p/cmdline" 2>/dev/null && continue
-        grep -qa '/usr/bin/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && _pids="$_pids $_p"
+        if grep -qa 'podkop_bot' "/proc/$_p/cmdline" 2>/dev/null; then
+            # skip this init script itself (cmdline contains rc.common/init path)
+            grep -qa '/etc/init.d/podkop_bot\|rc.common' "/proc/$_p/cmdline" 2>/dev/null && continue
+            grep -qa '/usr/bin/podkop_bot' "/proc/$_p/cmdline" 2>/dev/null && _pids="$_pids $_p"
+        fi
     done
-    [ -z "$_pids" ] && { rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null; return 0; }
+
+    [ -z "$_pids" ] && return 0
+
+    # Graceful TERM first
     kill $_pids 2>/dev/null
+    # Wait up to 8s for them to exit
     local _i=0
     while [ "$_i" -lt 8 ]; do
         local _alive=""
-        for _p in $_pids; do [ -d "/proc/$_p" ] && _alive="$_alive $_p"; done
+        for _p in $_pids; do
+            [ -d "/proc/$_p" ] && _alive="$_alive $_p"
+        done
         [ -z "$_alive" ] && break
         sleep 1; _i=$((_i + 1))
     done
-    for _p in $_pids; do [ -d "/proc/$_p" ] && kill -9 "$_p" 2>/dev/null; done
-    rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null
+
+    # Force-kill any survivors
+    for _p in $_pids; do
+        [ -d "/proc/$_p" ] && kill -9 "$_p" 2>/dev/null
+    done
+
+    # Drop both PID files so the next start isn't blocked:
+    # podkop_bot.pid = single-instance lock (written by bot at startup)
+    # bot.pid        = main PID used by safe_stop_bot in the installer
+    rm -f /tmp/podkop_bot/podkop_bot.pid /tmp/podkop_bot/bot.pid 2>/dev/null
 }
 
 start_service() {
-    _kill_all_podkop_bot
+    # If a healthy bot instance is already running under the lock file,
+    # skip the kill — avoid disrupting a running bot on redundant "start".
+    # Otherwise kill stale processes and clean the lock before starting fresh.
+    local _lock_pid
+    _lock_pid=$(cat /tmp/podkop_bot/podkop_bot.pid 2>/dev/null)
+    if [ -n "$_lock_pid" ] && [ -d "/proc/$_lock_pid" ] &&        grep -qa '/usr/bin/podkop_bot' "/proc/$_lock_pid/cmdline" 2>/dev/null; then
+        return 0  # healthy instance running — do not disturb it
+    else
+        _kill_all_podkop_bot
+        sleep 1
+        rm -f /tmp/podkop_bot/podkop_bot.pid 2>/dev/null
+    fi
+
     procd_open_instance
     procd_set_param command "$PROG"
-    procd_set_param respawn 3600 5 5
+    # respawn: 3600s window, max 5 crashes, 10s delay.
+    procd_set_param respawn 3600 5 10
     procd_set_param stdout 0
     procd_set_param stderr 0
     procd_close_instance
 }
 
 stop_service() {
+    # procd will signal the supervised main PID, but we must also reap the
+    # forked health/poll children that procd does not track.
     _kill_all_podkop_bot
 }
 
@@ -1612,7 +1727,7 @@ cleanup_bot_runtime_files() {
 
     # Leftover mktemp-based temp files (any version)
     rm -f /tmp/podkop_req.* /tmp/podkop_bot_update.* /tmp/podkop_updates.* \
-        /tmp/podkop_clash.* /tmp/podkop_ip[123].* /tmp/podkop_pubip.* 2>/dev/null || true
+        /tmp/podkop_clash.* /tmp/podkop_ip[1-5].* /tmp/podkop_pubip.* 2>/dev/null || true
 
     [ "$_removed" -gt 0 ] && info "Cleaned up ${_removed} runtime files."
 }
@@ -1691,7 +1806,15 @@ _bootstrap_jq() {
 }
 # ── Lock (prevents concurrent installer runs — important for unattended mode
 #       where luci-app-podkop-bot's rpcd backend might be triggered twice) ────
-_acquire_lock
+# Read-only actions (status, check, check-token) never mutate anything and must
+# not contend for the lock: check-token in particular makes a network getMe that
+# can take seconds, and the LuCI Setup Wizard may call it repeatedly — blocking
+# on (or being blocked by) a stale/concurrent install lock would make token
+# validation hang or fail for no reason. Only install/update/uninstall lock.
+case "$UA_ACTION" in
+    status|check|check-token) : ;;   # read-only, no lock
+    *) _acquire_lock ;;
+esac
 
 # ── Pure-output guard for status/check (Fix 1) ─────────────────────────────────
 # luci-app-podkop-bot's rpcd backend pipes `--action status` straight into a
@@ -1831,15 +1954,27 @@ if [ "$PODKOP_OK" = "0" ]; then
 else
     PODKOP_VER=""
     SINGBOX_VER=""
+    # variant-first: look up the package matching the detected variant first, so
+    # a leftover 'podkop' package on a NetShift box can't shadow the real version.
+    case "$PODKOP_VARIANT" in
+        plus)     _pkg_name="podkop-plus" ;;
+        netshift) _pkg_name="netshift" ;;
+        *)        _pkg_name="podkop" ;;
+    esac
     case "$PKG_MANAGER" in
         apk)
-            PODKOP_VER=$(apk info podkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            PODKOP_VER=$(apk info "$_pkg_name" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            # fallbacks in case variant detection and package naming disagree
+            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info podkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info podkop-plus 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info netshift 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             SINGBOX_VER=$(apk info sing-box 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             ;;
         opkg)
-            PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}' | sed 's/^v//')
+            PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^${_pkg_name} " | awk '{print $3}' | sed 's/^v//')
+            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}' | sed 's/^v//')
             [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop-plus " | awk '{print $3}' | sed 's/^v//')
+            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^netshift " | awk '{print $3}' | sed 's/^v//')
             SINGBOX_VER=$(opkg list-installed 2>/dev/null | grep "^sing-box " | awk '{print $3}' | sed 's/^v//')
             ;;
     esac
