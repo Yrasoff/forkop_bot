@@ -1,4 +1,4 @@
-# 🤖 podkop_bot v0.15.7
+# 🤖 podkop_bot v0.15.9
 
 Telegram-бот для удалённого управления [podkop](https://github.com/itdoginfo/podkop) — сервисом маршрутизации трафика для OpenWrt на базе sing-box.
 
@@ -27,6 +27,7 @@ Telegram-бот для удалённого управления [podkop](https:
 🗓  Еженедельный отчёт     — агрегаты за неделю: стабильность, трафик, подписка, версии, bot config
 📤  Upload Bot Script      — загрузка и установка бота прямо через Telegram (без GitHub)
 🔕  Тихие часы            — подавление watchdog-алертов в заданном временном диапазоне
+🖥️  Веб-интерфейс (LuCI)   — настройка бота и удобный Runtime Info через luci-app-podkop-bot
 ```
 
 **Только на Podkop Plus:**
@@ -158,6 +159,24 @@ ash install.sh --unattended \
 3. Создаёт резервную копию текущего бинаря
 4. Атомарно заменяет файл и перезапускает сервис
 5. Если новая версия не стартует — автоматически восстанавливает предыдущий бинарь
+
+### 🖥️ Веб-интерфейс — luci-app-podkop-bot
+
+Отдельный пакет LuCI для тех, кто предпочитает веб вместо Telegram для части задач: настройка бота (токен, admin_ids, транспорт, алерты, расписания отчётов) и удобный Runtime Info прямо в web-панели роутера, без необходимости открывать Telegram.
+
+Репозиторий: **https://github.com/Medvedolog/luci-app-podkop-bot**
+
+Ставится тем же `install.sh` — после установки/обновления бота он спросит, поставить ли веб-интерфейс (или сразу, без вопроса, флагом `--with-luci` в unattended-режиме):
+
+```sh
+ash install.sh --unattended --action install --config /tmp/podkop_bot_install.json --with-luci
+```
+
+Также доступно отдельным действием `update-luci` — скачивает и ставит последний релиз (`.ipk` под opkg / `.apk` под apk, по пакетному менеджеру роутера), в фоне (detached), не блокируясь если сама LuCI-панель перезапустится в процессе:
+
+```sh
+ash install.sh --unattended --action update-luci
+```
 
 ---
 
@@ -441,7 +460,7 @@ MIT
 
 Provides full control without SSH or LuCI: start/stop/reload, outbound proxy switching with latency display, multi-section support, routing lists editor (Service Lists, Domain List URLs, Devices → Tunnel, Devices → Bypass), DNS and YACD settings. Plus-only extras: subscription traffic/expiry display, URLTest filters by country/regex, zapret/byedpi section management with strategy validation, manual links in subscription sections, Close All Connections.
 
-The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for luci-app rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure).
+The installer auto-detects the podkop variant, supports unattended mode (`--unattended --action install|update|uninstall|status|check --config <json>`) for [luci-app-podkop-bot](https://github.com/Medvedolog/luci-app-podkop-bot) rpcd backends with structured exit codes, a bootstrap HTTP proxy for installations behind ISP blocks, and rollback-safe updates (download → `ash -n` validate → atomic swap → auto-restore on failure). The same installer can also fetch and install luci-app-podkop-bot itself (`--with-luci` flag, or standalone via `--action update-luci`) — a LuCI web UI for bot configuration and a browser-friendly Runtime Info view, for anyone who'd rather not do everything through Telegram.
 
 The bot maintains reachability through a 5-tier fallback transport chain (Podkop SOCKS → Fallback SOCKS list → Custom Proxy → Direct → Emergency IPs with DoH-based self-refresh every 6h from Cloudflare/Google/Quad9) with sticky routing, IPC-based recovery signalling, and automatic return to tier1 within one health interval after podkop recovers. A persistent reply keyboard (`🏠 Menu | 📊 Status`) is available at all times including during watchdog alerts.
 
