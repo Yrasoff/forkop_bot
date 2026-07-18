@@ -42,7 +42,7 @@ BOT_VERSION="0.15.9"
 #   original  (itdoginfo/podkop)            — connection_type + proxy_config_type
 #   evolution (subscription_update CLI)     — .outbounds[] subscription cache
 #   netshift  (yandexru45/netshift fork)    — like evolution, netshift paths
-#   plus      (ushan0v/podkop-plus binary)  — action= field, see PLUS MODEL below
+#   plus      (ushan0v/forkop binary)  — action= field, see PLUS MODEL below
 # NOTE: paths here are intentionally hardcoded — PODKOP_* vars not yet set.
 #
 # PLUS MODEL (important — differs from original's single proxy_config_type):
@@ -51,13 +51,13 @@ BOT_VERSION="0.15.9"
 #   flag → urltest, else selector). get_section_type() collapses these to one value
 #   (urltest wins over subscription), so for Plus the real mode must be read from
 #   the urltest_enabled flag directly, and subscription shown as a separate line.
-#   Server count + subscription metadata come from /var/run/podkop-plus/section-cache/
+#   Server count + subscription metadata come from /var/run/forkop/section-cache/
 #   <sec>.json (.servers map / .subscriptionMetadata array), preferred via Clash
 #   /proxies; the subscription-links/ dir is NOT the node cache. See get_section_type,
 #   get_subscription_server_count, _plus_sub_metadata, and the proxy_mode_menu handler.
 # ==============================================================================
 _detect_podkop_variant() {
-    if [ -f /usr/bin/podkop-plus ]; then
+    if [ -f /usr/bin/forkop ]; then
         echo "plus"
         return
     fi
@@ -81,12 +81,12 @@ _detect_podkop_variant() {
 _apply_variant_env() {
     case "$PODKOP_VARIANT" in
         plus)
-            PODKOP_UCI="podkop-plus"
-            PODKOP_BIN="/usr/bin/podkop-plus"
-            PODKOP_PKG="podkop-plus"
-            PODKOP_DISPLAY_NAME="Podkop Plus"
-            PODKOP_GITHUB_REPO="ushan0v/podkop-plus"
-            PODKOP_INIT="/etc/init.d/podkop-plus"
+            PODKOP_UCI="forkop"
+            PODKOP_BIN="/usr/bin/forkop"
+            PODKOP_PKG="forkop"
+            PODKOP_DISPLAY_NAME="Forkop"
+            PODKOP_GITHUB_REPO="ushan0v/forkop"
+            PODKOP_INIT="/etc/init.d/forkop"
             ;;
         netshift)
             PODKOP_UCI="netshift"
@@ -124,12 +124,12 @@ PODKOP_VARIANT=$(_detect_podkop_variant)
 
 case "$PODKOP_VARIANT" in
     plus)
-        PODKOP_UCI="podkop-plus"
-        PODKOP_BIN="/usr/bin/podkop-plus"
-        PODKOP_INIT="/etc/init.d/podkop-plus"
-        PODKOP_PKG="podkop-plus"
-        PODKOP_GITHUB_REPO="ushan0v/podkop-plus"
-        PODKOP_DISPLAY_NAME="Podkop Plus"
+        PODKOP_UCI="forkop"
+        PODKOP_BIN="/usr/bin/forkop"
+        PODKOP_INIT="/etc/init.d/forkop"
+        PODKOP_PKG="forkop"
+        PODKOP_GITHUB_REPO="ushan0v/forkop"
+        PODKOP_DISPLAY_NAME="Forkop"
         SINGBOX_CONFIG_PATH="/etc/sing-box/config.json"
         PODKOP_FAKEIP_DOMAIN="fakeip.podkop.fyi"
         ;;
@@ -173,7 +173,7 @@ _variant_has_subscription() {
     esac
 }
 
-# _plus_has_cmd: check if podkop-plus CLI supports a given command.
+# _plus_has_cmd: check if forkop CLI supports a given command.
 # show_help is incomplete (get_outbound_link_states, close_all_connections absent),
 # so we grep the CLI dispatcher directly — commands appear as "    <cmd>)" lines.
 # Falls back to show_help output for stripped/old builds.
@@ -185,7 +185,7 @@ _plus_has_cmd() {
     ${PODKOP_BIN} 2>&1 | grep -qF "$1"
 }
 
-# _plus_json: call a podkop-plus CLI command, return JSON via stdout.
+# _plus_json: call a forkop CLI command, return JSON via stdout.
 # Returns empty + non-zero if not Plus or command unavailable.
 _plus_json() {
     local _cmd="$1"; shift
@@ -197,14 +197,14 @@ _plus_json() {
 # _plus_sub_metadata: subscription metadata array for a section, WITHOUT spawning
 # the Plus binary. Plus' own `get_subscription_metadata` CLI just reads
 # section-cache/<sec>.json and returns its .subscriptionMetadata array
-# (confirmed in podkop-plus status_diagnostics.sh + subscription_cache.uc).
+# (confirmed in forkop status_diagnostics.sh + subscription_cache.uc).
 # We read the same file directly — avoids a Go/ucode subprocess (RSS spike,
 # OOM risk on 256 MB routers). Falls back to the CLI if the file is missing.
 # Output: the subscriptionMetadata JSON array, same shape _plus_format_sub_meta expects.
 _plus_sub_metadata() {
     local _sec="$1"
     [ "$PODKOP_VARIANT" = "plus" ] || return 1
-    local _cache="/var/run/podkop-plus/section-cache/${_sec}.json"
+    local _cache="/var/run/forkop/section-cache/${_sec}.json"
     if [ -f "$_cache" ]; then
         local _arr
         _arr=$(jq -ce '.subscriptionMetadata // []' "$_cache" 2>/dev/null)
@@ -667,8 +667,8 @@ get_singbox_version_display() {
     fi
     local ver=""
 
-    # 1. Podkop-plus writes version to state file after each install — no process spawn.
-    local _sb_state="/etc/podkop-plus/sing-box-version"
+    # 1. forkop writes version to state file after each install — no process spawn.
+    local _sb_state="/etc/forkop/sing-box-version"
     [ -r "$_sb_state" ] && ver=$(sed -n '1p' "$_sb_state" 2>/dev/null)
 
     # 2. opkg (OpenWrt 24.10 and earlier)
@@ -1168,7 +1168,7 @@ _pkg_net_check() {
 }
 
 # _pkg_disk_check: overlay free-space pre-flight for podkop/plus updates.
-# podkop-plus's own install.sh only requires 15 MB free on /overlay
+# forkop's own install.sh only requires 15 MB free on /overlay
 # (REQUIRED_SPACE_KB=15360), but real-world reports put sing-box's actual
 # footprint at ~50 MB (bigger still for -extended builds with extra
 # protocols/Tailscale). On tight-flash devices (e.g. AX3000T, ~60 MB overlay)
@@ -2665,7 +2665,7 @@ get_subscription_cache_path() {
     case "$PODKOP_VARIANT" in
         evolution) printf '/var/run/podkop/subscription/%s.json' "$sec" ;;
         netshift)  printf '/var/run/netshift/subscriptions/%s.json' "$sec" ;;
-        plus)      printf '/var/run/podkop-plus/section-cache/%s.json' "$sec" ;;
+        plus)      printf '/var/run/forkop/section-cache/%s.json' "$sec" ;;
         *)         printf '' ;;
     esac
 }
@@ -2674,7 +2674,7 @@ get_subscription_cache_path() {
 get_subscription_metadata_path() {
     local sec="$1"
     case "$PODKOP_VARIANT" in
-        plus) printf '/var/run/podkop-plus/subscription-metadata/%s.json' "$sec" ;;
+        plus) printf '/var/run/forkop/subscription-metadata/%s.json' "$sec" ;;
         *)    printf '' ;;
     esac
 }
@@ -2695,8 +2695,8 @@ get_subscription_urls() {
         [ -n "$_ns_urls" ] && printf '%s\n' "$_ns_urls"
     else
         # uci show for list fields returns one line per item:
-        # podkop-plus.main.subscription_urls='url1'
-        # podkop-plus.main.subscription_urls='url2'
+        # forkop.main.subscription_urls='url1'
+        # forkop.main.subscription_urls='url2'
         # Extract the value part after = and strip single quotes
         uci -q show ${PODKOP_UCI}.${sec}.subscription_urls 2>/dev/null \
             | sed "s/^[^=]*=//; s/^'//; s/'$//" \
@@ -6362,7 +6362,7 @@ EOF
             if [ "$PODKOP_VARIANT" = "plus" ]; then
                 case "$target_mode" in
                     url|outbound)
-                        send_or_edit "$mid" "$(printf '%s This mode is not available on Podkop Plus.' "$E_WARN")" \
+                        send_or_edit "$mid" "$(printf '%s This mode is not available on Forkop.' "$E_WARN")" \
                             "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"proxy_mode_menu\"}]]}" ; return ;;
                 esac
             fi
@@ -6901,7 +6901,7 @@ _handle_section_extras() {
             # URLTest filters — Plus only (urltest_filter_mode, countries, regex, outbounds)
             rm -f "$STATE_FILE"
             if [ "$PODKOP_VARIANT" != "plus" ]; then
-                send_or_edit "$mid" "$(printf '%s URLTest filters are only available on Podkop Plus.' "$E_WARN")"                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
+                send_or_edit "$mid" "$(printf '%s URLTest filters are only available on Forkop.' "$E_WARN")"                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"section_settings\"}]]}"
                 return
             fi
             local _fm _dc _dc_disp _exc _inc _exc_ob _inc_ob _exc_re _inc_re _hide text kb
@@ -8850,11 +8850,11 @@ EOF
 
         "cmd_server_instances")
             # Server Instances — Plus only. Read-only view from UCI (type=server sections).
-            # Source: uci show podkop-plus — no runtime dependency on sing-box/Clash API.
+            # Source: uci show forkop — no runtime dependency on sing-box/Clash API.
             # Clash /connections used optionally for per-server traffic stats.
             [ "$PODKOP_VARIANT" = "plus" ] || {
                 send_or_edit "$mid" \
-                    "$(printf '%s Server Instances are only available on Podkop Plus.' "$E_WARN")" \
+                    "$(printf '%s Server Instances are only available on Forkop.' "$E_WARN")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
                 return
             }
@@ -8871,7 +8871,7 @@ EOF
 
             if [ "$_si_count" -eq 0 ]; then
                 send_or_edit "$mid" \
-                    "$(printf '%s <b>Server Instances</b>\n\n<i>No server mode instances configured.</i>\n<i>Supported: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto (extended), Tailscale</i>\n\n<i>Configure in LuCI → Podkop Plus → Server</i>' "$E_SRV")" \
+                    "$(printf '%s <b>Server Instances</b>\n\n<i>No server mode instances configured.</i>\n<i>Supported: VLESS, VMess, Trojan, Shadowsocks, SOCKS, Hysteria2, MTProto (extended), Tailscale</i>\n\n<i>Configure in LuCI → Forkop → Server</i>' "$E_SRV")" \
                     "{\"inline_keyboard\":[[{\"text\":\"${E_RST} Refresh\",\"callback_data\":\"cmd_server_instances\"},{\"text\":\"${E_BACK} Back\",\"callback_data\":\"/menu\"}]]}"
                 return
             fi
@@ -8917,7 +8917,7 @@ EOF
             }
             # _si_ts_state_dir: per-section Tailscale state directory (Plus convention).
             _si_ts_state_dir() {
-                printf '/etc/podkop-plus/tailscale/%s' "$(_si_safe_name "$1")"
+                printf '/etc/forkop/tailscale/%s' "$(_si_safe_name "$1")"
             }
             # _si_ts_registered: node has provisioned state (tailscaled.state exists, non-empty).
             # sing-box stores tsnet state in <state_dir>/tailscaled.state once the node logs in.
