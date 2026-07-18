@@ -2,7 +2,7 @@
 
 # Installer for podkop_bot — Telegram remote management bot for podkop/sing-box on OpenWrt
 # Supports: OpenWrt 23.05 / 24.10 (opkg) and OpenWrt 25.x+ (apk)
-# Supports podkop variants: original, evolution, netshift, podkop-plus (auto-detected)
+# Supports podkop variants: original, evolution, netshift, forkop (auto-detected)
 # Based on installer pattern from https://github.com/VizzleTF/podkop_autoupdater
 #
 # CORRECT install command:
@@ -54,7 +54,7 @@
 # CHANGELOG v2.4.1:
 # - FIXED: _podkop_uci_pkg() mapped netshift -> "podkop" (wrong UCI namespace).
 #        NetShift lives in the `netshift` namespace; detection already knew the
-#        variant but the mapping dropped it. Now plus->podkop-plus,
+#        variant but the mapping dropped it. Now plus->forkop,
 #        netshift->netshift, *->podkop. (Same bug fixed in the rpcd backend.)
 #
 # INSTALLER_VERSION="2.4.0"
@@ -450,8 +450,8 @@ msg() {
             *)  printf "Podkop NetShift" ;;
             esac ;;
         variant_label_plus) case "$UI_LANG" in
-            ru) printf "Podkop Plus" ;;
-            *)  printf "Podkop Plus" ;;
+            ru) printf "Forkop" ;;
+            *)  printf "Forkop" ;;
             esac ;;
         variant_label_unknown) case "$UI_LANG" in
             ru) printf "не определён" ;;
@@ -548,8 +548,8 @@ msg() {
             *)  printf "NetShift (yandexru45/netshift — formerly podkop-evolution; subscriptions, HWID):" ;;
             esac ;;
         podkop_variant_plus_line) case "$UI_LANG" in
-            ru) printf "Podkop Plus (форк сообщества — zapret/byedpi, серверный режим):" ;;
-            *)  printf "Podkop Plus (community fork — zapret/byedpi, server mode):" ;;
+            ru) printf "Forkop (форк сообщества — zapret/byedpi, серверный режим):" ;;
+            *)  printf "Forkop (community fork — zapret/byedpi, server mode):" ;;
             esac ;;
         podkop_docs_line) case "$UI_LANG" in
             ru) printf "Документация по всем вариантам: https://podkop.net/docs/install/" ;;
@@ -993,7 +993,7 @@ msg() {
 # ── Variant detection ──────────────────────────────────────────────────────────
 # PODKOP_VARIANT one of: original | evolution | netshift | plus | none
 # Detection strategy, in order of confidence:
-#   1. Package name via opkg/apk (podkop-plus, podkop, etc. — name varies by
+#   1. Package name via opkg/apk (forkop, podkop, etc. — name varies by
 #      maintainer/fork but is the strongest signal when present).
 #   2. UCI field fingerprint: Plus uses `action=` on routing sections and has
 #      Plus-only fields (subscription_urls, rule_set, detect_server_country).
@@ -1007,7 +1007,7 @@ detect_podkop_variant() {
     local _bin_path=""
     # Binary-signal first: plus and netshift have their own binaries. Check them
     # before anything else so they're detected even before package metadata.
-    if [ -f "/usr/bin/podkop-plus" ]; then
+    if [ -f "/usr/bin/forkop" ]; then
         printf 'plus'
         return
     fi
@@ -1022,7 +1022,7 @@ detect_podkop_variant() {
     [ -z "$_bin_path" ] && [ -f "/usr/sbin/podkop" ] && _bin_path="/usr/sbin/podkop"
 
     if [ -z "$_bin_path" ] && ! uci -q get podkop.settings >/dev/null 2>&1 \
-                            && ! uci -q get podkop-plus.settings >/dev/null 2>&1 \
+                            && ! uci -q get forkop.settings >/dev/null 2>&1 \
                             && ! uci -q get netshift.settings >/dev/null 2>&1; then
         printf 'none'
         return
@@ -1032,12 +1032,12 @@ detect_podkop_variant() {
     local _pkg_name=""
     case "$PKG_MANAGER" in
         apk)
-            apk info 2>/dev/null | grep -qE '^podkop-plus$'  && _pkg_name="plus"
+            apk info 2>/dev/null | grep -qE '^forkop$'  && _pkg_name="plus"
             [ -z "$_pkg_name" ] && apk info 2>/dev/null | grep -qE '^podkop-evolution$' && _pkg_name="evolution"
             [ -z "$_pkg_name" ] && apk info 2>/dev/null | grep -qE '^netshift$'  && _pkg_name="netshift"
             ;;
         opkg)
-            opkg list-installed 2>/dev/null | grep -qE '^podkop-plus '  && _pkg_name="plus"
+            opkg list-installed 2>/dev/null | grep -qE '^forkop '  && _pkg_name="plus"
             [ -z "$_pkg_name" ] && opkg list-installed 2>/dev/null | grep -qE '^podkop-evolution ' && _pkg_name="evolution"
             [ -z "$_pkg_name" ] && opkg list-installed 2>/dev/null | grep -qE '^netshift '  && _pkg_name="netshift"
             ;;
@@ -1047,8 +1047,8 @@ detect_podkop_variant() {
         return
     fi
 
-    # UCI fingerprint: does any podkop-plus.* section exist with action=proxy?
-    if uci -q show podkop-plus 2>/dev/null | grep -qE '^podkop-plus\.[^.]+\.action='; then
+    # UCI fingerprint: does any forkop.* section exist with action=proxy?
+    if uci -q show forkop 2>/dev/null | grep -qE '^forkop\.[^.]+\.action='; then
         printf 'plus'
         return
     fi
@@ -1093,10 +1093,10 @@ variant_label() {
 }
 
 # ── UCI package name for the detected variant ──────────────────────────────────
-# Plus uses its own UCI package "podkop-plus"; everything else uses "podkop".
+# Plus uses its own UCI package "forkop"; everything else uses "podkop".
 _podkop_uci_pkg() {
     case "$PODKOP_VARIANT" in
-        plus)     printf 'podkop-plus' ;;
+        plus)     printf 'forkop' ;;
         netshift) printf 'netshift' ;;
         *)        printf 'podkop' ;;
     esac
@@ -1360,9 +1360,9 @@ INITEOF
 #   - original / evolution / netshift: `connection_type=proxy` +
 #     `mixed_proxy_enabled=1` on a section of UCI package "podkop".
 #   - plus: `action=proxy` + `mixed_proxy_enabled=1` on a section of UCI
-#     package "podkop-plus". (Plus renamed connection_type → action and
-#     moved everything to its own UCI package — see podkop-plus source,
-#     luci-app-podkop-plus/.../section.js ROUTING_SECTION_ACTIONS.)
+#     package "forkop". (Plus renamed connection_type → action and
+#     moved everything to its own UCI package — see forkop source,
+#     luci-app-forkop/.../section.js ROUTING_SECTION_ACTIONS.)
 # Before this fix, only the connection_type schema was checked, so tier1
 # was always empty on any Plus install — first-time installs on Plus had
 # zero fallback transport if GitHub was blocked (fallback_socks doesn't
@@ -1372,7 +1372,7 @@ _get_socks_endpoints() {
     local _pkg; _pkg=$(_podkop_uci_pkg)
     local _primary_sec _port _lan_ip _field_name
 
-    if [ "$_pkg" = "podkop-plus" ]; then
+    if [ "$_pkg" = "forkop" ]; then
         _field_name="action"
     else
         _field_name="connection_type"
@@ -2031,23 +2031,23 @@ info "$(msg hostname_label): $(cat /proc/sys/kernel/hostname 2>/dev/null || echo
 # ── Check podkop is installed + detect variant ─────────────────────────────────
 step "$(msg detecting_variant)"
 PODKOP_OK=0
-if [ -f "/usr/bin/podkop" ] || [ -f "/usr/sbin/podkop" ] || [ -f "/usr/bin/podkop-plus" ] || [ -f "/usr/bin/netshift" ]; then
+if [ -f "/usr/bin/podkop" ] || [ -f "/usr/sbin/podkop" ] || [ -f "/usr/bin/forkop" ] || [ -f "/usr/bin/netshift" ]; then
     PODKOP_OK=1
 fi
 # Also check via package manager (covers cases where binary lives elsewhere)
 if [ "$PODKOP_OK" = "0" ]; then
     case "$PKG_MANAGER" in
         apk)  apk info podkop >/dev/null 2>&1 && PODKOP_OK=1
-              apk info podkop-plus >/dev/null 2>&1 && PODKOP_OK=1
+              apk info forkop >/dev/null 2>&1 && PODKOP_OK=1
               apk info netshift >/dev/null 2>&1 && PODKOP_OK=1 ;;
         opkg) opkg list-installed 2>/dev/null | grep -qE "^podkop " && PODKOP_OK=1
-              opkg list-installed 2>/dev/null | grep -qE "^podkop-plus " && PODKOP_OK=1
+              opkg list-installed 2>/dev/null | grep -qE "^forkop " && PODKOP_OK=1
               opkg list-installed 2>/dev/null | grep -qE "^netshift " && PODKOP_OK=1 ;;
     esac
 fi
-# Check UCI config exists (covers both legacy "podkop" and Plus's "podkop-plus")
+# Check UCI config exists (covers both legacy "podkop" and Plus's "forkop")
 if [ "$PODKOP_OK" = "0" ]; then
-    if uci -q get podkop.settings >/dev/null 2>&1 || uci -q get podkop-plus.settings >/dev/null 2>&1 || uci -q get netshift.settings >/dev/null 2>&1; then
+    if uci -q get podkop.settings >/dev/null 2>&1 || uci -q get forkop.settings >/dev/null 2>&1 || uci -q get netshift.settings >/dev/null 2>&1; then
         PODKOP_OK=1
     fi
 fi
@@ -2067,7 +2067,7 @@ if [ "$PODKOP_OK" = "0" ]; then
     echo "      wget -O - https://raw.githubusercontent.com/yandexru45/netshift/refs/heads/main/install.sh | sh"
     echo ""
     echo "  • $(msg podkop_variant_plus_line)"
-    echo "      wget -O - https://raw.githubusercontent.com/ushan0v/podkop-plus/main/install.sh | sh"
+    echo "      wget -O - https://raw.githubusercontent.com/ushan0v/forkop/main/install.sh | sh"
     echo ""
     echo "  $(msg podkop_docs_line)"
     echo ""
@@ -2089,7 +2089,7 @@ else
     # variant-first: look up the package matching the detected variant first, so
     # a leftover 'podkop' package on a NetShift box can't shadow the real version.
     case "$PODKOP_VARIANT" in
-        plus)     _pkg_name="podkop-plus" ;;
+        plus)     _pkg_name="forkop" ;;
         netshift) _pkg_name="netshift" ;;
         *)        _pkg_name="podkop" ;;
     esac
@@ -2098,14 +2098,14 @@ else
             PODKOP_VER=$(apk info "$_pkg_name" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             # fallbacks in case variant detection and package naming disagree
             [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info podkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info podkop-plus 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info forkop 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             [ -z "$PODKOP_VER" ] && PODKOP_VER=$(apk info netshift 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             SINGBOX_VER=$(apk info sing-box 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
             ;;
         opkg)
             PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^${_pkg_name} " | awk '{print $3}' | sed 's/^v//')
             [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop " | awk '{print $3}' | sed 's/^v//')
-            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^podkop-plus " | awk '{print $3}' | sed 's/^v//')
+            [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^forkop " | awk '{print $3}' | sed 's/^v//')
             [ -z "$PODKOP_VER" ] && PODKOP_VER=$(opkg list-installed 2>/dev/null | grep "^netshift " | awk '{print $3}' | sed 's/^v//')
             SINGBOX_VER=$(opkg list-installed 2>/dev/null | grep "^sing-box " | awk '{print $3}' | sed 's/^v//')
             ;;
@@ -2960,7 +2960,7 @@ fi
 # things rather than just listing a command.
 _rec_pkg=$(_podkop_uci_pkg)
 _rec_field="connection_type"
-[ "$_rec_pkg" = "podkop-plus" ] && _rec_field="action"
+[ "$_rec_pkg" = "forkop" ] && _rec_field="action"
 
 _rec_mixed_sec=""
 _rec_mixed_sec=$(uci -q show "$_rec_pkg" 2>/dev/null \
