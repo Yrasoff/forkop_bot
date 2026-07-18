@@ -7,7 +7,7 @@
 #
 # CORRECT install command:
 #   wget -O /tmp/install_podkop_bot.sh \
-#     https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh
+#     https://raw.githubusercontent.com/Yrasoff/podkop_bot/main/install.sh
 #   ash /tmp/install_podkop_bot.sh
 #
 # UNATTENDED mode (for luci-app-podkop-bot backend, scripted installs, CI):
@@ -315,7 +315,7 @@ case "$_first_line" in
         echo "Use the raw URL:"
         echo ""
         echo "  wget -O /tmp/install_podkop_bot.sh \\"
-        echo "    https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/install.sh"
+        echo "    https://raw.githubusercontent.com/Yrasoff/forkop_bot/refs/heads/main/install.sh"
         echo "  ash /tmp/install_podkop_bot.sh"
         echo ""
         exit 1
@@ -325,11 +325,11 @@ unset _first_line
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 INSTALLER_VERSION="2.5.1"
-BOT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot.sh"
-VERSION_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt"
+BOT_URL="https://raw.githubusercontent.com/Yrasoff/forkop_bot/refs/heads/main/podkop_bot.sh"
+VERSION_URL="https://raw.githubusercontent.com/Yrasoff/forkop_bot/refs/heads/main/version.txt"
 BOT_PATH="/usr/bin/podkop_bot"
 INIT_PATH="/etc/init.d/podkop_bot"
-INIT_URL="https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/podkop_bot_init"
+INIT_URL="https://raw.githubusercontent.com/Yrasoff/forkop_bot/refs/heads/main/podkop_bot_init"
 # Vendored fallback copies shipped inside luci-app-podkop-bot (.ipk/.apk). Used
 # as a LAST-resort transport tier in download_file()/download_file_optional()
 # when direct + SOCKS all fail — enables offline bootstrap of the bot when
@@ -1482,7 +1482,7 @@ _curl_socks_fallover() {
 #      update. So the actual package-manager call is DETACHED (setsid/nohup) and
 #      logs to a file the UI polls — if rpcd restarts mid-install, the install
 #      still completes and the log survives.
-LUCI_REPO="Medvedolog/luci-app-podkop-bot"
+LUCI_REPO="Yrasoff/luci-app-fodkop-bot"
 LUCI_UPDATE_LOG="/tmp/podkop_bot_luci_update.log"
 
 # _update_luci_app: fetch latest LuCI release asset and install it detached.
@@ -1578,11 +1578,11 @@ _update_luci_app() {
 _probe_github_reachable() {
     if command -v curl >/dev/null 2>&1; then
         curl -fsS --connect-timeout 6 --max-time 10 -o /dev/null \
-            "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" 2>/dev/null
+            "https://raw.githubusercontent.com/Yrasoff/forkop_bot/refs/heads/main/version.txt" 2>/dev/null
         return $?
     fi
     wget -q -T 10 -O /dev/null \
-        "https://raw.githubusercontent.com/Medvedolog/podkop_bot/main/version.txt" 2>/dev/null
+        "https://raw.githubusercontent.com/Yrasoff/forkop_bot/refs/heads/main/version.txt" 2>/dev/null
 }
 
 # _apply_user_proxy: export standard proxy env vars (used by curl, wget, and
@@ -2577,7 +2577,7 @@ if [ "$HAS_EXISTING" = "1" ]; then
             echo "$(msg restart_bot_cmd)"
             echo "$(msg check_status_cmd)"
             echo ""
-            echo "GitHub: https://github.com/Medvedolog/podkop_bot"
+            echo "GitHub: https://github.com/Yrasoff/forkop_bot"
             _release_lock
             exit 0
             ;;
@@ -3053,7 +3053,7 @@ if [ "$UI_LANG" = "ru" ]; then
         echo "      смотрит в интернет напрямую)."
     fi
     echo ""
-    echo "GitHub: https://github.com/Medvedolog/podkop_bot"
+    echo "GitHub: https://github.com/Yrasoff/forkop_bot"
 else
     echo "  Bot script      : $BOT_PATH"
     echo "  Config          : /etc/config/${UCI_PKG}"
@@ -3115,7 +3115,7 @@ else
         echo "      internet directly)."
     fi
     echo ""
-    echo "GitHub: https://github.com/Medvedolog/podkop_bot"
+    echo "GitHub: https://github.com/Yrasoff/forkop_bot"
 fi
 
 # ── Offer to install/update the LuCI web UI ────────────────────────────────────
